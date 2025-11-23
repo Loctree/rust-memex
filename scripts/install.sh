@@ -3,16 +3,19 @@ set -euo pipefail
 
 echo "=== mcp_memex setup ==="
 
-# Build Rust binary
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 echo "Building release binary..."
 cargo build --release
 
 if [[ "${1:-}" == "--bundle-macos" ]]; then
   echo "Creating macOS app bundle..."
-  ./build-macos.sh
+  "$SCRIPT_DIR/build-macos.sh"
   BIN_PATH="$HOME/.mcp-servers/MCPServer.app/Contents/MacOS/mcp_memex"
 else
-  BIN_PATH="$(pwd)/target/release/mcp_memex"
+  BIN_PATH="$REPO_ROOT/target/release/mcp_memex"
 fi
 
 echo ""
