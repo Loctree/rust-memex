@@ -28,7 +28,7 @@ pub use tui::{HostDetection, HostKind, WizardConfig, detect_hosts, run_wizard};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Enabled features (namespaced strings)
+    /// Enabled features (namespaced strings). Currently informational/reserved.
     pub features: Vec<String>,
 
     /// Cache size in MB for sled/moka

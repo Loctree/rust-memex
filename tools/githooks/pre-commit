@@ -18,7 +18,7 @@ if command -v semgrep >/dev/null 2>&1; then
   semgrep \
     --config .semgrep.yaml \
     --error --metrics=off \
-    --exclude target --exclude lancedb --exclude .fastembed_cache
+    --exclude target --exclude lancedb --exclude .lancedb --exclude .fastembed_cache
 else
   echo "[pre-commit] semgrep not installed; skipping (install via 'pipx install semgrep')."
 fi
