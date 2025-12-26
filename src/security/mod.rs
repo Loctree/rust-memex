@@ -195,7 +195,7 @@ impl NamespaceAccessManager {
     pub fn new(config: NamespaceSecurityConfig) -> Self {
         let store_path = config.token_store_path.or_else(|| {
             if config.enabled {
-                Some("~/.rmcp_servers/rmcp_memex/tokens.json".to_string())
+                Some("~/.rmcp-servers/rmcp-memex/tokens.json".to_string())
             } else {
                 None
             }

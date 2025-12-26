@@ -653,20 +653,33 @@ impl EmbeddingClient {
     }
 }
 
-/// Truncate text at a word/sentence boundary to avoid cutting mid-word
+/// Truncate text at a word/sentence boundary to avoid cutting mid-word (UTF-8 safe)
 fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return text.to_string();
     }
 
-    let truncated = &text[..max_chars];
+    // Get byte index of max_chars-th character (UTF-8 safe)
+    let byte_idx = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+
+    let truncated = &text[..byte_idx];
 
     // Try to find a sentence boundary first (prefer complete sentences)
+    let half_byte_idx = text
+        .char_indices()
+        .nth(max_chars / 2)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
     if let Some(pos) = truncated.rfind(['.', '!', '?', '\n'])
-        && pos > max_chars / 2
-    {
-        return text[..=pos].to_string();
-    }
+        && pos > half_byte_idx {
+            return text[..=pos].to_string();
+        }
 
     // Fall back to word boundary
     if let Some(pos) = truncated.rfind([' ', '\t', '\n']) {

@@ -482,14 +482,23 @@ fn create_outer_summary(middle_content: &str, keywords: &[String], target_chars:
     format!("{}{}", keyword_prefix, summary)
 }
 
-/// Truncate text at a word boundary
+/// Truncate text at a word boundary (UTF-8 safe)
 fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return text.to_string();
     }
 
-    // Find the last space before max_chars
-    let truncated = &text[..max_chars];
+    // Get byte index of max_chars-th character (UTF-8 safe)
+    let byte_idx = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+
+    let truncated = &text[..byte_idx];
+
+    // Find the last space before cutoff
     if let Some(last_space) = truncated.rfind(' ') {
         format!("{}...", &text[..last_space])
     } else {

@@ -168,7 +168,7 @@ impl MCPServer {
             "initialize" => json!({
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
-                    "name": "rmcp_memex",
+                    "name": "rmcp-memex",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -181,7 +181,7 @@ impl MCPServer {
                 "tools": [
                     {
                         "name": "health",
-                        "description": "Health/status of rmcp_memex server",
+                        "description": "Health/status of rmcp-memex server",
                         "inputSchema": {
                             "type": "object",
                             "properties": {},

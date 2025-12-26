@@ -64,7 +64,7 @@ impl Default for ServerConfig {
                 "search".to_string(),
             ],
             cache_mb: 4096,
-            db_path: "~/.rmcp_servers/rmcp_memex/lancedb".to_string(),
+            db_path: "~/.rmcp-servers/rmcp-memex/lancedb".to_string(),
             max_request_bytes: 5 * 1024 * 1024,
             log_level: Level::INFO,
             allowed_paths: vec![],
@@ -115,7 +115,7 @@ mod lib_tests {
         let cfg = ServerConfig::default();
         assert!(cfg.features.contains(&"filesystem".to_string()));
         assert_eq!(cfg.cache_mb, 4096);
-        assert_eq!(cfg.db_path, "~/.rmcp_servers/rmcp_memex/lancedb");
+        assert_eq!(cfg.db_path, "~/.rmcp-servers/rmcp-memex/lancedb");
         assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);
     }
 }

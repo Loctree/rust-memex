@@ -1,13 +1,13 @@
 # Schema Migration Guide
 
-This document describes how to handle schema changes in rmcp_memex storage layers.
+This document describes how to handle schema changes in rmcp-memex storage layers.
 
 ## Schema Versioning
 
 The current schema version is defined in `src/storage/mod.rs`:
 
 ```rust
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 ```
 
 Increment this version whenever you make breaking changes to:
@@ -15,7 +15,7 @@ Increment this version whenever you make breaking changes to:
 - Sled key-value schema
 - ChromaDocument fields
 
-## Current Schema (v1)
+## Current Schema (v3)
 
 ### LanceDB Table: `mcp_documents`
 
@@ -23,9 +23,20 @@ Increment this version whenever you make breaking changes to:
 |--------|------|-------------|
 | `id` | String | Unique document identifier |
 | `namespace` | String | Namespace for isolation |
-| `embedding` | FixedSizeList[Float32, 384] | fastembed vector (384 dims) |
+| `embedding` | FixedSizeList[Float32, 4096] | MLX embedding vector |
 | `metadata` | String (JSON) | Serialized metadata object |
 | `document` | String | Original text content |
+| `layer` | u8 | Onion slice layer (1=Outer, 2=Middle, 3=Inner, 4=Core, 0=legacy) |
+| `parent_id` | String (nullable) | Parent slice ID in hierarchy |
+| `children_ids` | List[String] | Children slice IDs |
+| `keywords` | List[String] | Extracted keywords for this slice |
+| `content_hash` | String (nullable) | SHA256 hash for exact-match dedup |
+
+### Schema History
+
+- **v1**: Initial schema (id, namespace, embedding, metadata, document)
+- **v2**: Added onion slice fields (layer, parent_id, children_ids, keywords)
+- **v3**: Added content_hash for exact-match deduplication
 
 ### Sled Keys
 
@@ -39,11 +50,11 @@ Increment this version whenever you make breaking changes to:
 
 1. **Backup your data**:
    ```bash
-   cp -r ~/.rmcp_servers/rmcp_memex/lancedb ~/.rmcp_servers/rmcp_memex/lancedb.backup
-   cp -r ~/.rmcp_servers/sled ~/.rmcp_servers/sled.backup
+   cp -r ~/.rmcp-servers/rmcp-memex/lancedb ~/.rmcp-servers/rmcp-memex/lancedb.backup
+   cp -r ~/.rmcp-servers/sled ~/.rmcp-servers/sled.backup
    ```
 
-2. **Stop all rmcp_memex instances**
+2. **Stop all rmcp-memex instances**
 
 ### Migration Strategies
 
@@ -53,10 +64,10 @@ Best for datasets < 100K documents or when embeddings model changes.
 
 ```bash
 # 1. Backup
-cp -r ~/.rmcp_servers/rmcp_memex/lancedb ~/.rmcp_servers/rmcp_memex/lancedb.backup
+cp -r ~/.rmcp-servers/rmcp-memex/lancedb ~/.rmcp-servers/rmcp-memex/lancedb.backup
 
 # 2. Delete old data
-rm -rf ~/.rmcp_servers/rmcp_memex/lancedb
+rm -rf ~/.rmcp-servers/rmcp-memex/lancedb
 
 # 3. Re-index your documents
 # (Use your indexing scripts or MCP tools)
@@ -70,10 +81,10 @@ For large datasets where re-indexing is expensive.
 // Example migration script (pseudocode)
 use rmcp_memex::storage::StorageManager;
 
-async fn migrate_v1_to_v2(storage: &StorageManager) -> Result<()> {
+async fn migrate_v2_to_v3(storage: &StorageManager) -> Result<()> {
     // 1. Read all documents from old schema
-    // 2. Transform to new schema
-    // 3. Write to new table
+    // 2. Compute content_hash for each document
+    // 3. Write to new table with content_hash
     // 4. Swap tables atomically
     Ok(())
 }
@@ -81,9 +92,14 @@ async fn migrate_v1_to_v2(storage: &StorageManager) -> Result<()> {
 
 ### Version-Specific Migrations
 
-#### v1 → v2 (Future)
+#### v2 → v3
 
-*Not yet defined. This section will be updated when v2 schema is introduced.*
+Added `content_hash` field for exact-match deduplication. Documents without this field will have `None` and deduplication will fall back to embedding-based comparison.
+
+```bash
+# Simple migration: just restart - new documents get content_hash
+rmcp-memex serve --db-path ~/.rmcp-servers/rmcp-memex/lancedb
+```
 
 ## Adding a Migration
 
@@ -111,13 +127,13 @@ If migration fails:
 
 ```bash
 # Restore from backup
-rm -rf ~/.rmcp_servers/rmcp_memex/lancedb
-cp -r ~/.rmcp_servers/rmcp_memex/lancedb.backup ~/.rmcp_servers/rmcp_memex/lancedb
+rm -rf ~/.rmcp-servers/rmcp-memex/lancedb
+cp -r ~/.rmcp-servers/rmcp-memex/lancedb.backup ~/.rmcp-servers/rmcp-memex/lancedb
 ```
 
 ## FAQ
 
-**Q: Do I need to migrate if I only update rmcp_memex?**
+**Q: Do I need to migrate if I only update rmcp-memex?**
 
 A: Only if the SCHEMA_VERSION changes. Check the CHANGELOG for "breaking: schema change" entries.
 
@@ -127,4 +143,4 @@ A: Not recommended. Use separate `--db-path` for each version during testing.
 
 **Q: How do I check my current schema version?**
 
-A: Currently there's no runtime check. The schema version is implied by the rmcp_memex version you're running. Future versions may store schema version in the database.
+A: Currently there's no runtime check. The schema version is implied by the rmcp-memex version you're running. Future versions may store schema version in the database.

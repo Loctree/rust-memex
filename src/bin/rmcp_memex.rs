@@ -21,6 +21,34 @@ fn parse_features(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Standard config discovery locations (in priority order)
+const CONFIG_SEARCH_PATHS: &[&str] = &[
+    "~/.rmcp-servers/rmcp-memex/config.toml",
+    "~/.config/rmcp-memex/config.toml",
+    "~/.rmcp_servers/rmcp_memex/config.toml", // legacy underscore path
+];
+
+/// Discover config file from standard locations
+fn discover_config() -> Option<String> {
+    // 1. Environment variable takes priority
+    if let Ok(path) = std::env::var("RMCP_MEMEX_CONFIG") {
+        let expanded = shellexpand::tilde(&path).to_string();
+        if std::path::Path::new(&expanded).exists() {
+            return Some(path);
+        }
+    }
+
+    // 2. Check standard locations
+    for path in CONFIG_SEARCH_PATHS {
+        let expanded = shellexpand::tilde(path).to_string();
+        if std::path::Path::new(&expanded).exists() {
+            return Some(path.to_string());
+        }
+    }
+
+    None
+}
+
 fn load_file_config(path: &str) -> Result<FileConfig> {
     let expanded = shellexpand::tilde(path).to_string();
     // This is the START of path validation - canonicalize resolves symlinks
@@ -54,6 +82,22 @@ fn load_file_config(path: &str) -> Result<FileConfig> {
     // Path is validated above: canonicalized + checked against HOME/CWD
     let contents = std::fs::read_to_string(&canonical)?; // nosemgrep
     toml::from_str(&contents).map_err(Into::into)
+}
+
+/// Load config from explicit path or discover from standard locations
+fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, Option<String>)> {
+    // Explicit path takes priority
+    if let Some(path) = explicit_path {
+        return Ok((load_file_config(path)?, Some(path.to_string())));
+    }
+
+    // Try to discover config
+    if let Some(discovered) = discover_config() {
+        return Ok((load_file_config(&discovered)?, Some(discovered)));
+    }
+
+    // No config found - use defaults
+    Ok((FileConfig::default(), None))
 }
 
 #[derive(serde::Deserialize, Default, Clone)]
@@ -260,7 +304,7 @@ struct Cli {
     security_enabled: bool,
 
     /// Path to token store file for namespace access tokens.
-    /// Defaults to ~/.rmcp_servers/rmcp_memex/tokens.json when security is enabled.
+    /// Defaults to ~/.rmcp-servers/rmcp-memex/tokens.json when security is enabled.
     #[arg(long, global = true)]
     token_store_path: Option<String>,
 }
@@ -271,6 +315,7 @@ enum Commands {
     Serve,
 
     /// Launch interactive configuration wizard
+    #[command(alias = "config")]
     Wizard {
         /// Dry run mode - show changes without writing files
         #[arg(long)]
@@ -422,12 +467,10 @@ enum Commands {
 
 impl Cli {
     fn into_server_config(self) -> Result<ServerConfig> {
-        let file_cfg = self
-            .config
-            .as_deref()
-            .map(load_file_config)
-            .transpose()?
-            .unwrap_or_default();
+        let (file_cfg, config_path) = load_or_discover_config(self.config.as_deref())?;
+        if let Some(ref path) = config_path {
+            eprintln!("Using config: {}", path);
+        }
 
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.to_embedding_config();
@@ -1118,12 +1161,10 @@ async fn main() -> Result<()> {
             dedup,
         }) => {
             // Get db_path and cache_mb from config or defaults
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             // Extract embedding config before any moves
             let embedding_config = file_cfg.to_embedding_config();
@@ -1131,7 +1172,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let _cache_mb = cli.cache_mb.or(file_cfg.cache_mb).unwrap_or(4096);
             // CLI flag overrides file config
             let preprocess = preprocess || file_cfg.preprocessing_enabled.unwrap_or(false);
@@ -1159,19 +1200,17 @@ async fn main() -> Result<()> {
             deep,
             layer,
         }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let embedding_config = file_cfg.to_embedding_config();
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             // Parse layer filter
@@ -1205,19 +1244,17 @@ async fn main() -> Result<()> {
             id,
             json,
         }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let embedding_config = file_cfg.to_embedding_config();
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_expand(namespace, id, json, db_path, &embedding_config).await
@@ -1227,19 +1264,17 @@ async fn main() -> Result<()> {
             id,
             json,
         }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let embedding_config = file_cfg.to_embedding_config();
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_get(namespace, id, json, db_path, &embedding_config).await
@@ -1250,35 +1285,31 @@ async fn main() -> Result<()> {
             namespace,
             json,
         }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let embedding_config = file_cfg.to_embedding_config();
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_rag_search(query, limit, namespace, json, db_path, &embedding_config).await
         }
         Some(Commands::Namespaces { stats, json }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_list_namespaces(stats, json, db_path).await
@@ -1288,17 +1319,15 @@ async fn main() -> Result<()> {
             output,
             include_embeddings,
         }) => {
-            let file_cfg = cli
-                .config
-                .as_deref()
-                .map(load_file_config)
-                .transpose()?
-                .unwrap_or_default();
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_export(namespace, output, include_embeddings, db_path).await
