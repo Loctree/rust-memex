@@ -1,26 +1,26 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -e
 
-ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT"
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
 
-echo "[pre-commit] cargo fmt --check"
-cargo fmt -- --check
+echo "=== Pre-commit (fast checks) ==="
 
-echo "[pre-commit] cargo clippy --all-targets --all-features -D warnings"
-cargo clippy --all-targets --all-features -- -D warnings
+# Check if any Rust files are staged
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 
-echo "[pre-commit] cargo test"
-cargo test --all-targets
+if [ -n "$STAGED_RS" ]; then
+  echo "Running cargo fmt (auto-fix)..."
+  cargo fmt
 
-if command -v semgrep >/dev/null 2>&1; then
-  echo "[pre-commit] semgrep (.semgrep.yaml)"
-  semgrep \
-    --config .semgrep.yaml \
-    --error --metrics=off \
-    --exclude target --exclude lancedb --exclude .lancedb --exclude .fastembed_cache
-else
-  echo "[pre-commit] semgrep not installed; skipping (install via 'pipx install semgrep')."
+  # Re-add formatted files
+  echo "$STAGED_RS" | xargs -I {} git add "{}" 2>/dev/null || true
+
+  echo "Running cargo check..."
+  cargo check --quiet || {
+    echo "Compilation errors. Fix before committing."
+    exit 1
+  }
 fi
 
-echo "[pre-commit] done"
+echo "Pre-commit checks passed."

@@ -463,6 +463,25 @@ enum Commands {
         #[arg(long)]
         include_embeddings: bool,
     },
+
+    /// Upsert a text chunk directly into vector memory (for hooks/scripts)
+    Upsert {
+        /// Namespace for the chunk
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Unique ID for the chunk
+        #[arg(long, short = 'i', required = true)]
+        id: String,
+
+        /// Text content (if not provided, reads from stdin)
+        #[arg(long, short = 't')]
+        text: Option<String>,
+
+        /// Optional metadata as JSON string
+        #[arg(long, short = 'm', default_value = "{}")]
+        metadata: String,
+    },
 }
 
 impl Cli {
@@ -1331,6 +1350,62 @@ async fn main() -> Result<()> {
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_export(namespace, output, include_embeddings, db_path).await
+        }
+        Some(Commands::Upsert {
+            namespace,
+            id,
+            text,
+            metadata,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            // Get text from argument or stdin
+            let content = match text {
+                Some(t) => t,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin().read_to_string(&mut buffer)?;
+                    buffer
+                }
+            };
+
+            if content.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "No text provided (use --text or pipe to stdin)"
+                ));
+            }
+
+            // Parse metadata JSON
+            let meta: serde_json::Value = serde_json::from_str(&metadata)
+                .map_err(|e| anyhow::anyhow!("Invalid metadata JSON: {}", e))?;
+
+            // Initialize RAG pipeline
+            let embedding_client =
+                Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
+            let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+            let rag = RAGPipeline::new(embedding_client, storage).await?;
+
+            // Upsert
+            rag.memory_upsert(&namespace, id.clone(), content.clone(), meta)
+                .await?;
+
+            eprintln!("✓ Upserted chunk '{}' to namespace '{}'", id, namespace);
+            eprintln!("  Text: {} chars", content.len());
+            eprintln!("  DB: {}", db_path);
+
+            Ok(())
         }
         Some(Commands::Serve) | None => {
             // Run MCP server

@@ -677,9 +677,10 @@ fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
         .unwrap_or(0);
 
     if let Some(pos) = truncated.rfind(['.', '!', '?', '\n'])
-        && pos > half_byte_idx {
-            return text[..=pos].to_string();
-        }
+        && pos > half_byte_idx
+    {
+        return text[..=pos].to_string();
+    }
 
     // Fall back to word boundary
     if let Some(pos) = truncated.rfind([' ', '\t', '\n']) {
