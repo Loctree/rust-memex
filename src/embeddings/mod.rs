@@ -544,10 +544,12 @@ impl EmbeddingClient {
 
         for text in texts {
             // If single text exceeds limit, chunk it and use first chunk
-            let text_to_embed = if text.len() > max_text_chars {
+            // Use chars().count() for accurate character count (not bytes)
+            let char_count = text.chars().count();
+            let text_to_embed = if char_count > max_text_chars {
                 tracing::debug!(
                     "Text too large ({} chars), truncating to {} chars",
-                    text.len(),
+                    char_count,
                     max_text_chars
                 );
                 truncate_at_boundary(text, max_text_chars)
@@ -555,7 +557,7 @@ impl EmbeddingClient {
                 text.clone()
             };
 
-            let text_len = text_to_embed.len();
+            let text_len = text_to_embed.chars().count();
 
             // Check if we need to flush current batch
             if !current_batch.is_empty()
