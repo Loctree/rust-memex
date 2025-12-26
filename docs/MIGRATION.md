@@ -98,7 +98,7 @@ Added `content_hash` field for exact-match deduplication. Documents without this
 
 ```bash
 # Simple migration: just restart - new documents get content_hash
-rmcp_memex serve --db-path ~/.rmcp-servers/rmcp-memex/lancedb
+rmcp-memex serve --db-path ~/.rmcp-servers/rmcp-memex/lancedb
 ```
 
 ## Adding a Migration
