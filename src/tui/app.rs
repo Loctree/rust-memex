@@ -363,6 +363,17 @@ impl App {
 }
 
 fn which_rmcp_memex() -> Option<String> {
+    // Try hyphen version first (current naming)
+    if let Some(path) = std::process::Command::new("which")
+        .arg("rmcp-memex")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    {
+        return Some(path);
+    }
+    // Fallback to underscore (legacy)
     std::process::Command::new("which")
         .arg("rmcp_memex")
         .output()
