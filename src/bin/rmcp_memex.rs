@@ -260,7 +260,7 @@ struct Cli {
     security_enabled: bool,
 
     /// Path to token store file for namespace access tokens.
-    /// Defaults to ~/.rmcp_servers/rmcp_memex/tokens.json when security is enabled.
+    /// Defaults to ~/.rmcp-servers/rmcp-memex/tokens.json when security is enabled.
     #[arg(long, global = true)]
     token_store_path: Option<String>,
 }
@@ -1131,7 +1131,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let _cache_mb = cli.cache_mb.or(file_cfg.cache_mb).unwrap_or(4096);
             // CLI flag overrides file config
             let preprocess = preprocess || file_cfg.preprocessing_enabled.unwrap_or(false);
@@ -1171,7 +1171,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             // Parse layer filter
@@ -1217,7 +1217,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_expand(namespace, id, json, db_path, &embedding_config).await
@@ -1239,7 +1239,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_get(namespace, id, json, db_path, &embedding_config).await
@@ -1262,7 +1262,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_rag_search(query, limit, namespace, json, db_path, &embedding_config).await
@@ -1278,7 +1278,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_list_namespaces(stats, json, db_path).await
@@ -1298,7 +1298,7 @@ async fn main() -> Result<()> {
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp_servers/rmcp_memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_export(namespace, output, include_embeddings, db_path).await
