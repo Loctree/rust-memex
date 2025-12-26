@@ -1,21 +1,50 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    UInt8Array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Table};
+use lancedb::{Table, connect};
 use moka::future::Cache;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sled::Db;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+use crate::rag::SliceLayer;
+
+/// Schema version for LanceDB tables. Increment when changing table structure.
+/// Version 2: Added onion slice fields (layer, parent_id, children_ids, keywords)
+/// Version 3: Added content_hash for exact-match deduplication
+/// See docs/MIGRATION.md for migration procedures.
+pub const SCHEMA_VERSION: u32 = 3;
+
+// =============================================================================
+// STORAGE BACKEND INTERFACE
+// =============================================================================
+//
+// To add a new storage backend, implement a struct with the following methods:
+//
+//   async fn add_to_store(&self, documents: Vec<ChromaDocument>) -> Result<()>
+//   async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>>
+//   async fn search(&self, namespace: Option<&str>, embedding: &[f32], k: usize) -> Result<Vec<ChromaDocument>>
+//   async fn delete(&self, namespace: &str, id: &str) -> Result<usize>
+//   async fn delete_namespace(&self, namespace: &str) -> Result<usize>
+//
+// Current implementation:
+//   - `StorageManager`: LanceDB (vector store) + sled (KV) + moka (cache)
+//
+// Future alternatives to consider:
+//   - Qdrant, Milvus, Pinecone (external vector DBs)
+//   - SQLite with vector extension
+// =============================================================================
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ChromaDocument {
@@ -24,14 +53,125 @@ pub struct ChromaDocument {
     pub embedding: Vec<f32>,
     pub metadata: serde_json::Value,
     pub document: String,
+    /// Onion slice layer (1=Outer, 2=Middle, 3=Inner, 4=Core, 0=legacy flat)
+    pub layer: u8,
+    /// Parent slice ID in the onion hierarchy (None for Core slices)
+    pub parent_id: Option<String>,
+    /// Children slice IDs in the onion hierarchy
+    pub children_ids: Vec<String>,
+    /// Extracted keywords for this slice
+    pub keywords: Vec<String>,
+    /// SHA256 hash of original content for exact-match deduplication
+    pub content_hash: Option<String>,
+}
+
+impl ChromaDocument {
+    /// Create a new document with default (legacy) slice values
+    pub fn new_flat(
+        id: String,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+        document: String,
+    ) -> Self {
+        Self {
+            id,
+            namespace,
+            embedding,
+            metadata,
+            document,
+            layer: 0, // Legacy flat mode
+            parent_id: None,
+            children_ids: vec![],
+            keywords: vec![],
+            content_hash: None,
+        }
+    }
+
+    /// Create a new document with content hash for deduplication
+    pub fn new_flat_with_hash(
+        id: String,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+        document: String,
+        content_hash: String,
+    ) -> Self {
+        Self {
+            id,
+            namespace,
+            embedding,
+            metadata,
+            document,
+            layer: 0,
+            parent_id: None,
+            children_ids: vec![],
+            keywords: vec![],
+            content_hash: Some(content_hash),
+        }
+    }
+
+    /// Create a document from an onion slice
+    pub fn from_onion_slice(
+        slice: &crate::rag::OnionSlice,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: slice.id.clone(),
+            namespace,
+            embedding,
+            metadata,
+            document: slice.content.clone(),
+            layer: slice.layer.as_u8(),
+            parent_id: slice.parent_id.clone(),
+            children_ids: slice.children_ids.clone(),
+            keywords: slice.keywords.clone(),
+            content_hash: None,
+        }
+    }
+
+    /// Create a document from an onion slice with content hash for deduplication
+    pub fn from_onion_slice_with_hash(
+        slice: &crate::rag::OnionSlice,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+        content_hash: String,
+    ) -> Self {
+        Self {
+            id: slice.id.clone(),
+            namespace,
+            embedding,
+            metadata,
+            document: slice.content.clone(),
+            layer: slice.layer.as_u8(),
+            parent_id: slice.parent_id.clone(),
+            children_ids: slice.children_ids.clone(),
+            keywords: slice.keywords.clone(),
+            content_hash: Some(content_hash),
+        }
+    }
+
+    /// Check if this is a legacy flat chunk (not an onion slice)
+    pub fn is_flat(&self) -> bool {
+        self.layer == 0
+    }
+
+    /// Get the slice layer if this is an onion slice
+    pub fn slice_layer(&self) -> Option<SliceLayer> {
+        SliceLayer::from_u8(self.layer)
+    }
 }
 
 pub struct StorageManager {
     cache: Arc<Cache<String, Vec<u8>>>,
-    db: Db,
+    db: Option<Db>,
     lance: Connection,
     table: Arc<Mutex<Option<Table>>>,
     collection_name: String,
+    lance_path: String,
 }
 
 type BatchIter =
@@ -47,13 +187,16 @@ impl StorageManager {
             .build();
 
         // Persistent K/V for auxiliary state
-        let sled_path = shellexpand::tilde("~/.mcp-servers/sled").to_string();
-        let db = sled::open(sled_path)?;
+        // SLED_PATH env allows unique sled per instance when sharing LanceDB
+        let sled_path = std::env::var("SLED_PATH")
+            .unwrap_or_else(|_| format!("{}/.sled", shellexpand::tilde(db_path)));
+        let sled_path = shellexpand::tilde(&sled_path).to_string();
+        let db = sled::open(&sled_path)?;
 
         // Embedded LanceDB path (expand ~, allow override via env)
         let lance_env = std::env::var("LANCEDB_PATH").unwrap_or_else(|_| db_path.to_string());
         let lance_path = if lance_env.trim().is_empty() {
-            shellexpand::tilde("~/.mcp-servers/mcp_memex/lancedb").to_string()
+            shellexpand::tilde("~/.rmcp_servers/rmcp_memex/lancedb").to_string()
         } else {
             shellexpand::tilde(&lance_env).to_string()
         };
@@ -62,11 +205,38 @@ impl StorageManager {
 
         Ok(Self {
             cache: Arc::new(cache),
-            db,
+            db: Some(db),
             lance,
             table: Arc::new(Mutex::new(None)),
             collection_name: "mcp_documents".to_string(),
+            lance_path,
         })
+    }
+
+    /// Create a LanceDB-only storage manager without sled K/V store.
+    /// Use this for CLI tools that only need vector operations (index/search).
+    /// This allows concurrent access with running MCP server.
+    pub async fn new_lance_only(db_path: &str) -> Result<Self> {
+        let cache = Cache::builder()
+            .max_capacity(64 * 1024 * 1024) // 64MB default for CLI
+            .time_to_live(Duration::from_secs(3600))
+            .build();
+
+        let lance_path = shellexpand::tilde(db_path).to_string();
+        let lance = connect(&lance_path).execute().await?;
+
+        Ok(Self {
+            cache: Arc::new(cache),
+            db: None,
+            lance,
+            table: Arc::new(Mutex::new(None)),
+            collection_name: "mcp_documents".to_string(),
+            lance_path,
+        })
+    }
+
+    pub fn lance_path(&self) -> &str {
+        &self.lance_path
     }
 
     pub async fn ensure_collection(&self) -> Result<()> {
@@ -99,7 +269,9 @@ impl StorageManager {
         if let Some(value) = self.cache.get(key).await {
             return Ok(Some(value));
         }
-        if let Some(value) = self.db.get(key)? {
+        if let Some(ref db) = self.db
+            && let Some(value) = db.get(key)?
+        {
             let vec = value.to_vec();
             self.cache.insert(key.to_string(), vec.clone()).await;
             return Ok(Some(vec));
@@ -109,8 +281,10 @@ impl StorageManager {
 
     pub async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.cache.insert(key.to_string(), value.clone()).await;
-        self.db.insert(key, value)?;
-        self.db.flush()?;
+        if let Some(ref db) = self.db {
+            db.insert(key, value)?;
+            db.flush()?;
+        }
         Ok(())
     }
 
@@ -236,23 +410,10 @@ impl StorageManager {
                 ));
             }
             info!(
-                "Creating Lance table '{}' with vector dimension {}",
-                self.collection_name, dim
+                "Creating Lance table '{}' with vector dimension {} (schema v{})",
+                self.collection_name, dim, SCHEMA_VERSION
             );
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("namespace", DataType::Utf8, false),
-                Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        dim as i32,
-                    ),
-                    false,
-                ),
-                Field::new("text", DataType::Utf8, true),
-                Field::new("metadata", DataType::Utf8, true),
-            ]));
+            let schema = Arc::new(Self::create_schema(dim));
             self.lance
                 .create_empty_table(self.collection_name.as_str(), schema)
                 .execute()
@@ -261,6 +422,31 @@ impl StorageManager {
 
         *guard = Some(table.clone());
         Ok(table)
+    }
+
+    /// Create the LanceDB schema with onion slice fields and content hash
+    fn create_schema(dim: usize) -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                false,
+            ),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("metadata", DataType::Utf8, true),
+            // Onion slice fields (v2 schema)
+            Field::new("layer", DataType::UInt8, true), // 0=flat, 1=outer, 2=middle, 3=inner, 4=core
+            Field::new("parent_id", DataType::Utf8, true), // Parent slice ID
+            Field::new("children_ids", DataType::Utf8, true), // JSON array of children IDs
+            Field::new("keywords", DataType::Utf8, true), // JSON array of keywords
+            // Deduplication field (v3 schema)
+            Field::new("content_hash", DataType::Utf8, true), // SHA256 hash for exact-match dedup
+        ])
     }
 
     fn docs_to_batch(&self, documents: &[ChromaDocument], dim: usize) -> Result<BatchIter> {
@@ -286,20 +472,25 @@ impl StorageManager {
             }
         });
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("namespace", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dim as i32,
-                ),
-                false,
-            ),
-            Field::new("text", DataType::Utf8, true),
-            Field::new("metadata", DataType::Utf8, true),
-        ]));
+        // Onion slice fields
+        let layers: Vec<u8> = documents.iter().map(|d| d.layer).collect();
+        let parent_ids: Vec<Option<&str>> =
+            documents.iter().map(|d| d.parent_id.as_deref()).collect();
+        let children_ids_json: Vec<String> = documents
+            .iter()
+            .map(|d| serde_json::to_string(&d.children_ids).unwrap_or_else(|_| "[]".to_string()))
+            .collect();
+        let keywords_json: Vec<String> = documents
+            .iter()
+            .map(|d| serde_json::to_string(&d.keywords).unwrap_or_else(|_| "[]".to_string()))
+            .collect();
+        // Content hash for deduplication
+        let content_hashes: Vec<Option<&str>> = documents
+            .iter()
+            .map(|d| d.content_hash.as_deref())
+            .collect();
+
+        let schema = Arc::new(Self::create_schema(dim));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -313,6 +504,20 @@ impl StorageManager {
                 ),
                 Arc::new(StringArray::from(texts)),
                 Arc::new(StringArray::from(metadata_strings)),
+                // Onion slice fields
+                Arc::new(UInt8Array::from(layers)),
+                Arc::new(StringArray::from(parent_ids)),
+                Arc::new(StringArray::from(
+                    children_ids_json
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    keywords_json.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                // Content hash for deduplication
+                Arc::new(StringArray::from(content_hashes)),
             ],
         )?;
 
@@ -344,6 +549,24 @@ impl StorageManager {
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
             .ok_or_else(|| anyhow!("Missing vector column"))?;
 
+        // Onion slice fields (optional for backward compatibility with v1 schema)
+        let layer_col = batch
+            .column_by_name("layer")
+            .and_then(|c| c.as_any().downcast_ref::<UInt8Array>());
+        let parent_id_col = batch
+            .column_by_name("parent_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let children_ids_col = batch
+            .column_by_name("children_ids")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let keywords_col = batch
+            .column_by_name("keywords")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        // Content hash field (optional for backward compatibility with v2 schema)
+        let content_hash_col = batch
+            .column_by_name("content_hash")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
         let dim = vector_col.value_length() as usize;
         let values = vector_col
             .values()
@@ -365,15 +588,157 @@ impl StorageManager {
                 emb.push(values.value(offset + j));
             }
 
+            // Read onion slice fields (with v1 schema compatibility)
+            let layer = layer_col
+                .and_then(|col| {
+                    if col.is_null(i) {
+                        None
+                    } else {
+                        Some(col.value(i))
+                    }
+                })
+                .unwrap_or(0);
+
+            let parent_id = parent_id_col.and_then(|col| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i).to_string())
+                }
+            });
+
+            let children_ids: Vec<String> = children_ids_col
+                .and_then(|col| {
+                    if col.is_null(i) {
+                        None
+                    } else {
+                        serde_json::from_str(col.value(i)).ok()
+                    }
+                })
+                .unwrap_or_default();
+
+            let keywords: Vec<String> = keywords_col
+                .and_then(|col| {
+                    if col.is_null(i) {
+                        None
+                    } else {
+                        serde_json::from_str(col.value(i)).ok()
+                    }
+                })
+                .unwrap_or_default();
+
+            let content_hash = content_hash_col.and_then(|col| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i).to_string())
+                }
+            });
+
             docs.push(ChromaDocument {
                 id,
                 namespace,
                 embedding: emb,
                 metadata,
                 document: text,
+                layer,
+                parent_id,
+                children_ids,
+                keywords,
+                content_hash,
             });
         }
         Ok(docs)
+    }
+
+    /// Search with optional layer filtering for onion slice architecture
+    pub async fn search_store_with_layer(
+        &self,
+        namespace: Option<&str>,
+        embedding: Vec<f32>,
+        k: usize,
+        layer_filter: Option<SliceLayer>,
+    ) -> Result<Vec<ChromaDocument>> {
+        if embedding.is_empty() {
+            return Ok(vec![]);
+        }
+        let dim = embedding.len();
+        let table = self.ensure_table(dim).await?;
+
+        let mut query = table.query();
+
+        // Build combined filter
+        let mut filters = Vec::new();
+        if let Some(ns) = namespace {
+            filters.push(self.namespace_filter(ns));
+        }
+        if let Some(layer) = layer_filter {
+            filters.push(self.layer_filter(layer));
+        }
+
+        if !filters.is_empty() {
+            let combined = filters.join(" AND ");
+            query = query.only_if(combined.as_str());
+        }
+
+        let mut stream = query.nearest_to(embedding)?.limit(k).execute().await?;
+
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            let mut docs = self.batch_to_docs(&batch)?;
+            results.append(&mut docs);
+        }
+        debug!(
+            "Lance returned {} results (layer filter: {:?})",
+            results.len(),
+            layer_filter
+        );
+        Ok(results)
+    }
+
+    /// Get a document by ID and expand to get its children
+    pub async fn get_children(
+        &self,
+        namespace: &str,
+        parent_id: &str,
+    ) -> Result<Vec<ChromaDocument>> {
+        // Ensure table exists
+        let _ = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]),
+        };
+
+        // First get the parent document to find children IDs
+        if let Some(parent) = self.get_document(namespace, parent_id).await? {
+            if parent.children_ids.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Query for all children
+            let mut children = Vec::new();
+            for child_id in &parent.children_ids {
+                if let Some(child) = self.get_document(namespace, child_id).await? {
+                    children.push(child);
+                }
+            }
+            return Ok(children);
+        }
+
+        Ok(vec![])
+    }
+
+    /// Get the parent of a document (drill up in onion hierarchy)
+    pub async fn get_parent(
+        &self,
+        namespace: &str,
+        child_id: &str,
+    ) -> Result<Option<ChromaDocument>> {
+        if let Some(child) = self.get_document(namespace, child_id).await?
+            && let Some(ref parent_id) = child.parent_id
+        {
+            return self.get_document(namespace, parent_id).await;
+        }
+        Ok(None)
     }
 
     fn namespace_filter(&self, namespace: &str) -> String {
@@ -382,5 +747,131 @@ impl StorageManager {
 
     fn id_filter(&self, id: &str) -> String {
         format!("id = '{}'", id.replace('\'', "''"))
+    }
+
+    fn layer_filter(&self, layer: SliceLayer) -> String {
+        format!("layer = {}", layer.as_u8())
+    }
+
+    fn content_hash_filter(&self, hash: &str) -> String {
+        format!("content_hash = '{}'", hash.replace('\'', "''"))
+    }
+
+    /// Check if the table schema has content_hash column (schema v3+)
+    async fn table_has_content_hash(table: &Table) -> bool {
+        table
+            .schema()
+            .await
+            .map(|schema| schema.field_with_name("content_hash").is_ok())
+            .unwrap_or(false)
+    }
+
+    /// Check if a content hash already exists in a namespace (for exact-match deduplication)
+    ///
+    /// Returns Ok(false) if:
+    /// - Table doesn't exist yet
+    /// - Table has old schema without content_hash column (graceful degradation)
+    pub async fn has_content_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
+        let table = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(false), // Table doesn't exist yet, no duplicates possible
+        };
+
+        // Graceful handling of old schema without content_hash column
+        if !Self::table_has_content_hash(&table).await {
+            tracing::warn!(
+                "Table '{}' has old schema without content_hash column. \
+                 Deduplication disabled. Consider re-indexing with new schema.",
+                self.collection_name
+            );
+            return Ok(false); // Can't check for duplicates, treat as new
+        }
+
+        let filter = format!(
+            "{} AND {}",
+            self.namespace_filter(namespace),
+            self.content_hash_filter(hash)
+        );
+
+        let mut stream = table
+            .query()
+            .only_if(filter.as_str())
+            .limit(1)
+            .execute()
+            .await?;
+
+        if let Some(batch) = stream.try_next().await? {
+            return Ok(batch.num_rows() > 0);
+        }
+
+        Ok(false)
+    }
+
+    /// Filter a list of hashes to return only those that don't exist in the namespace.
+    /// This is more efficient than calling has_content_hash for each hash individually.
+    ///
+    /// Returns all hashes as "new" if table has old schema without content_hash column.
+    pub async fn filter_existing_hashes<'a>(
+        &self,
+        namespace: &str,
+        hashes: &'a [String],
+    ) -> Result<Vec<&'a String>> {
+        if hashes.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let table = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(hashes.iter().collect()), // Table doesn't exist, all are new
+        };
+
+        // Graceful handling of old schema without content_hash column
+        if !Self::table_has_content_hash(&table).await {
+            tracing::warn!(
+                "Table '{}' has old schema without content_hash column. \
+                 Deduplication disabled. Consider re-indexing with new schema.",
+                self.collection_name
+            );
+            return Ok(hashes.iter().collect()); // All are "new" since we can't check
+        }
+
+        // Query for existing hashes in this namespace
+        // We build a filter with OR conditions for all hashes
+        let hash_conditions: Vec<String> =
+            hashes.iter().map(|h| self.content_hash_filter(h)).collect();
+
+        let filter = format!(
+            "{} AND ({})",
+            self.namespace_filter(namespace),
+            hash_conditions.join(" OR ")
+        );
+
+        let mut stream = table
+            .query()
+            .only_if(filter.as_str())
+            .limit(hashes.len())
+            .execute()
+            .await?;
+
+        // Collect existing hashes from results
+        let mut existing_hashes = std::collections::HashSet::new();
+        while let Some(batch) = stream.try_next().await? {
+            if let Some(hash_col) = batch
+                .column_by_name("content_hash")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..batch.num_rows() {
+                    if !hash_col.is_null(i) {
+                        existing_hashes.insert(hash_col.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        // Return only hashes that don't exist
+        Ok(hashes
+            .iter()
+            .filter(|h| !existing_hashes.contains(h.as_str()))
+            .collect())
     }
 }

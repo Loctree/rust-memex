@@ -1,123 +1,363 @@
-mcp_memex
+# rmcp_memex
 
-Lightweight Model Context Protocol (MCP) server written in Rust. It provides a local Retrieval-Augmented Generation (RAG) toolset backed by an embedded LanceDB vector store and local embeddings. If an MLX HTTP server is available, it is used for embeddings and reranking; otherwise the server falls back to on‑device embeddings via fastembed.
+Lightweight **Model Context Protocol (MCP)** server written in Rust. Provides a local RAG (Retrieval-Augmented Generation) toolset backed by embedded **LanceDB** vector storage. Embeddings are provided via configurable external providers (e.g., Ollama, MLX HTTP bridge, or any OpenAI-compatible endpoint).
 
-Tools exposed to MCP clients
- - rag_index(path, namespace?) — index a file (UTF‑8 text or PDF) into the local vector store
- - rag_index_text(text, id?, namespace?, metadata?) — index raw text (UUID generated when id is omitted)
- - rag_search(query, k=10, namespace?) — search indexed chunks and return the top‑k results
- - memory_upsert(namespace, id, text, metadata?) — upsert single chunk into vector memory
- - memory_get(namespace, id) — fetch stored chunk
- - memory_search(namespace, query, k=5) — semantic search within a namespace
- - memory_delete(namespace, id) — delete a chunk by id
- - memory_purge_namespace(namespace) — drop all chunks in a namespace
+## Features
 
-Overview
- - Stack: Rust 2021, Tokio, Clap
- - Vector store: Embedded LanceDB (no external DB needed)
- - Embeddings: Optional MLX HTTP bridge; automatic fastembed fallback
- - Caching/persistence: moka (in‑memory) + sled (local key/value)
- - IO: reqwest for HTTP; pdf-extract for PDF text
- - Transport: JSON‑RPC over stdin/stdout (compatible with MCP hosts)
+- **Vector Memory**: Store, search, and retrieve text chunks with semantic similarity
+- **Document Indexing**: Index UTF-8 text files and PDFs for RAG queries
+- **Namespace Isolation**: Organize data into separate namespaces
+- **Health Monitoring**: Built-in health tool for status checks
+- **Configuration Wizard**: Interactive TUI for easy setup and host configuration
+- **MCP Compatible**: Works with Claude Desktop, Codex, Cursor, and other MCP hosts
 
- Binary entry point: src/bin/mcp_memex.rs (binary name: mcp_memex). Library API exposes `ServerConfig` + `run_stdio_server` for embedding; server logs to stdout/stderr and reads JSON‑RPC requests from stdin.
+## Quick Start
 
- Requirements
- - Rust toolchain with Cargo (stable)
- - macOS or Linux (Windows likely works but untested)
- - Protobuf compiler: required by some dependencies at build time. If you don’t have it, install it (e.g., macOS: `brew install protobuf`; Linux: `apt install protobuf-compiler`).
- - Optional MLX bridge: HTTP server with /v1/embeddings, /v1/rerank, /v1/models.
+### Installation
 
- Quick start
- ```bash
- # build
- cargo build --release
-
-# run (uses local fastembed by default; LanceDB at ~/.mcp-servers/mcp_memex/lancedb)
-cargo run --release -- --log-level info
-# logs go to stderr; stdout is reserved for JSON-RPC responses
-```
-
-Embed as a library
-```rust
-use mcp_memex::{run_stdio_server, ServerConfig};
-
-# async context
-let config = ServerConfig::default()
-    .with_db_path("/tmp/lancedb"); // override as needed
-run_stdio_server(config).await?;
-```
-
- Configuration
- CLI flags (from src/lib.rs)
- - --features string (default "filesystem,memory,search")
- - --cache-mb usize (default 4096)
- - --db-path string (default "~/.mcp-servers/mcp_memex/lancedb")
- - --log-level trace|debug|info|warn|error (default info)
-
- Environment variables
- - DISABLE_MLX — if set, disables MLX bridge; fastembed only
- - DRAGON_BASE_URL — base URL for MLX HTTP (default http://localhost)
- - MLX_JIT_MODE — "true" to use a single port for all models (default false)
- - MLX_JIT_PORT — JIT mode port (default 1234)
- - EMBEDDER_PORT — non‑JIT embeddings port (default 12345)
- - RERANKER_PORT — non‑JIT rerank port (default 12346)
- - EMBEDDER_MODEL — embeddings model id (default Qwen/Qwen3-Embedding-4B)
- - RERANKER_MODEL — reranker model id (default Qwen/Qwen3-Reranker-4B)
-  - FASTEMBED_CACHE_PATH / HF_HUB_CACHE — if unset, the server sets both to `$HOME/.cache/fastembed` to avoid `.fastembed_cache` in each cwd
-  - LANCEDB_PATH — overrides the --db-path for the embedded DB (default ~/.mcp-servers/mcp_memex/lancedb)
-  - PROTOC — path to protoc if build.rs cannot find the vendored binary
-
-Example (MLX non‑JIT)
 ```bash
-export DRAGON_BASE_URL=http://localhost
-export EMBEDDER_PORT=5555
- export RERANKER_PORT=5556
- ```
+# Clone and build
+git clone https://github.com/Loctree/rmcp-memex.git
+cd rmcp_memex
+cargo build --release
 
-Tools (RPC)
- - rag_index(path: string, namespace?: string)
-   - Extracts text (PDF via pdf-extract; others as UTF‑8)
-   - Chunks to size 512 with overlap 128; embeds (MLX or fastembed)
-   - Inserts into LanceDB table mcp_documents (auto‑created), default namespace "rag"
+# Install to ~/.cargo/bin (optional)
+cp target/release/rmcp_memex ~/.cargo/bin/
+```
 
- - rag_index_text(text: string, id?: string, namespace?: string, metadata?: object)
-   - Single-chunk insert with optional custom id (UUID generated when missing)
-   - Default namespace "rag"
+Or use the install script:
 
- - rag_search(query: string, k: number=10, namespace?: string)
-   - Embeds the query, searches LanceDB, reranks with MLX if available (cosine fallback)
-   - Returns id, namespace, text, score, metadata
+```bash
+./scripts/install.sh
+# For macOS app bundle:
+./scripts/install.sh --bundle-macos
+```
 
- - memory_upsert(namespace: string, id: string, text: string, metadata?: object)
-   - Convenience wrapper to store a single chunk in a namespace
+### Run
 
- - memory_get(namespace: string, id: string)
-   - Returns the stored chunk (id, namespace, text, metadata)
+```bash
+# Start MCP server (serve is REQUIRED)
+rmcp_memex serve
 
- - memory_search(namespace: string, query: string, k: number=5)
-   - Semantic search constrained to the namespace (rerank + cosine fallback)
+# With options
+rmcp_memex serve --db-path ~/mydata/lancedb --log-level debug --cache-mb 2048
+```
 
- - memory_delete(namespace: string, id: string)
- - memory_purge_namespace(namespace: string)
+### Configuration Wizard
 
-Scripts
- - build-macos.sh — builds release and creates a minimal app bundle at ~/.mcp-servers/MCPServer.app with CFBundleExecutable=mcp_memex
- - install.sh — builds the release binary; pass --bundle-macos to also create the app bundle
+Interactive TUI for setting up rmcp_memex and configuring MCP host integrations:
 
- Project structure
- - src/main.rs • src/lib.rs • src/handlers • src/embeddings • src/rag • src/storage
- - build.rs • build-macos.sh • install.sh • Cargo.toml
+```bash
+# Launch wizard
+rmcp_memex wizard
 
- Tests
- ```bash
- cargo test
- ```
+# Dry-run mode (preview changes without writing)
+rmcp_memex wizard --dry-run
+```
 
- License
- MIT — see LICENSE.
+The wizard will:
+1. Auto-detect installed MCP hosts (Codex, Cursor, Claude Desktop, JetBrains, VS Code)
+2. Guide you through memex configuration (database path, cache size, log level, mode)
+3. Generate config snippets for selected hosts
+4. Run health checks to verify setup
+5. Optionally write configuration files (with backups)
 
-Known limitations
- - Only text and PDF ingestion are supported (no HTML/Markdown parsing yet)
- - LanceDB collection name is fixed to mcp_documents (namespacing is handled via a column)
- - Minimal JSON‑RPC loop intended for MCP hosts; richer transport may be added
+## Usage as Library
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rmcp_memex = { git = "https://github.com/Loctree/rmcp-memex.git" }
+```
+
+### Example: Direct RAG Pipeline Access
+
+```rust
+use rmcp_memex::{RAGPipeline, StorageManager, ServerConfig};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize storage
+    let storage = Arc::new(StorageManager::new(4096, "~/.my_app/lancedb").await?);
+    storage.ensure_collection().await?;
+
+    // Create RAG pipeline (no MLX bridge)
+    let mlx = Arc::new(Mutex::new(None));
+    let rag = RAGPipeline::new(mlx, storage).await?;
+
+    // Index text
+    rag.memory_upsert(
+        "my_namespace",
+        "doc1".to_string(),
+        "Important information to remember".to_string(),
+        serde_json::json!({"source": "manual"}),
+    ).await?;
+
+    // Search
+    let results = rag.memory_search("my_namespace", "important", 5).await?;
+    for r in results {
+        println!("{}: {} (score: {})", r.id, r.text, r.score);
+    }
+
+    Ok(())
+}
+```
+
+### Example: Run Full MCP Server Programmatically
+
+```rust
+use rmcp_memex::{run_stdio_server, ServerConfig};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = ServerConfig::default()
+        .with_db_path("~/custom/lancedb");
+    
+    run_stdio_server(config).await
+}
+```
+
+### Exported Types
+
+| Type | Description |
+|------|-------------|
+| `ServerConfig` | Configuration for server/pipeline |
+| `RAGPipeline` | Core RAG operations: index, search, memory |
+| `SearchResult` | Search result with id, text, score, metadata |
+| `StorageManager` | LanceDB + sled + moka cache layer |
+| `ChromaDocument` | Document struct for storage |
+| `UniversalEmbedder` | Configurable embeddings via external providers |
+| `MLXBridge` | Optional MLX HTTP bridge for Apple Silicon |
+| `MCPServer` | MCP protocol handler |
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `health` | Server status: version, db_path, cache_dir, embeddings provider |
+| `rag_index` | Index a file (UTF-8 text or PDF) into vector store |
+| `rag_index_text` | Index raw text with optional ID and metadata |
+| `rag_search` | Semantic search across indexed documents |
+| `memory_upsert` | Store a text chunk in a namespace |
+| `memory_get` | Retrieve a chunk by namespace + ID |
+| `memory_search` | Semantic search within a namespace |
+| `memory_delete` | Delete a chunk by namespace + ID |
+| `memory_purge_namespace` | Delete all chunks in a namespace |
+
+## Namespace Conventions
+
+Namespaces provide data isolation and multi-tenancy. We recommend these naming patterns:
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| `user:<id>` | Per-user memory isolation | `user:alice`, `user:12345` |
+| `agent:<id>` | Per-AI-agent memory | `agent:claude`, `agent:codex` |
+| `session:<id>` | Ephemeral session data | `session:abc123` |
+| `kb:<name>` | Shared knowledge bases | `kb:docs`, `kb:codebase` |
+| `project:<name>` | Project-scoped data | `project:myapp`, `project:rmcp_memex` |
+
+### Best Practices
+
+1. **Use prefixes consistently** — helps with retention policies and access control
+2. **Keep IDs URL-safe** — avoid special characters; use alphanumeric + hyphen/underscore
+3. **Document your schema** — maintain a mapping of namespace patterns in your project
+4. **Consider lifecycle** — `session:*` for temporary, `kb:*` for persistent data
+
+### Examples
+
+```rust
+// Per-user memory
+rag.memory_upsert("user:alice", "pref1", "Likes dark mode".into(), json!({})).await?;
+
+// Shared knowledge base
+rag.memory_upsert("kb:company-docs", "doc1", "Q4 report...".into(), json!({"type": "report"})).await?;
+
+// Session-scoped (clean up after session ends)
+rag.memory_upsert("session:abc123", "context", "Current task...".into(), json!({})).await?;
+rag.purge_namespace("session:abc123").await?; // Cleanup
+```
+
+## Configuration
+
+### CLI Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | — | Path to TOML config file |
+| `--mode` | `full` | Server mode: `memory` (memory-only) or `full` (all features) |
+| `--db-path` | `~/.rmcp_servers/rmcp_memex/lancedb` | LanceDB storage path |
+| `--cache-mb` | `4096` | Cache size in MB |
+| `--log-level` | `info` | Logging level: trace, debug, info, warn, error |
+| `--max-request-bytes` | `5242880` (5 MB) | Max JSON-RPC request size |
+| `--features` | `filesystem,memory,search` | Feature flags (overrides `--mode`) |
+
+### Server Modes
+
+| Mode | Features | Use Case |
+|------|----------|----------|
+| `full` | filesystem, memory, search | Full RAG with document indexing |
+| `memory` | memory, search | Pure vector memory server (no filesystem access) |
+
+```bash
+# Memory-only mode (recommended for AI assistants)
+rmcp_memex serve --mode memory
+
+# Full RAG mode (default)
+rmcp_memex serve --mode full
+```
+
+### TOML Config File
+
+```toml
+mode = "memory"  # or "full"
+db_path = "~/.rmcp_servers/rmcp_memex/lancedb"
+cache_mb = 4096
+log_level = "info"
+max_request_bytes = 5242880
+# features = "memory,search"  # Optional: overrides mode
+```
+
+CLI flags override config file values.
+
+### Embeddings Configuration
+
+Configure embedding providers in `config.toml`:
+
+```toml
+[embeddings]
+required_dimension = 4096
+
+[[embeddings.providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434"
+model = "qwen3-embedding:8b"
+priority = 1
+
+[[embeddings.providers]]
+name = "mlx-fallback"
+base_url = "http://localhost:12345"
+model = "bge-m3"
+priority = 2
+```
+
+Providers are tried in priority order (lowest number first). If a provider fails, the next one is attempted.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `HF_HUB_CACHE` | HuggingFace cache path |
+| `DRAGON_BASE_URL` | MLX HTTP server base URL (default: `http://localhost`) |
+| `MLX_JIT_MODE` | `true` for single-port MLX mode |
+| `MLX_JIT_PORT` | JIT mode port (default: `1234`) |
+| `EMBEDDER_PORT` | Non-JIT embeddings port (default: `12345`) |
+| `RERANKER_PORT` | Non-JIT reranker port (default: `12346`) |
+
+## MCP Host Configuration
+
+### Codex (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers."rmcp_memex"]
+command = "/path/to/rmcp_memex"
+args = ["serve", "--db-path", "~/.rmcp_servers/rmcp_memex/lancedb", "--log-level", "info"]
+startup_timeout_sec = 120
+```
+
+### Claude Desktop (`claude_desktop_config.json`)
+
+```json
+{
+  "mcpServers": {
+    "rmcp_memex": {
+      "command": "/path/to/rmcp_memex",
+      "args": ["serve", "--log-level", "info"]
+    }
+  }
+}
+```
+
+### Cursor / Other MCP Hosts
+
+Use stdio transport with the binary path and desired arguments.
+
+## Library Usage
+
+```rust
+use rmcp_memex::{run_stdio_server, ServerConfig};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = ServerConfig::default()
+        .with_db_path("/custom/path/lancedb");
+    
+    run_stdio_server(config).await
+}
+```
+
+## Architecture
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   MCP Client    │────▶│   rmcp_memex     │────▶│    LanceDB      │
+│ (Claude, Codex) │     │  (JSON-RPC/stdio)│     │  (embeddings)   │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+                               │
+                               ▼
+                        ┌──────────────────┐
+                        │  Embeddings API  │
+                        │ (Ollama/MLX/etc) │
+                        └──────────────────┘
+```
+
+- **Transport**: Newline-delimited JSON-RPC over stdio
+- **Vector Store**: Embedded LanceDB (no external DB required)
+- **Embeddings**: External providers (Ollama, MLX HTTP, OpenAI-compatible)
+- **Caching**: moka (in-memory) + sled (persistent KV)
+
+## Development
+
+```bash
+# Format
+cargo fmt
+
+# Lint
+cargo clippy --all-targets -- -D warnings
+
+# Test
+cargo test
+
+# Build release
+cargo build --release
+```
+
+### Git Hooks
+
+Install pre-commit and pre-push hooks:
+
+```bash
+./tools/install-githooks.sh
+```
+
+Pre-push runs: fmt check, clippy, tests, semgrep.
+
+## Requirements
+
+- **Rust**: Stable toolchain
+- **OS**: macOS, Linux (Windows untested)
+- **Protobuf**: Build uses vendored protoc, but system protoc may be needed:
+  - macOS: `brew install protobuf`
+  - Linux: `apt install protobuf-compiler`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Links
+
+- **Repository**: https://github.com/Loctree/rmcp_memex
+- **Changelog**: [CHANGELOG.md](CHANGELOG.md)
+- **Loctree Integration**: [docs/LOCTREE_INTEGRATION_PROPOSAL.md](docs/LOCTREE_INTEGRATION_PROPOSAL.md)
