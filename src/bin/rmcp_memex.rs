@@ -8,9 +8,9 @@ use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig,
-    ProviderConfig, RAGPipeline, RerankerConfig, ServerConfig, SliceLayer, SliceMode,
-    StorageManager, WizardConfig, run_stdio_server, run_wizard,
+    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, MlxConfig, NamespaceSecurityConfig,
+    PreprocessingConfig, ProviderConfig, RAGPipeline, RerankerConfig, ServerConfig, SliceLayer,
+    SliceMode, StorageManager, WizardConfig, run_stdio_server, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -360,6 +360,11 @@ enum Commands {
         /// Uses SHA256 hash of original content before any preprocessing.
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
+
+        /// Show smart progress bar with ETA based on calibration.
+        /// Displays three phases: pre-scan, calibration, and indexing progress.
+        #[arg(long)]
+        progress: bool,
     },
 
     /// Semantic search within a namespace
@@ -1003,6 +1008,8 @@ struct BatchIndexConfig {
     slice_mode: SliceMode,
     dedup: bool,
     embedding_config: EmbeddingConfig,
+    /// Show smart progress bar with calibration-based ETA
+    show_progress: bool,
 }
 
 /// Run batch indexing
@@ -1018,6 +1025,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         slice_mode,
         dedup,
         embedding_config,
+        show_progress,
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
     let expanded = shellexpand::tilde(path.to_str().unwrap_or("")).to_string();
@@ -1037,13 +1045,22 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         SliceMode::Onion => "onion (hierarchical)",
         SliceMode::Flat => "flat (traditional)",
     };
-    eprintln!("Found {} files to index (slice mode: {})", total, mode_name);
-    if preprocess {
-        eprintln!("Preprocessing enabled: filtering tool artifacts, CLI output, and metadata");
-    }
-    if dedup {
-        eprintln!("Deduplication enabled: skipping files with identical content");
-    }
+
+    // Initialize progress tracker if --progress flag is set
+    let mut tracker = if show_progress {
+        let t = IndexProgressTracker::pre_scan(&files);
+        t.display_pre_scan();
+        Some(t)
+    } else {
+        eprintln!("Found {} files to index (slice mode: {})", total, mode_name);
+        if preprocess {
+            eprintln!("Preprocessing enabled: filtering tool artifacts, CLI output, and metadata");
+        }
+        if dedup {
+            eprintln!("Deduplication enabled: skipping files with identical content");
+        }
+        None
+    };
 
     // Initialize RAG pipeline - db_path is from CLI args or config, validated at load time
     let expanded_db = shellexpand::tilde(&db_path).to_string();
@@ -1071,14 +1088,36 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     let mut failed = 0;
     let mut total_chunks = 0;
 
+    // Get embedder model name for calibration display
+    let embedder_model = embedding_config
+        .providers
+        .first()
+        .map(|p| p.model.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
     for (i, file_path) in files.iter().enumerate() {
-        let progress = format!("[{}/{}]", i + 1, total);
+        // Start calibration on first file if progress mode
+        if i == 0
+            && let Some(ref mut t) = tracker
+        {
+            t.start_calibration();
+        }
+
         let display_path = file_path
             .strip_prefix(&canonical)
             .unwrap_or(file_path)
             .display();
 
-        eprint!("{} Indexing {}... ", progress, display_path);
+        // Update progress bar message or print progress line
+        if let Some(ref mut t) = tracker {
+            t.set_message(&format!("{}", display_path));
+        } else {
+            let progress = format!("[{}/{}]", i + 1, total);
+            eprint!("{} Indexing {}... ", progress, display_path);
+        }
+
+        // Get file size for calibration adjustment
+        let file_bytes = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
 
         if dedup {
             // Use dedup-enabled indexing
@@ -1096,16 +1135,44 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
             match result {
                 Ok(rmcp_memex::IndexResult::Indexed { chunks_indexed, .. }) => {
-                    eprintln!("done ({} chunks)", chunks_indexed);
+                    if let Some(ref mut t) = tracker {
+                        // Finish calibration after first file
+                        if i == 0 {
+                            t.finish_calibration(chunks_indexed, &embedder_model);
+                            t.adjust_estimate(file_bytes, chunks_indexed);
+                            t.start_progress_bar();
+                        }
+                        t.file_indexed(chunks_indexed);
+                    } else {
+                        eprintln!("done ({} chunks)", chunks_indexed);
+                    }
                     indexed += 1;
                     total_chunks += chunks_indexed;
                 }
                 Ok(rmcp_memex::IndexResult::Skipped { reason, .. }) => {
-                    eprintln!("SKIPPED ({})", reason);
+                    if let Some(ref mut t) = tracker {
+                        // If first file is skipped, we need to handle calibration differently
+                        if i == 0 {
+                            // Use a default speed estimate since we couldn't calibrate
+                            t.finish_calibration(0, &embedder_model);
+                            t.start_progress_bar();
+                        }
+                        t.file_skipped();
+                    } else {
+                        eprintln!("SKIPPED ({})", reason);
+                    }
                     skipped += 1;
                 }
                 Err(e) => {
-                    eprintln!("FAILED: {}", e);
+                    if let Some(ref mut t) = tracker {
+                        if i == 0 {
+                            t.finish_calibration(0, &embedder_model);
+                            t.start_progress_bar();
+                        }
+                        t.file_failed();
+                    } else {
+                        eprintln!("FAILED: {}", e);
+                    }
                     failed += 1;
                 }
             }
@@ -1121,37 +1188,62 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
             match result {
                 Ok(()) => {
-                    eprintln!("done");
+                    if let Some(ref mut t) = tracker {
+                        // Without dedup, we don't know chunk count, estimate based on file size
+                        let estimated_chunks = (file_bytes as usize) / 500;
+                        if i == 0 {
+                            t.finish_calibration(estimated_chunks.max(1), &embedder_model);
+                            t.adjust_estimate(file_bytes, estimated_chunks.max(1));
+                            t.start_progress_bar();
+                        }
+                        t.file_indexed(estimated_chunks.max(1));
+                    } else {
+                        eprintln!("done");
+                    }
                     indexed += 1;
                 }
                 Err(e) => {
-                    eprintln!("FAILED: {}", e);
+                    if let Some(ref mut t) = tracker {
+                        if i == 0 {
+                            t.finish_calibration(0, &embedder_model);
+                            t.start_progress_bar();
+                        }
+                        t.file_failed();
+                    } else {
+                        eprintln!("FAILED: {}", e);
+                    }
                     failed += 1;
                 }
             }
         }
     }
 
-    eprintln!();
-    eprintln!("Indexing complete:");
-    eprintln!("  New chunks:        {}", total_chunks);
-    eprintln!("  Files indexed:     {}", indexed);
-    if dedup && skipped > 0 {
-        eprintln!("  Skipped (duplicate): {}", skipped);
+    // Display summary
+    if let Some(ref mut t) = tracker {
+        t.finish();
+        t.display_summary();
+    } else {
+        eprintln!();
+        eprintln!("Indexing complete:");
+        eprintln!("  New chunks:        {}", total_chunks);
+        eprintln!("  Files indexed:     {}", indexed);
+        if dedup && skipped > 0 {
+            eprintln!("  Skipped (duplicate): {}", skipped);
+        }
+        if failed > 0 {
+            eprintln!("  Failed:            {}", failed);
+        }
+        eprintln!("  Total processed:   {}", total);
+        if let Some(ns) = ns {
+            eprintln!("  Namespace:         {}", ns);
+        }
+        eprintln!("  Slice mode:        {}", mode_name);
+        eprintln!(
+            "  Deduplication:     {}",
+            if dedup { "enabled" } else { "disabled" }
+        );
+        eprintln!("  DB path:           {}", expanded_db);
     }
-    if failed > 0 {
-        eprintln!("  Failed:            {}", failed);
-    }
-    eprintln!("  Total processed:   {}", total);
-    if let Some(ns) = ns {
-        eprintln!("  Namespace:         {}", ns);
-    }
-    eprintln!("  Slice mode:        {}", mode_name);
-    eprintln!(
-        "  Deduplication:     {}",
-        if dedup { "enabled" } else { "disabled" }
-    );
-    eprintln!("  DB path:           {}", expanded_db);
 
     Ok(())
 }
@@ -1178,6 +1270,7 @@ async fn main() -> Result<()> {
             preprocess,
             slice_mode,
             dedup,
+            progress,
         }) => {
             // Get db_path and cache_mb from config or defaults
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -1208,6 +1301,7 @@ async fn main() -> Result<()> {
                 slice_mode,
                 dedup,
                 embedding_config,
+                show_progress: progress,
             })
             .await
         }

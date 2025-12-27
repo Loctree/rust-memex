@@ -65,6 +65,9 @@ shellexpand = "3.1"
 ratatui = "0.29"
 crossterm = "0.29"
 
+# Progress bar for CLI
+indicatif = "0.17"
+
 [build-dependencies]
 protoc-bin-vendored = "3"
 

@@ -2,6 +2,7 @@ pub mod common;
 pub mod embeddings;
 pub mod handlers;
 pub mod preprocessing;
+pub mod progress;
 pub mod rag;
 pub mod security;
 pub mod storage;
@@ -18,6 +19,7 @@ pub use embeddings::{
 };
 pub use handlers::{MCPServer, create_server};
 pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
+pub use progress::IndexProgressTracker;
 pub use rag::{
     IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline, SearchOptions, SearchResult,
     SliceLayer, SliceMode, compute_content_hash, create_onion_slices,
