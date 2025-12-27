@@ -384,19 +384,48 @@ pub async fn import_lancedb(
     }
 }
 
-/// Recursively copy a directory
+/// Recursively copy a directory with path validation
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(dst).await?;
+    use crate::tui::path_utils::{validate_read_path, validate_write_path};
 
-    let mut entries = tokio::fs::read_dir(src).await?;
+    // Validate source directory is safe to read
+    let safe_src = validate_read_path(src)?;
+
+    // Validate destination is safe to write
+    let safe_dst = validate_write_path(dst)?;
+
+    tokio::fs::create_dir_all(&safe_dst).await?;
+
+    // Path is validated by validate_read_path above
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let mut entries = tokio::fs::read_dir(&safe_src).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let dest_path = dst.join(entry.file_name());
+
+        // Validate each entry path to prevent symlink attacks
+        let entry_name = entry.file_name();
+        let entry_name_str = entry_name.to_string_lossy();
+
+        // Reject suspicious filenames
+        if entry_name_str.contains("..")
+            || entry_name_str.starts_with('.')
+                && entry_name_str.len() > 1
+                && entry_name_str.chars().nth(1) == Some('.')
+        {
+            continue; // Skip potentially dangerous entries
+        }
+
+        let dest_path = safe_dst.join(&entry_name);
 
         if path.is_dir() {
             Box::pin(copy_dir_recursive(&path, &dest_path)).await?;
         } else {
-            tokio::fs::copy(&path, &dest_path).await?;
+            // Validate individual file paths
+            if let (Ok(safe_file_src), Ok(safe_file_dst)) =
+                (validate_read_path(&path), validate_write_path(&dest_path))
+            {
+                tokio::fs::copy(&safe_file_src, &safe_file_dst).await?;
+            }
         }
     }
 
@@ -499,20 +528,20 @@ async fn run_indexing(
     Ok(())
 }
 
-/// Validate a path entered by the user
+/// Validate a path entered by the user with security checks
 pub fn validate_path(path: &str) -> Result<PathBuf> {
+    use crate::tui::path_utils::sanitize_existing_path;
+
     if path.trim().is_empty() {
         return Err(anyhow!("Path cannot be empty"));
     }
 
-    let expanded = shellexpand::tilde(path.trim()).to_string();
-    let path_buf = PathBuf::from(&expanded);
-
-    if !path_buf.exists() {
-        return Err(anyhow!("Path does not exist: {}", expanded));
-    }
-
-    Ok(path_buf)
+    // Use secure path sanitization which:
+    // 1. Checks for path traversal sequences
+    // 2. Expands tilde
+    // 3. Canonicalizes the path
+    // 4. Validates it's under an allowed directory
+    sanitize_existing_path(path)
 }
 
 #[cfg(test)]

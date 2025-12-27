@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // =============================================================================
@@ -397,11 +397,31 @@ fn backup_timestamp() -> String {
 }
 
 /// Create a backup of an existing config file
-fn create_backup(path: &PathBuf) -> Result<PathBuf> {
-    let backup_path = PathBuf::from(format!("{}.bak.{}", path.display(), backup_timestamp()));
-    std::fs::copy(path, &backup_path)
-        .with_context(|| format!("Failed to create backup of {}", path.display()))?;
-    Ok(backup_path)
+fn create_backup(path: &Path) -> Result<PathBuf> {
+    use crate::tui::path_utils::{validate_read_path, validate_write_path};
+
+    // Validate source path is safe to read
+    let safe_src = validate_read_path(path).with_context(|| {
+        format!(
+            "Cannot backup: source path validation failed for {}",
+            path.display()
+        )
+    })?;
+
+    let backup_path = PathBuf::from(format!("{}.bak.{}", safe_src.display(), backup_timestamp()));
+
+    // Validate backup destination is safe to write
+    let safe_dst = validate_write_path(&backup_path).with_context(|| {
+        format!(
+            "Cannot backup: destination path validation failed for {}",
+            backup_path.display()
+        )
+    })?;
+
+    // Path is validated by validate_read_path/validate_write_path above
+    std::fs::copy(&safe_src, &safe_dst) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to create backup of {}", safe_src.display()))?;
+    Ok(safe_dst)
 }
 
 /// Merge rmcp_memex server entry into existing JSON config
@@ -503,10 +523,21 @@ pub fn write_host_config(
         None
     };
 
+    use crate::tui::path_utils::{validate_read_path, validate_write_path};
+
     // Read existing content or use empty string
     let existing_content = if host.exists {
-        std::fs::read_to_string(&host.path)
-            .with_context(|| format!("Failed to read {}", host.path.display()))?
+        // Validate path before reading
+        let safe_read_path = validate_read_path(&host.path).with_context(|| {
+            format!(
+                "Cannot read config: path validation failed for {}",
+                host.path.display()
+            )
+        })?;
+        // Path is validated by validate_read_path above
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        std::fs::read_to_string(&safe_read_path)
+            .with_context(|| format!("Failed to read {}", safe_read_path.display()))?
     } else {
         String::new()
     };
@@ -517,9 +548,17 @@ pub fn write_host_config(
         HostFormat::Toml => merge_toml_config(&existing_content, binary_path, db_path)?,
     };
 
+    // Validate path before writing
+    let safe_write_path = validate_write_path(&host.path).with_context(|| {
+        format!(
+            "Cannot write config: path validation failed for {}",
+            host.path.display()
+        )
+    })?;
+
     // Write the merged config
-    std::fs::write(&host.path, &new_content)
-        .with_context(|| format!("Failed to write config to {}", host.path.display()))?;
+    std::fs::write(&safe_write_path, &new_content)
+        .with_context(|| format!("Failed to write config to {}", safe_write_path.display()))?;
 
     Ok(WriteResult {
         host_name,

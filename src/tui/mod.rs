@@ -17,6 +17,7 @@ mod detection;
 mod health;
 mod host_detection;
 mod indexer;
+mod path_utils;
 mod ui;
 
 pub use app::{WizardConfig, run_wizard};
