@@ -1053,7 +1053,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Use lance-only storage for CLI - no sled lock conflict with running server
+    // Use lance-only storage for CLI - smaller cache for CLI use
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
     let storage = Arc::new(StorageManager::new_lance_only(&expanded_db).await?);
     let rag = RAGPipeline::new(embedding_client, storage).await?;

@@ -9,12 +9,9 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Table, connect};
-use moka::future::Cache;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sled::Db;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -39,7 +36,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 //   async fn delete_namespace(&self, namespace: &str) -> Result<usize>
 //
 // Current implementation:
-//   - `StorageManager`: LanceDB (vector store) + sled (KV) + moka (cache)
+//   - `StorageManager`: LanceDB embedded vector store
 //
 // Future alternatives to consider:
 //   - Qdrant, Milvus, Pinecone (external vector DBs)
@@ -166,8 +163,6 @@ impl ChromaDocument {
 }
 
 pub struct StorageManager {
-    cache: Arc<Cache<String, Vec<u8>>>,
-    db: Option<Db>,
     lance: Connection,
     table: Arc<Mutex<Option<Table>>>,
     collection_name: String,
@@ -178,21 +173,7 @@ type BatchIter =
     RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>;
 
 impl StorageManager {
-    pub async fn new(cache_mb: usize, db_path: &str) -> Result<Self> {
-        // In-memory cache for misc K/V usage
-        let cache_bytes = cache_mb * 1024 * 1024;
-        let cache = Cache::builder()
-            .max_capacity(cache_bytes as u64)
-            .time_to_live(Duration::from_secs(3600))
-            .build();
-
-        // Persistent K/V for auxiliary state
-        // SLED_PATH env allows unique sled per instance when sharing LanceDB
-        let sled_path = std::env::var("SLED_PATH")
-            .unwrap_or_else(|_| format!("{}/.sled", shellexpand::tilde(db_path)));
-        let sled_path = shellexpand::tilde(&sled_path).to_string();
-        let db = sled::open(&sled_path)?;
-
+    pub async fn new(_cache_mb: usize, db_path: &str) -> Result<Self> {
         // Embedded LanceDB path (expand ~, allow override via env)
         let lance_env = std::env::var("LANCEDB_PATH").unwrap_or_else(|_| db_path.to_string());
         let lance_path = if lance_env.trim().is_empty() {
@@ -204,8 +185,6 @@ impl StorageManager {
         let lance = connect(&lance_path).execute().await?;
 
         Ok(Self {
-            cache: Arc::new(cache),
-            db: Some(db),
             lance,
             table: Arc::new(Mutex::new(None)),
             collection_name: "mcp_documents".to_string(),
@@ -213,21 +192,13 @@ impl StorageManager {
         })
     }
 
-    /// Create a LanceDB-only storage manager without sled K/V store.
+    /// Create a storage manager for CLI tools.
     /// Use this for CLI tools that only need vector operations (index/search).
-    /// This allows concurrent access with running MCP server.
     pub async fn new_lance_only(db_path: &str) -> Result<Self> {
-        let cache = Cache::builder()
-            .max_capacity(64 * 1024 * 1024) // 64MB default for CLI
-            .time_to_live(Duration::from_secs(3600))
-            .build();
-
         let lance_path = shellexpand::tilde(db_path).to_string();
         let lance = connect(&lance_path).execute().await?;
 
         Ok(Self {
-            cache: Arc::new(cache),
-            db: None,
             lance,
             table: Arc::new(Mutex::new(None)),
             collection_name: "mcp_documents".to_string(),
@@ -261,29 +232,6 @@ impl StorageManager {
                     self.collection_name
                 );
             }
-        }
-        Ok(())
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.cache.get(key).await {
-            return Ok(Some(value));
-        }
-        if let Some(ref db) = self.db
-            && let Some(value) = db.get(key)?
-        {
-            let vec = value.to_vec();
-            self.cache.insert(key.to_string(), vec.clone()).await;
-            return Ok(Some(vec));
-        }
-        Ok(None)
-    }
-
-    pub async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
-        self.cache.insert(key.to_string(), value.clone()).await;
-        if let Some(ref db) = self.db {
-            db.insert(key, value)?;
-            db.flush()?;
         }
         Ok(())
     }

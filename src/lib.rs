@@ -31,7 +31,7 @@ pub struct ServerConfig {
     /// Enabled features (namespaced strings). Currently informational/reserved.
     pub features: Vec<String>,
 
-    /// Cache size in MB for sled/moka
+    /// Cache size in MB for moka in-memory cache
     pub cache_mb: usize,
 
     /// Path for embedded vector store (LanceDB)
