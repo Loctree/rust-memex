@@ -71,13 +71,16 @@ struct RerankResult {
 // =============================================================================
 
 /// Single embedding provider configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderConfig {
     /// Human-readable name for logging
+    #[serde(default)]
     pub name: String,
     /// Base URL (e.g., "http://localhost:11434")
+    #[serde(default)]
     pub base_url: String,
     /// Model name to use
+    #[serde(default)]
     pub model: String,
     /// Priority (1 = highest, tried first)
     #[serde(default = "default_priority")]
@@ -167,6 +170,29 @@ impl Default for EmbeddingConfig {
             ],
             reranker: RerankerConfig::default(),
         }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Returns the name of the first (highest priority) provider
+    pub fn provider_name(&self) -> String {
+        self.providers
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    /// Returns the model name of the first (highest priority) provider
+    pub fn model_name(&self) -> String {
+        self.providers
+            .first()
+            .map(|p| p.model.clone())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    /// Alias for required_dimension for API compatibility
+    pub fn dimension(&self) -> usize {
+        self.required_dimension
     }
 }
 
