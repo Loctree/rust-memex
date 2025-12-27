@@ -519,29 +519,93 @@ impl EmbeddingClient {
     }
 
     pub async fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        let text_preview: String = text.chars().take(100).collect();
+        tracing::debug!(
+            "Embedding single text ({} chars): {}{}",
+            text.chars().count(),
+            text_preview,
+            if text.chars().count() > 100 {
+                "..."
+            } else {
+                ""
+            }
+        );
+
         let request = EmbeddingRequest {
             input: vec![text.to_string()],
             model: self.embedder_model.clone(),
         };
 
-        let response = self
+        let response = match self
             .client
             .post(&self.embedder_url)
             .json(&request)
             .send()
-            .await?
-            .json::<EmbeddingResponse>()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!(
+                    "Embedding request failed: {:?}\n  URL: {}\n  Model: {}",
+                    e,
+                    self.embedder_url,
+                    self.embedder_model
+                );
+                return Err(anyhow!("Embedding request failed: {}", e));
+            }
+        };
 
-        let embedding = response
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to read response body: {:?}", e);
+            "<failed to read body>".to_string()
+        });
+
+        if !status.is_success() {
+            tracing::error!(
+                "Embedding API error (HTTP {}):\n  URL: {}\n  Model: {}\n  Response: {}",
+                status,
+                self.embedder_url,
+                self.embedder_model,
+                response_text
+            );
+            return Err(anyhow!(
+                "Embedding API error (HTTP {}): {}",
+                status,
+                response_text
+            ));
+        }
+
+        let parsed: EmbeddingResponse = match serde_json::from_str(&response_text) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to parse embedding response: {:?}\n  Response body: {}",
+                    e,
+                    response_text
+                );
+                return Err(anyhow!("Failed to parse embedding response: {}", e));
+            }
+        };
+
+        let embedding = parsed
             .data
             .into_iter()
             .next()
             .map(|d| d.embedding)
-            .ok_or_else(|| anyhow!("No embedding returned"))?;
+            .ok_or_else(|| {
+                tracing::error!("No embedding returned in response: {}", response_text);
+                anyhow!("No embedding returned")
+            })?;
 
         // Validate dimension
         if embedding.len() != self.required_dimension {
+            tracing::error!(
+                "Dimension mismatch! Expected {}, got {}. Model: {}",
+                self.required_dimension,
+                embedding.len(),
+                self.embedder_model
+            );
             return Err(anyhow!(
                 "Dimension mismatch! Expected {}, got {}. This would corrupt the database!",
                 self.required_dimension,
@@ -549,6 +613,7 @@ impl EmbeddingClient {
             ));
         }
 
+        tracing::debug!("Successfully embedded text ({} dims)", embedding.len());
         Ok(embedding)
     }
 
@@ -612,31 +677,151 @@ impl EmbeddingClient {
 
     /// Internal batch embedding - sends directly to server
     async fn embed_batch_internal(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let total_chars: usize = texts.iter().map(|t| t.chars().count()).sum();
+
+        tracing::debug!(
+            "Embedding batch: {} texts, {} chars total",
+            texts.len(),
+            total_chars
+        );
+
+        // Log first few chars of each text in trace mode for debugging
+        for (i, text) in texts.iter().enumerate() {
+            let preview: String = text.chars().take(50).collect();
+            tracing::trace!(
+                "  Batch[{}]: {} chars - {}{}",
+                i,
+                text.chars().count(),
+                preview,
+                if text.chars().count() > 50 { "..." } else { "" }
+            );
+        }
+
         let request = EmbeddingRequest {
             input: texts.to_vec(),
             model: self.embedder_model.clone(),
         };
 
-        tracing::debug!(
-            "Embedding batch: {} texts, {} chars",
-            texts.len(),
-            texts.iter().map(|t| t.len()).sum::<usize>()
-        );
-
-        let response = self
+        let response = match self
             .client
             .post(&self.embedder_url)
             .json(&request)
             .send()
-            .await?
-            .json::<EmbeddingResponse>()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!(
+                    "Batch embedding request failed: {:?}\n  URL: {}\n  Model: {}\n  Batch size: {} texts, {} chars",
+                    e,
+                    self.embedder_url,
+                    self.embedder_model,
+                    texts.len(),
+                    total_chars
+                );
+                // Log which texts were in the failing batch
+                for (i, text) in texts.iter().enumerate() {
+                    let preview: String = text.chars().take(100).collect();
+                    tracing::debug!(
+                        "  Failed batch[{}] ({} chars): {}{}",
+                        i,
+                        text.chars().count(),
+                        preview,
+                        if text.chars().count() > 100 {
+                            "..."
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                return Err(anyhow!("Batch embedding request failed: {}", e));
+            }
+        };
 
-        let embeddings: Vec<Vec<f32>> = response.data.into_iter().map(|d| d.embedding).collect();
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to read response body: {:?}", e);
+            "<failed to read body>".to_string()
+        });
 
-        // Validate dimensions
+        if !status.is_success() {
+            tracing::error!(
+                "Batch embedding API error (HTTP {}):\n  URL: {}\n  Model: {}\n  Batch: {} texts, {} chars\n  Response: {}",
+                status,
+                self.embedder_url,
+                self.embedder_model,
+                texts.len(),
+                total_chars,
+                response_text
+            );
+            // Log which texts were in the failing batch
+            for (i, text) in texts.iter().enumerate() {
+                let preview: String = text.chars().take(100).collect();
+                tracing::debug!(
+                    "  Failed batch[{}] ({} chars): {}{}",
+                    i,
+                    text.chars().count(),
+                    preview,
+                    if text.chars().count() > 100 {
+                        "..."
+                    } else {
+                        ""
+                    }
+                );
+            }
+            return Err(anyhow!(
+                "Batch embedding API error (HTTP {}): {}",
+                status,
+                response_text
+            ));
+        }
+
+        let parsed: EmbeddingResponse = match serde_json::from_str(&response_text) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to parse batch embedding response: {:?}\n  Batch: {} texts\n  Response body (first 500 chars): {}",
+                    e,
+                    texts.len(),
+                    response_text.chars().take(500).collect::<String>()
+                );
+                return Err(anyhow!("Failed to parse batch embedding response: {}", e));
+            }
+        };
+
+        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
+
+        // Validate count
+        if embeddings.len() != texts.len() {
+            tracing::error!(
+                "Embedding count mismatch! Sent {} texts, got {} embeddings",
+                texts.len(),
+                embeddings.len()
+            );
+            return Err(anyhow!(
+                "Embedding count mismatch! Sent {} texts, got {} embeddings",
+                texts.len(),
+                embeddings.len()
+            ));
+        }
+
+        // Validate dimensions with per-chunk diagnostics
         for (i, emb) in embeddings.iter().enumerate() {
             if emb.len() != self.required_dimension {
+                let text_preview: String = texts[i].chars().take(100).collect();
+                tracing::error!(
+                    "Dimension mismatch in batch[{}]! Expected {}, got {}.\n  Text ({} chars): {}{}",
+                    i,
+                    self.required_dimension,
+                    emb.len(),
+                    texts[i].chars().count(),
+                    text_preview,
+                    if texts[i].chars().count() > 100 {
+                        "..."
+                    } else {
+                        ""
+                    }
+                );
                 return Err(anyhow!(
                     "Dimension mismatch in batch[{}]! Expected {}, got {}",
                     i,
@@ -645,6 +830,13 @@ impl EmbeddingClient {
                 ));
             }
         }
+
+        tracing::debug!(
+            "Successfully embedded batch: {} texts -> {} embeddings ({} dims each)",
+            texts.len(),
+            embeddings.len(),
+            self.required_dimension
+        );
 
         Ok(embeddings)
     }
@@ -658,22 +850,75 @@ impl EmbeddingClient {
             .as_ref()
             .ok_or_else(|| anyhow!("Reranker model not configured."))?;
 
+        let query_preview: String = query.chars().take(100).collect();
+        tracing::debug!(
+            "Reranking {} documents for query: {}{}",
+            documents.len(),
+            query_preview,
+            if query.chars().count() > 100 {
+                "..."
+            } else {
+                ""
+            }
+        );
+
         let request = RerankRequest {
             query: query.to_string(),
             documents: documents.to_vec(),
             model: reranker_model.clone(),
         };
 
-        let response = self
-            .client
-            .post(reranker_url)
-            .json(&request)
-            .send()
-            .await?
-            .json::<RerankResponse>()
-            .await?;
+        let response = match self.client.post(reranker_url).json(&request).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!(
+                    "Rerank request failed: {:?}\n  URL: {}\n  Model: {}\n  Query: {}\n  Documents: {}",
+                    e,
+                    reranker_url,
+                    reranker_model,
+                    query_preview,
+                    documents.len()
+                );
+                return Err(anyhow!("Rerank request failed: {}", e));
+            }
+        };
 
-        Ok(response
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to read rerank response body: {:?}", e);
+            "<failed to read body>".to_string()
+        });
+
+        if !status.is_success() {
+            tracing::error!(
+                "Rerank API error (HTTP {}):\n  URL: {}\n  Model: {}\n  Response: {}",
+                status,
+                reranker_url,
+                reranker_model,
+                response_text
+            );
+            return Err(anyhow!(
+                "Rerank API error (HTTP {}): {}",
+                status,
+                response_text
+            ));
+        }
+
+        let parsed: RerankResponse = match serde_json::from_str(&response_text) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to parse rerank response: {:?}\n  Response body: {}",
+                    e,
+                    response_text
+                );
+                return Err(anyhow!("Failed to parse rerank response: {}", e));
+            }
+        };
+
+        tracing::debug!("Rerank complete: {} documents scored", parsed.results.len());
+
+        Ok(parsed
             .results
             .into_iter()
             .map(|r| (r.index, r.score))
