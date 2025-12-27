@@ -3,7 +3,6 @@
 //! Renders the wizard UI using ratatui widgets.
 
 use crate::tui::app::{App, WizardStep};
-#[allow(unused_imports)]
 use crate::tui::detection::ProviderStatus;
 use crate::tui::health::CheckStatus;
 use crate::tui::indexer::{DataSetupOption, DataSetupSubStep, ImportMode};
@@ -132,7 +131,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(format!(
             "Detected {} MCP host configuration(s)",
-            app.hosts.iter().filter(|h| h.exists).count()
+            app.hosts.iter().filter(|(_kind, h)| h.exists).count()
         )),
         Line::from(""),
         if app.dry_run {
@@ -231,18 +230,18 @@ fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
         .hosts
         .iter()
         .enumerate()
-        .map(|(i, host)| {
+        .map(|(i, (kind, detection))| {
             let is_focused = i == app.focus;
             let is_selected = app.selected_hosts.contains(&i);
 
             let checkbox = if is_selected { "[x]" } else { "[ ]" };
-            let status = host.status_icon();
+            let status = detection.status_icon();
 
             let style = if is_focused {
                 Style::default().fg(Color::Cyan).bold()
             } else if is_selected {
                 Style::default().fg(Color::Green)
-            } else if !host.exists {
+            } else if !detection.exists {
                 Style::default().fg(Color::DarkGray)
             } else {
                 Style::default()
@@ -254,12 +253,12 @@ fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(prefix, style),
                 Span::styled(format!("{} ", checkbox), style),
                 Span::styled(format!("{} ", status), style),
-                Span::styled(format!("{:<20}", host.kind.display_name()), style),
+                Span::styled(format!("{:<20}", kind.display_name()), style),
                 Span::styled(
-                    format!(" {} ", host.status_text()),
-                    if host.has_rmcp_memex {
+                    format!(" {} ", detection.status_text()),
+                    if detection.has_rmcp_memex {
                         Style::default().fg(Color::Green)
-                    } else if host.exists {
+                    } else if detection.exists {
                         Style::default().fg(Color::Yellow)
                     } else {
                         Style::default().fg(Color::DarkGray)
@@ -464,6 +463,10 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(format!(
         "  Dimension: {}",
         app.embedding_config.dimension()
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("             {}", app.embedder_state.dimension_hint()),
+        Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
 
@@ -681,8 +684,8 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for host in selected {
-            lines.push(Line::from(format!("  • {}", host.kind.display_name())));
+        for (kind, _detection) in selected {
+            lines.push(Line::from(format!("  • {}", kind.display_name())));
         }
     }
 

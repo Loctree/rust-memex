@@ -5,11 +5,12 @@
 
 use crate::embeddings::{EmbeddingConfig, ProviderConfig};
 use crate::tui::detection::{
-    DetectedProvider, ProviderKind, detect_providers, dimension_explanation,
+    DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
 };
 use crate::tui::health::{HealthCheckResult, HealthChecker};
 use crate::tui::host_detection::{
-    HostDetection, HostKind, detect_hosts, generate_snippet, write_host_config,
+    ExtendedHostKind, HostDetection, detect_extended_hosts, generate_extended_snippet,
+    write_extended_host_config,
 };
 use crate::tui::indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, import_lancedb,
@@ -217,7 +218,8 @@ pub struct App {
     pub embedder_state: EmbedderState,
     /// Derived embedding config (updated from embedder_state)
     pub embedding_config: EmbeddingConfig,
-    pub hosts: Vec<HostDetection>,
+    /// Extended hosts with their kind and detection info
+    pub hosts: Vec<(ExtendedHostKind, HostDetection)>,
     pub selected_hosts: Vec<usize>,
     pub dry_run: bool,
     pub messages: Vec<String>,
@@ -242,7 +244,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: WizardConfig) -> Self {
-        let hosts = detect_hosts();
+        let hosts = detect_extended_hosts();
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp_memex".to_string());
         let embedder_state = EmbedderState::default();
         let embedding_config = embedder_state.to_embedding_config();
@@ -288,6 +290,12 @@ impl App {
             {
                 self.embedder_state.detecting = true;
             }
+
+            // Auto-trigger health check when entering HealthCheck step
+            if self.step == WizardStep::HealthCheck && !self.health_running {
+                self.run_health_check();
+                self.trigger_health_check();
+            }
         }
     }
 
@@ -306,19 +314,20 @@ impl App {
         }
     }
 
-    pub fn get_selected_hosts(&self) -> Vec<&HostDetection> {
+    pub fn get_selected_hosts(&self) -> Vec<&(ExtendedHostKind, HostDetection)> {
         self.selected_hosts
             .iter()
             .filter_map(|&i| self.hosts.get(i))
             .collect()
     }
 
-    pub fn generate_snippets(&self) -> Vec<(HostKind, String)> {
+    pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
         self.get_selected_hosts()
             .iter()
-            .map(|h| {
-                let snippet = generate_snippet(h.kind, &self.binary_path, &self.memex_cfg.db_path);
-                (h.kind, snippet)
+            .map(|(kind, _detection)| {
+                let snippet =
+                    generate_extended_snippet(*kind, &self.binary_path, &self.memex_cfg.db_path);
+                (*kind, snippet)
             })
             .collect()
     }
@@ -360,13 +369,16 @@ impl App {
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
             for &idx in &self.selected_hosts.clone() {
-                if let Some(host) = self.hosts.get(idx) {
-                    let snippet =
-                        generate_snippet(host.kind, &self.binary_path, &self.memex_cfg.db_path);
+                if let Some((kind, detection)) = self.hosts.get(idx) {
+                    let snippet = generate_extended_snippet(
+                        *kind,
+                        &self.binary_path,
+                        &self.memex_cfg.db_path,
+                    );
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
-                        host.kind.display_name(),
-                        host.path.display(),
+                        kind.display_name(),
+                        detection.path.display(),
                         snippet
                     ));
                 }
@@ -378,8 +390,9 @@ impl App {
         let mut error_count = 0;
 
         for &idx in &self.selected_hosts.clone() {
-            if let Some(host) = self.hosts.get(idx) {
-                match write_host_config(host, &self.binary_path, &self.memex_cfg.db_path) {
+            if let Some((kind, _detection)) = self.hosts.get(idx) {
+                match write_extended_host_config(*kind, &self.binary_path, &self.memex_cfg.db_path)
+                {
                     Ok(result) => {
                         success_count += 1;
                         if let Some(backup) = result.backup_path {
@@ -405,11 +418,8 @@ impl App {
                     }
                     Err(e) => {
                         error_count += 1;
-                        self.messages.push(format!(
-                            "[ERR] {} failed: {}",
-                            host.kind.display_name(),
-                            e
-                        ));
+                        self.messages
+                            .push(format!("[ERR] {} failed: {}", kind.display_name(), e));
                     }
                 }
             }
@@ -744,6 +754,20 @@ impl App {
 
     /// Run the async health check (called from event loop)
     pub async fn run_async_health_check(&mut self) {
+        // Quick connectivity check for selected provider
+        if let Some(ref provider) = self.embedder_state.selected_provider {
+            let url = format!("{}/v1/models", provider.base_url);
+            if check_health(&url).await {
+                self.messages
+                    .push(format!("[OK] Provider {} is reachable", provider.base_url));
+            } else {
+                self.messages.push(format!(
+                    "[WARN] Provider {} may be offline",
+                    provider.base_url
+                ));
+            }
+        }
+
         let checker = HealthChecker::new();
         let result = checker
             .run_all(&self.embedding_config, &self.memex_cfg.db_path)

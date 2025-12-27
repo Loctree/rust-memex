@@ -172,7 +172,13 @@ pub async fn detect_providers() -> Vec<DetectedProvider> {
 }
 
 /// Check if a URL is reachable (simple health check).
-async fn check_health(client: &Client, url: &str) -> bool {
+/// Used for quick provider connectivity verification.
+pub async fn check_health(url: &str) -> bool {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
     client.get(url).send().await.is_ok()
 }
 

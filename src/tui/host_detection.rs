@@ -136,14 +136,6 @@ impl ExtendedHostKind {
             ExtendedHostKind::Junie => "Junie",
         }
     }
-
-    pub fn as_label(&self) -> &'static str {
-        match self {
-            ExtendedHostKind::Standard(k) => k.as_label(),
-            ExtendedHostKind::ClaudeCode => "claude-code",
-            ExtendedHostKind::Junie => "junie",
-        }
-    }
 }
 
 fn get_host_config_path(kind: HostKind) -> Option<(PathBuf, HostFormat)> {
@@ -204,7 +196,7 @@ fn get_host_config_path(kind: HostKind) -> Option<(PathBuf, HostFormat)> {
 }
 
 /// Get config path for extended host kinds (including ClaudeCode and Junie)
-fn get_extended_host_config_path(kind: ExtendedHostKind) -> Option<(PathBuf, HostFormat)> {
+pub fn get_extended_host_config_path(kind: ExtendedHostKind) -> Option<(PathBuf, HostFormat)> {
     let home = home_dir()?;
 
     match kind {
@@ -353,9 +345,13 @@ pub fn detect_hosts() -> Vec<HostDetection> {
         .collect()
 }
 
-/// Generate a config snippet for a specific host.
-pub fn generate_snippet(kind: HostKind, binary_path: &str, db_path: &str) -> String {
-    match get_host_config_path(kind) {
+/// Generate a config snippet for an extended host kind.
+pub fn generate_extended_snippet(
+    kind: ExtendedHostKind,
+    binary_path: &str,
+    db_path: &str,
+) -> String {
+    match get_extended_host_config_path(kind) {
         Some((_, HostFormat::Toml)) => {
             format!(
                 r#"[mcp_servers.rmcp_memex]
@@ -648,14 +644,41 @@ command = "other"
 
     #[test]
     fn test_generate_toml_snippet() {
-        let snippet = generate_snippet(HostKind::Codex, "/usr/bin/rmcp_memex", "~/.rmcp/db");
+        let snippet = generate_extended_snippet(
+            ExtendedHostKind::Standard(HostKind::Codex),
+            "/usr/bin/rmcp_memex",
+            "~/.rmcp/db",
+        );
         assert!(snippet.contains("[mcp_servers.rmcp_memex]"));
         assert!(snippet.contains("/usr/bin/rmcp_memex"));
     }
 
     #[test]
     fn test_generate_json_snippet() {
-        let snippet = generate_snippet(HostKind::Claude, "/usr/bin/rmcp_memex", "~/.rmcp/db");
+        let snippet = generate_extended_snippet(
+            ExtendedHostKind::Standard(HostKind::Claude),
+            "/usr/bin/rmcp_memex",
+            "~/.rmcp/db",
+        );
+        assert!(snippet.contains("\"mcpServers\""));
+        assert!(snippet.contains("\"rmcp_memex\""));
+    }
+
+    #[test]
+    fn test_generate_extended_claude_code_snippet() {
+        let snippet = generate_extended_snippet(
+            ExtendedHostKind::ClaudeCode,
+            "/usr/bin/rmcp_memex",
+            "~/.rmcp/db",
+        );
+        assert!(snippet.contains("\"mcpServers\""));
+        assert!(snippet.contains("\"rmcp_memex\""));
+    }
+
+    #[test]
+    fn test_generate_extended_junie_snippet() {
+        let snippet =
+            generate_extended_snippet(ExtendedHostKind::Junie, "/usr/bin/rmcp_memex", "~/.rmcp/db");
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
     }
@@ -728,15 +751,5 @@ args = []
         );
         assert_eq!(ExtendedHostKind::ClaudeCode.display_name(), "Claude Code");
         assert_eq!(ExtendedHostKind::Junie.display_name(), "Junie");
-    }
-
-    #[test]
-    fn test_extended_host_kind_labels() {
-        assert_eq!(
-            ExtendedHostKind::Standard(HostKind::Codex).as_label(),
-            "codex"
-        );
-        assert_eq!(ExtendedHostKind::ClaudeCode.as_label(), "claude-code");
-        assert_eq!(ExtendedHostKind::Junie.as_label(), "junie");
     }
 }
