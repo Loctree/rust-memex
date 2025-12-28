@@ -315,8 +315,31 @@ impl HealthChecker {
             });
 
             match self.client.post(&url).json(&request).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<EmbeddingResponse>().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = match resp.text().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read response body from {}: {}",
+                                provider.name,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    if !status.is_success() {
+                        tracing::warn!(
+                            "Embedding API error from {} (HTTP {}): {}",
+                            provider.name,
+                            status,
+                            &body[..body.len().min(500)]
+                        );
+                        continue;
+                    }
+
+                    match serde_json::from_str::<EmbeddingResponse>(&body) {
                         Ok(emb_resp) => {
                             if let Some(data) = emb_resp.data.first() {
                                 let dim = data.embedding.len();
@@ -325,21 +348,26 @@ impl HealthChecker {
                                     format!("Got {}-dim vector from {}", dim, provider.name);
                                 return (item, Some(dim));
                             } else {
+                                tracing::warn!("Empty embedding data from {}", provider.name);
                                 continue;
                             }
                         }
                         Err(e) => {
+                            tracing::error!(
+                                "Failed to parse embedding response from {}: {} - Body preview: {}",
+                                provider.name,
+                                e,
+                                &body[..body.len().min(200)]
+                            );
                             item = item.fail(format!("Failed to parse response: {}", e));
                             return (item, None);
                         }
                     }
                 }
-                Ok(resp) => {
-                    // Try next provider
-                    let _ = resp.status();
+                Err(e) => {
+                    tracing::debug!("Connection failed to {}: {}", provider.name, e);
                     continue;
                 }
-                Err(_) => continue,
             }
         }
 

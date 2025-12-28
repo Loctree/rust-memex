@@ -2,6 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2025-12-28
+
+### Added
+- **BM25 Keyword Search** - Hybrid search combining semantic + keyword (Tantivy-based).
+  - Stemming and language support for improved recall
+  - Token-aware validation utilities
+- **Context-Aware Chunking** - Sentence-aware chunking in RAG pipeline.
+  - Context prefix injection for enriched chunks
+  - Improved boundary detection
+- **Embedding Retry Logic** - Failed chunks retry individually with exponential backoff.
+
+## [0.2.3] - 2025-12-27
+
+### Added
+- **Smart Progress Bar** - `--progress` flag for index command with ETA.
+  - Phase 1: Pre-scan (file count, total size, estimated chunks)
+  - Phase 2: Calibration (measure embedding speed on first file)
+  - Phase 3: Progress bar with ETA based on calibration
+- **Verbose Error Logging** - Detailed diagnostics for embedding operations.
+  - Full error chain with URL, model, batch size
+  - Per-chunk diagnostics with text preview
+  - Response body dump on parse failures
+
+### Changed
+- Added `indicatif` crate for progress bar rendering.
+
+## [0.2.2] - 2025-12-27
+
+### Added
+- **Path Sanitization** - Security hardening for TUI wizard (Semgrep findings).
+  - `sanitize_existing_path()` / `sanitize_new_path()` functions
+  - Paths validated against allowed directories (home, /tmp, /var/folders)
+  - Traversal sequence detection
+- **Release Workflow** - GitHub Actions for multi-platform binary releases.
+- **Install Script** - `curl | sh` installer with platform detection.
+  ```bash
+  curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+  ```
+
+## [0.2.1] - 2025-12-26
+
+### Added
+- **TUI Wizard** - Interactive configuration wizard with provider detection.
+  - Auto-detect Ollama and MLX embedding providers
+  - Health check system for embedder connectivity
+  - Host detection for Codex, Cursor, Claude, JetBrains, VSCode
+  - Config merge (preserves existing servers)
+  - Dimension hints and extended host snippets (ClaudeCode, Junie)
+- **Upsert Command** - Direct text chunk insertion via CLI.
+- **Git Hooks** - Pre-commit (auto-fix) and pre-push (format, lint, test, build, Semgrep).
+
+### Fixed
+- **UTF-8 Boundary Panic** - Use `chars().count()` for accurate character counting in embedding batching.
+
+### Removed
+- **sled Dependency** - Eliminated dead code causing file corruption and crash loops.
+  - Storage now uses only LanceDB + moka in-memory cache.
+
 ## [0.2.0] - 2025-12-26
 
 ### Breaking Changes

@@ -6,6 +6,7 @@ RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 
 `rmcp-memex` is an MCP (Model Context Protocol) server providing:
 - **RAG (Retrieval-Augmented Generation)** - document indexing and semantic search
+- **Hybrid Search** - BM25 keyword + semantic vector search (Tantivy-based)
 - **Vector Memory** - semantic storage and retrieval of text chunks
 - **Namespace Isolation** - data isolation in namespaces
 - **Security** - token-based access control for protected namespaces
@@ -26,7 +27,7 @@ RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 ├─────────────────────────────────────────────────────────────┤
 │  Storage Layer                                               │
 │  ├── LanceDB           - Vector embeddings                  │
-│  ├── sled              - Key-value store                    │
+│  ├── Tantivy           - BM25 keyword index                 │
 │  └── moka              - In-memory cache                    │
 ├─────────────────────────────────────────────────────────────┤
 │  Embeddings (External Providers)                             │
@@ -66,9 +67,14 @@ RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 
 ### Installation
 
+**Quick install (recommended):**
 ```bash
-cd rmcp-memex
-cargo install --path rmcp-memex
+curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+```
+
+**From source:**
+```bash
+cargo install --path .
 ```
 
 ### Running
@@ -134,6 +140,9 @@ Instead of traditional flat chunking, rmcp-memex offers hierarchical "onion slic
 ```bash
 # Index with onion slicing (default)
 rmcp-memex index -n memories /path/to/data/ --slice-mode onion
+
+# Index with progress bar and ETA
+rmcp-memex index -n memories /path/to/data/ --progress
 
 # Index with flat chunking (backward compatible)
 rmcp-memex index -n memories /path/to/data/ --slice-mode flat
@@ -211,7 +220,7 @@ rmcp-memex/
 │   ├── preprocessing/
 │   │   └── mod.rs          # Noise filtering for conversation exports
 │   ├── storage/
-│   │   └── mod.rs          # LanceDB + sled (schema v3 with content_hash)
+│   │   └── mod.rs          # LanceDB + Tantivy (schema v3 with content_hash)
 │   ├── embeddings/
 │   │   └── mod.rs          # MLX/FastEmbed bridge
 │   └── tui/

@@ -1,9 +1,11 @@
 pub mod common;
 pub mod embeddings;
 pub mod handlers;
+pub mod path_utils;
 pub mod preprocessing;
 pub mod progress;
 pub mod rag;
+pub mod search;
 pub mod security;
 pub mod storage;
 #[cfg(test)]
@@ -16,13 +18,20 @@ use tracing::Level;
 // Re-export core types for library consumers
 pub use embeddings::{
     EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, ProviderConfig, RerankerConfig,
+    TokenConfig, estimate_tokens, safe_chunk_size, truncate_to_token_limit, validate_batch_tokens,
+    validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
 pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
 pub use progress::IndexProgressTracker;
 pub use rag::{
-    IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline, SearchOptions, SearchResult,
-    SliceLayer, SliceMode, compute_content_hash, create_onion_slices,
+    ContextPrefixConfig, EnrichedChunk, IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline,
+    SearchOptions, SearchResult, SliceLayer, SliceMode, compute_content_hash,
+    create_enriched_chunks, create_onion_slices,
+};
+pub use search::{
+    BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
+    StemLanguage,
 };
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{ChromaDocument, StorageManager};

@@ -312,63 +312,93 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
 
     // Try /v1/models first
     let models_url = format!("{}/v1/models", base_url);
-    if let Ok(resp) = client.get(&models_url).send().await
-        && resp.status().is_success()
-        && let Ok(models_resp) = resp.json::<ModelsResponse>().await
-    {
-        let models: Vec<String> = models_resp.data.iter().map(|m| m.id.clone()).collect();
+    if let Ok(resp) = client.get(&models_url).send().await {
+        if resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(models_resp) = serde_json::from_str::<ModelsResponse>(&body) {
+                let models: Vec<String> = models_resp.data.iter().map(|m| m.id.clone()).collect();
 
-        let embedding_model = models
-            .iter()
-            .find(|m| m.contains("embedding") || m.contains("Embedding"))
-            .cloned();
+                let embedding_model = models
+                    .iter()
+                    .find(|m| m.contains("embedding") || m.contains("Embedding"))
+                    .cloned();
 
-        let status = if let Some(ref model) = embedding_model {
-            ProviderStatus::Online(model.clone())
+                let status = if let Some(ref model) = embedding_model {
+                    ProviderStatus::Online(model.clone())
+                } else {
+                    ProviderStatus::OnlineNoModel
+                };
+
+                return Ok(DetectedProvider {
+                    kind: ProviderKind::OpenAICompat,
+                    base_url: base_url.to_string(),
+                    port,
+                    models,
+                    suggested_model: embedding_model,
+                    status,
+                });
+            } else {
+                tracing::debug!(
+                    "Failed to parse /v1/models response: {}",
+                    &body[..body.len().min(200)]
+                );
+            }
         } else {
-            ProviderStatus::OnlineNoModel
-        };
-
-        return Ok(DetectedProvider {
-            kind: ProviderKind::OpenAICompat,
-            base_url: base_url.to_string(),
-            port,
-            models,
-            suggested_model: embedding_model,
-            status,
-        });
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                "OpenAI endpoint returned HTTP {}: {}",
+                status,
+                &body[..body.len().min(200)]
+            );
+        }
     }
 
     // Try Ollama endpoint
     let tags_url = format!("{}/api/tags", base_url);
-    if let Ok(resp) = client.get(&tags_url).send().await
-        && resp.status().is_success()
-        && let Ok(tags) = resp.json::<OllamaTagsResponse>().await
-    {
-        let models: Vec<String> = tags.models.iter().map(|m| m.name.clone()).collect();
+    if let Ok(resp) = client.get(&tags_url).send().await {
+        if resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(tags) = serde_json::from_str::<OllamaTagsResponse>(&body) {
+                let models: Vec<String> = tags.models.iter().map(|m| m.name.clone()).collect();
 
-        let embedding_model = models
-            .iter()
-            .find(|m| m.contains("embedding"))
-            .or_else(|| models.iter().find(|m| m.contains("embed")))
-            .cloned();
+                let embedding_model = models
+                    .iter()
+                    .find(|m| m.contains("embedding"))
+                    .or_else(|| models.iter().find(|m| m.contains("embed")))
+                    .cloned();
 
-        let status = if let Some(ref model) = embedding_model {
-            ProviderStatus::Online(model.clone())
-        } else if !models.is_empty() {
-            ProviderStatus::OnlineNoModel
+                let status = if let Some(ref model) = embedding_model {
+                    ProviderStatus::Online(model.clone())
+                } else if !models.is_empty() {
+                    ProviderStatus::OnlineNoModel
+                } else {
+                    ProviderStatus::Offline
+                };
+
+                return Ok(DetectedProvider {
+                    kind: ProviderKind::Ollama,
+                    base_url: base_url.to_string(),
+                    port,
+                    models,
+                    suggested_model: embedding_model.or(Some("qwen3-embedding:8b".to_string())),
+                    status,
+                });
+            } else {
+                tracing::debug!(
+                    "Failed to parse /api/tags response: {}",
+                    &body[..body.len().min(200)]
+                );
+            }
         } else {
-            ProviderStatus::Offline
-        };
-
-        return Ok(DetectedProvider {
-            kind: ProviderKind::Ollama,
-            base_url: base_url.to_string(),
-            port,
-            models,
-            suggested_model: embedding_model.or(Some("qwen3-embedding:8b".to_string())),
-            status,
-        });
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                "Ollama endpoint returned HTTP {}: {}",
+                status,
+                &body[..body.len().min(200)]
+            );
+        }
     }
 
     Ok(DetectedProvider {

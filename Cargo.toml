@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-memex"
-version = "0.2.2"
+version = "0.2.4"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
@@ -67,6 +67,9 @@ crossterm = "0.29"
 
 # Progress bar for CLI
 indicatif = "0.17"
+
+# BM25 keyword search (hybrid search with vector)
+tantivy = "0.22"
 
 [build-dependencies]
 protoc-bin-vendored = "3"

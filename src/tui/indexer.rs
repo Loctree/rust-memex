@@ -386,7 +386,7 @@ pub async fn import_lancedb(
 
 /// Recursively copy a directory with path validation
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    use crate::tui::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::{validate_read_path, validate_write_path};
 
     // Validate source directory is safe to read
     let safe_src = validate_read_path(src)?;
@@ -530,7 +530,7 @@ async fn run_indexing(
 
 /// Validate a path entered by the user with security checks
 pub fn validate_path(path: &str) -> Result<PathBuf> {
-    use crate::tui::path_utils::sanitize_existing_path;
+    use crate::path_utils::sanitize_existing_path;
 
     if path.trim().is_empty() {
         return Err(anyhow!("Path cannot be empty"));

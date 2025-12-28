@@ -398,7 +398,7 @@ fn backup_timestamp() -> String {
 
 /// Create a backup of an existing config file
 fn create_backup(path: &Path) -> Result<PathBuf> {
-    use crate::tui::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::{validate_read_path, validate_write_path};
 
     // Validate source path is safe to read
     let safe_src = validate_read_path(path).with_context(|| {
@@ -523,7 +523,7 @@ pub fn write_host_config(
         None
     };
 
-    use crate::tui::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::{validate_read_path, validate_write_path};
 
     // Read existing content or use empty string
     let existing_content = if host.exists {

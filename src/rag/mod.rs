@@ -1248,25 +1248,462 @@ impl RAGPipeline {
         self.mlx_bridge.lock().await.embed_batch(documents).await
     }
 
-    fn chunk_text(&self, text: &str, chunk_size: usize, overlap: usize) -> Result<Vec<String>> {
+    /// Sentence-aware chunking that respects semantic boundaries.
+    ///
+    /// Instead of cutting at fixed character positions, this method:
+    /// 1. Splits text into sentences
+    /// 2. Aggregates sentences until reaching target_size
+    /// 3. Adds overlap by including the last 1-2 sentences from the previous chunk
+    fn chunk_text(&self, text: &str, target_size: usize, overlap: usize) -> Result<Vec<String>> {
+        let sentences = split_into_sentences(text);
+
+        if sentences.is_empty() {
+            return Ok(vec![text.to_string()]);
+        }
+
+        // For very short text, return as single chunk
+        if text.chars().count() <= target_size {
+            return Ok(vec![text.to_string()]);
+        }
+
         let mut chunks = Vec::new();
-        let chars: Vec<char> = text.chars().collect();
+        let mut current_chunk = String::new();
+        let mut overlap_sentences: Vec<String> = Vec::new();
 
-        let mut start = 0;
-        while start < chars.len() {
-            let end = (start + chunk_size).min(chars.len());
-            let chunk: String = chars[start..end].iter().collect();
-            chunks.push(chunk);
+        // Target overlap in sentences (typically 1-2 sentences)
+        let overlap_sentence_count = (overlap / 50).clamp(1, 3);
 
-            if end >= chars.len() {
-                break;
+        for sentence in &sentences {
+            let sentence_len = sentence.chars().count();
+            let current_len = current_chunk.chars().count();
+
+            // If adding this sentence exceeds max_size (target_size * 1.5), flush chunk
+            let max_size = target_size + target_size / 2;
+            if current_len + sentence_len > max_size && !current_chunk.is_empty() {
+                chunks.push(current_chunk.trim().to_string());
+
+                // Start new chunk with overlap from previous chunk
+                current_chunk = overlap_sentences.join(" ");
+                if !current_chunk.is_empty() {
+                    current_chunk.push(' ');
+                }
+                overlap_sentences.clear();
             }
 
-            start = end - overlap;
+            current_chunk.push_str(sentence);
+            current_chunk.push(' ');
+
+            // Track last N sentences for overlap
+            overlap_sentences.push(sentence.clone());
+            if overlap_sentences.len() > overlap_sentence_count {
+                overlap_sentences.remove(0);
+            }
+
+            // If chunk reached target size, flush it
+            if current_chunk.chars().count() >= target_size {
+                chunks.push(current_chunk.trim().to_string());
+
+                // Start new chunk with overlap
+                current_chunk = overlap_sentences.join(" ");
+                if !current_chunk.is_empty() {
+                    current_chunk.push(' ');
+                }
+                overlap_sentences.clear();
+            }
+        }
+
+        // Don't forget the last chunk
+        let remaining = current_chunk.trim();
+        if !remaining.is_empty() {
+            // If last chunk is very short, merge with previous if possible
+            if remaining.chars().count() < target_size / 4 && !chunks.is_empty() {
+                let last_idx = chunks.len() - 1;
+                chunks[last_idx].push(' ');
+                chunks[last_idx].push_str(remaining);
+            } else {
+                chunks.push(remaining.to_string());
+            }
+        }
+
+        // Ensure we have at least one chunk
+        if chunks.is_empty() {
+            chunks.push(text.to_string());
         }
 
         Ok(chunks)
     }
+}
+
+// =============================================================================
+// CONTEXT PREFIX INJECTION
+// =============================================================================
+//
+// Each chunk contains document context for better semantic matching.
+// This helps the embedding model understand "what this chunk is about"
+// without needing to see the full document.
+//
+// Format: [Source: filename.ext] [Section: Header Name] \n\n <content>
+// =============================================================================
+
+/// Configuration for context prefix injection
+#[derive(Debug, Clone)]
+pub struct ContextPrefixConfig {
+    /// Include source filename in prefix
+    pub include_source: bool,
+    /// Include section header in prefix (if detected)
+    pub include_section: bool,
+    /// Include document type hint
+    pub include_doc_type: bool,
+    /// Maximum prefix length (chars)
+    pub max_prefix_length: usize,
+}
+
+impl Default for ContextPrefixConfig {
+    fn default() -> Self {
+        Self {
+            include_source: true,
+            include_section: true,
+            include_doc_type: true,
+            max_prefix_length: 100,
+        }
+    }
+}
+
+/// An enriched chunk with context prefix and metadata
+#[derive(Debug, Clone)]
+pub struct EnrichedChunk {
+    /// Full content with context prefix prepended
+    pub content: String,
+    /// Original content without prefix (for display)
+    pub original_content: String,
+    /// Source document path
+    pub doc_path: String,
+    /// Chunk index within document
+    pub chunk_index: usize,
+    /// Section header (if detected)
+    pub section: Option<String>,
+    /// Detected document type
+    pub doc_type: Option<String>,
+}
+
+/// Create enriched chunks with context prefix injection
+///
+/// # Arguments
+/// * `content` - The text content to chunk
+/// * `doc_path` - Path to the source document
+/// * `chunk_size` - Target chunk size in characters
+/// * `overlap` - Overlap between chunks
+/// * `config` - Context prefix configuration
+///
+/// # Returns
+/// Vector of enriched chunks with context prefixes
+pub fn create_enriched_chunks(
+    content: &str,
+    doc_path: &str,
+    chunk_size: usize,
+    overlap: usize,
+    config: &ContextPrefixConfig,
+) -> Vec<EnrichedChunk> {
+    // Detect document type from extension
+    let doc_type = detect_doc_type(doc_path);
+
+    // Extract filename for source prefix
+    let filename = std::path::Path::new(doc_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // Split content into sections (based on headers)
+    let sections = extract_sections(content);
+
+    let mut enriched_chunks = Vec::new();
+    let mut global_chunk_index = 0;
+
+    for (section_header, section_content) in sections {
+        // Chunk this section
+        let chunks = smart_chunk_text(section_content, chunk_size, overlap);
+
+        for chunk in chunks {
+            // Build context prefix
+            let prefix = build_context_prefix(
+                filename,
+                section_header.as_deref(),
+                doc_type.as_deref(),
+                config,
+            );
+
+            // Combine prefix with content
+            let full_content = if prefix.is_empty() {
+                chunk.clone()
+            } else {
+                format!("{}\n\n{}", prefix, chunk)
+            };
+
+            enriched_chunks.push(EnrichedChunk {
+                content: full_content,
+                original_content: chunk,
+                doc_path: doc_path.to_string(),
+                chunk_index: global_chunk_index,
+                section: section_header.clone(),
+                doc_type: doc_type.clone(),
+            });
+
+            global_chunk_index += 1;
+        }
+    }
+
+    // If no chunks were created (e.g., empty content), create one
+    if enriched_chunks.is_empty() && !content.trim().is_empty() {
+        let prefix = build_context_prefix(filename, None, doc_type.as_deref(), config);
+        let full_content = if prefix.is_empty() {
+            content.to_string()
+        } else {
+            format!("{}\n\n{}", prefix, content)
+        };
+
+        enriched_chunks.push(EnrichedChunk {
+            content: full_content,
+            original_content: content.to_string(),
+            doc_path: doc_path.to_string(),
+            chunk_index: 0,
+            section: None,
+            doc_type,
+        });
+    }
+
+    enriched_chunks
+}
+
+/// Build context prefix string
+fn build_context_prefix(
+    filename: &str,
+    section: Option<&str>,
+    doc_type: Option<&str>,
+    config: &ContextPrefixConfig,
+) -> String {
+    let mut parts = Vec::new();
+
+    if config.include_source && !filename.is_empty() {
+        parts.push(format!("[Source: {}]", filename));
+    }
+
+    if config.include_section
+        && let Some(sec) = section
+    {
+        parts.push(format!("[Section: {}]", sec));
+    }
+
+    if config.include_doc_type
+        && let Some(dt) = doc_type
+    {
+        parts.push(format!("[Type: {}]", dt));
+    }
+
+    let prefix = parts.join(" ");
+
+    // Truncate if too long
+    if prefix.len() > config.max_prefix_length {
+        prefix.chars().take(config.max_prefix_length).collect()
+    } else {
+        prefix
+    }
+}
+
+/// Detect document type from file extension
+fn detect_doc_type(path: &str) -> Option<String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())?;
+
+    let doc_type = match ext.as_str() {
+        "rs" => "Rust source code",
+        "py" => "Python source code",
+        "js" | "jsx" => "JavaScript source code",
+        "ts" | "tsx" => "TypeScript source code",
+        "md" => "Markdown documentation",
+        "txt" => "Plain text",
+        "json" => "JSON data",
+        "yaml" | "yml" => "YAML configuration",
+        "toml" => "TOML configuration",
+        "html" => "HTML document",
+        "css" => "CSS stylesheet",
+        "sql" => "SQL query",
+        "sh" | "bash" => "Shell script",
+        "pdf" => "PDF document",
+        _ => return None,
+    };
+
+    Some(doc_type.to_string())
+}
+
+/// Extract sections from content based on markdown-style headers
+fn extract_sections(content: &str) -> Vec<(Option<String>, &str)> {
+    // Simple header detection for markdown-style headers
+    let header_pattern = regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)$").ok();
+
+    if let Some(re) = header_pattern {
+        let mut sections = Vec::new();
+        let mut last_end = 0;
+        let mut current_header: Option<String> = None;
+
+        for caps in re.captures_iter(content) {
+            let match_start = caps.get(0).unwrap().start();
+
+            // Add previous section
+            if match_start > last_end {
+                let section_content = &content[last_end..match_start];
+                if !section_content.trim().is_empty() {
+                    sections.push((current_header.clone(), section_content.trim()));
+                }
+            }
+
+            current_header = Some(caps.get(2).unwrap().as_str().to_string());
+            last_end = caps.get(0).unwrap().end();
+        }
+
+        // Add final section
+        if last_end < content.len() {
+            let section_content = &content[last_end..];
+            if !section_content.trim().is_empty() {
+                sections.push((current_header, section_content.trim()));
+            }
+        }
+
+        if sections.is_empty() {
+            vec![(None, content)]
+        } else {
+            sections
+        }
+    } else {
+        vec![(None, content)]
+    }
+}
+
+/// Smart text chunking respecting sentence boundaries
+fn smart_chunk_text(text: &str, target_size: usize, overlap: usize) -> Vec<String> {
+    let sentences = split_into_sentences(text);
+
+    if sentences.is_empty() || text.chars().count() <= target_size {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    let mut overlap_sentences: Vec<String> = Vec::new();
+    let overlap_sentence_count = (overlap / 50).clamp(1, 3);
+
+    for sentence in &sentences {
+        let sentence_len = sentence.chars().count();
+        let current_len = current_chunk.chars().count();
+        let max_size = target_size + target_size / 2;
+
+        if current_len + sentence_len > max_size && !current_chunk.is_empty() {
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk = overlap_sentences.join(" ");
+            if !current_chunk.is_empty() {
+                current_chunk.push(' ');
+            }
+            overlap_sentences.clear();
+        }
+
+        current_chunk.push_str(sentence);
+        current_chunk.push(' ');
+
+        overlap_sentences.push(sentence.clone());
+        if overlap_sentences.len() > overlap_sentence_count {
+            overlap_sentences.remove(0);
+        }
+
+        if current_chunk.chars().count() >= target_size {
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk = overlap_sentences.join(" ");
+            if !current_chunk.is_empty() {
+                current_chunk.push(' ');
+            }
+            overlap_sentences.clear();
+        }
+    }
+
+    let remaining = current_chunk.trim();
+    if !remaining.is_empty() {
+        if remaining.chars().count() < target_size / 4 && !chunks.is_empty() {
+            let last_idx = chunks.len() - 1;
+            chunks[last_idx].push(' ');
+            chunks[last_idx].push_str(remaining);
+        } else {
+            chunks.push(remaining.to_string());
+        }
+    }
+
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+
+    chunks
+}
+
+/// Split text into sentences using common sentence boundaries.
+/// Returns Vec of sentences with punctuation preserved.
+fn split_into_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        current.push(c);
+
+        // Check for sentence ending
+        if matches!(c, '.' | '!' | '?') {
+            // Look ahead - if followed by whitespace or newline, it's likely end of sentence
+            if let Some(&next) = chars.peek() {
+                if next.is_whitespace() {
+                    // Skip common abbreviations
+                    let trimmed = current.trim();
+                    let is_abbreviation = trimmed.ends_with("Mr.")
+                        || trimmed.ends_with("Mrs.")
+                        || trimmed.ends_with("Dr.")
+                        || trimmed.ends_with("Prof.")
+                        || trimmed.ends_with("vs.")
+                        || trimmed.ends_with("etc.")
+                        || trimmed.ends_with("e.g.")
+                        || trimmed.ends_with("i.e.")
+                        // Single letter abbreviations like "A." or "B."
+                        || (trimmed.len() >= 2 && trimmed.chars().rev().nth(1).map(|c| c.is_uppercase()).unwrap_or(false));
+
+                    if !is_abbreviation {
+                        sentences.push(current.trim().to_string());
+                        current = String::new();
+                        // Skip the whitespace
+                        chars.next();
+                    }
+                }
+            } else {
+                // End of text
+                sentences.push(current.trim().to_string());
+                current = String::new();
+            }
+        } else if c == '\n' {
+            // Double newline often indicates paragraph break
+            if let Some(&next) = chars.peek()
+                && next == '\n'
+            {
+                if !current.trim().is_empty() {
+                    sentences.push(current.trim().to_string());
+                    current = String::new();
+                }
+                chars.next(); // skip second newline
+            }
+        }
+    }
+
+    // Don't forget remaining text
+    let remaining = current.trim();
+    if !remaining.is_empty() {
+        sentences.push(remaining.to_string());
+    }
+
+    sentences
 }
 
 /// Options for search operations

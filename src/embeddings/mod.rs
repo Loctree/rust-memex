@@ -621,6 +621,7 @@ impl EmbeddingClient {
     ///
     /// Large texts are chunked and only the first chunk is embedded.
     /// Batches are split to stay under max_batch_chars and max_batch_items.
+    /// Failed chunks are retried individually with exponential backoff.
     pub async fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -628,26 +629,35 @@ impl EmbeddingClient {
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
         let mut current_batch: Vec<String> = Vec::new();
+        let mut current_batch_indices: Vec<usize> = Vec::new();
         let mut current_chars = 0;
 
         // Max chars per individual text (half of batch limit for safety)
         let max_text_chars = self.max_batch_chars / 2;
 
-        for text in texts {
-            // If single text exceeds limit, chunk it and use first chunk
-            // Use chars().count() for accurate character count (not bytes)
-            let char_count = text.chars().count();
-            let text_to_embed = if char_count > max_text_chars {
-                tracing::debug!(
-                    "Text too large ({} chars), truncating to {} chars",
-                    char_count,
-                    max_text_chars
-                );
-                truncate_at_boundary(text, max_text_chars)
-            } else {
-                text.clone()
-            };
+        // Prepare all texts first
+        let prepared_texts: Vec<String> = texts
+            .iter()
+            .map(|text| {
+                let char_count = text.chars().count();
+                if char_count > max_text_chars {
+                    tracing::debug!(
+                        "Text too large ({} chars), truncating to {} chars",
+                        char_count,
+                        max_text_chars
+                    );
+                    truncate_at_boundary(text, max_text_chars)
+                } else {
+                    text.clone()
+                }
+            })
+            .collect();
 
+        // Pre-allocate result vector with None
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        for (idx, text_to_embed) in prepared_texts.iter().enumerate() {
             let text_len = text_to_embed.chars().count();
 
             // Check if we need to flush current batch
@@ -655,21 +665,119 @@ impl EmbeddingClient {
                 && (current_chars + text_len > self.max_batch_chars
                     || current_batch.len() >= self.max_batch_items)
             {
-                // Flush current batch
-                let batch_embeddings = self.embed_batch_internal(&current_batch).await?;
-                all_embeddings.extend(batch_embeddings);
+                // Flush current batch with retry
+                match self.embed_batch_internal(&current_batch).await {
+                    Ok(batch_embeddings) => {
+                        for (i, emb) in batch_embeddings.into_iter().enumerate() {
+                            if let Some(orig_idx) = current_batch_indices.get(i) {
+                                results[*orig_idx] = Some(emb);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Batch embedding failed for {} texts, will retry individually: {}",
+                            current_batch.len(),
+                            e
+                        );
+                        failed_indices.extend(current_batch_indices.iter().copied());
+                    }
+                }
                 current_batch.clear();
+                current_batch_indices.clear();
                 current_chars = 0;
             }
 
-            current_batch.push(text_to_embed);
+            current_batch.push(text_to_embed.clone());
+            current_batch_indices.push(idx);
             current_chars += text_len;
         }
 
         // Flush remaining batch
         if !current_batch.is_empty() {
-            let batch_embeddings = self.embed_batch_internal(&current_batch).await?;
-            all_embeddings.extend(batch_embeddings);
+            match self.embed_batch_internal(&current_batch).await {
+                Ok(batch_embeddings) => {
+                    for (i, emb) in batch_embeddings.into_iter().enumerate() {
+                        if let Some(orig_idx) = current_batch_indices.get(i) {
+                            results[*orig_idx] = Some(emb);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Batch embedding failed for {} texts, will retry individually: {}",
+                        current_batch.len(),
+                        e
+                    );
+                    failed_indices.extend(current_batch_indices.iter().copied());
+                }
+            }
+        }
+
+        // Retry failed chunks individually with exponential backoff
+        const MAX_RETRIES: usize = 3;
+        for idx in failed_indices {
+            let text = &prepared_texts[idx];
+            let mut attempts = 0;
+            let mut last_error = String::new();
+
+            while attempts < MAX_RETRIES {
+                match self.embed(text).await {
+                    Ok(embedding) => {
+                        results[idx] = Some(embedding);
+                        tracing::info!(
+                            "Retry succeeded for chunk {} after {} attempts",
+                            idx,
+                            attempts + 1
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        last_error = e.to_string();
+                        tracing::warn!(
+                            "Embed attempt {}/{} failed for chunk {}: {}",
+                            attempts,
+                            MAX_RETRIES,
+                            idx,
+                            e
+                        );
+                        if attempts < MAX_RETRIES {
+                            // Exponential backoff: 100ms, 200ms, 400ms
+                            let delay_ms = 100 * (1 << attempts);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                }
+            }
+
+            if results[idx].is_none() {
+                tracing::error!(
+                    "Chunk {} failed after {} retries: {}",
+                    idx,
+                    MAX_RETRIES,
+                    last_error
+                );
+                return Err(anyhow!(
+                    "Failed to embed chunk {} after {} retries: {}",
+                    idx,
+                    MAX_RETRIES,
+                    last_error
+                ));
+            }
+        }
+
+        // Collect all results - all should be Some at this point
+        for (idx, opt) in results.iter().enumerate() {
+            match opt {
+                Some(emb) => all_embeddings.push(emb.clone()),
+                None => {
+                    return Err(anyhow!(
+                        "Internal error: missing embedding for chunk {}",
+                        idx
+                    ));
+                }
+            }
         }
 
         Ok(all_embeddings)
@@ -964,6 +1072,119 @@ fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
     truncated.to_string()
 }
 
+// =============================================================================
+// TOKEN-AWARE VALIDATION
+// =============================================================================
+//
+// Embedding models have token limits (e.g., 8192 for qwen3-embedding).
+// These utilities estimate token counts and validate chunks before embedding.
+// =============================================================================
+
+/// Token estimation configuration
+#[derive(Debug, Clone)]
+pub struct TokenConfig {
+    /// Maximum tokens for the embedding model
+    pub max_tokens: usize,
+    /// Average characters per token (varies by language)
+    /// English: ~4 chars/token, Polish/multilingual: ~2-3 chars/token
+    pub chars_per_token: f32,
+}
+
+impl Default for TokenConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 8192,     // qwen3-embedding default
+            chars_per_token: 3.0, // Conservative for multilingual
+        }
+    }
+}
+
+impl TokenConfig {
+    /// Create config for English-only content
+    pub fn english() -> Self {
+        Self {
+            max_tokens: 8192,
+            chars_per_token: 4.0,
+        }
+    }
+
+    /// Create config for multilingual/Polish content
+    pub fn multilingual() -> Self {
+        Self {
+            max_tokens: 8192,
+            chars_per_token: 2.5,
+        }
+    }
+
+    /// Create config with custom max tokens
+    pub fn with_max_tokens(mut self, max: usize) -> Self {
+        self.max_tokens = max;
+        self
+    }
+}
+
+/// Estimate token count for text
+///
+/// This is a heuristic approximation. For precise counting,
+/// use the actual tokenizer (tiktoken, sentencepiece, etc.)
+pub fn estimate_tokens(text: &str, config: &TokenConfig) -> usize {
+    let char_count = text.chars().count();
+    (char_count as f32 / config.chars_per_token).ceil() as usize
+}
+
+/// Validate that a chunk fits within token limits
+///
+/// Returns Ok(()) if chunk is within limits, Err with details otherwise.
+pub fn validate_chunk_tokens(chunk: &str, config: &TokenConfig) -> Result<()> {
+    let estimated = estimate_tokens(chunk, config);
+
+    if estimated > config.max_tokens {
+        return Err(anyhow!(
+            "Chunk exceeds token limit: ~{} tokens > {} max (text: {} chars). \
+             Consider reducing chunk_size or enabling truncation.",
+            estimated,
+            config.max_tokens,
+            chunk.chars().count()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Calculate safe chunk size in characters for given token limit
+pub fn safe_chunk_size(config: &TokenConfig) -> usize {
+    // Use 80% of max to leave room for context prefix
+    let safe_tokens = (config.max_tokens as f32 * 0.8) as usize;
+    (safe_tokens as f32 * config.chars_per_token) as usize
+}
+
+/// Truncate text to fit within token limit
+pub fn truncate_to_token_limit(text: &str, config: &TokenConfig) -> String {
+    let safe_chars = safe_chunk_size(config);
+
+    if text.chars().count() <= safe_chars {
+        return text.to_string();
+    }
+
+    truncate_at_boundary(text, safe_chars)
+}
+
+/// Validate a batch of texts and return which ones exceed limits
+pub fn validate_batch_tokens(texts: &[String], config: &TokenConfig) -> Vec<(usize, usize)> {
+    texts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, text)| {
+            let estimated = estimate_tokens(text, config);
+            if estimated > config.max_tokens {
+                Some((idx, estimated))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,5 +1258,59 @@ mod tests {
         let text = "Short text";
         let truncated = truncate_at_boundary(text, 100);
         assert_eq!(truncated, "Short text");
+    }
+
+    #[test]
+    fn test_token_estimation() {
+        let config = TokenConfig::default();
+
+        // ~3 chars per token (default multilingual)
+        let text = "Hello world"; // 11 chars -> ~4 tokens
+        let tokens = estimate_tokens(text, &config);
+        assert!((3..=5).contains(&tokens));
+
+        // English config (4 chars per token)
+        let english_config = TokenConfig::english();
+        let tokens = estimate_tokens(text, &english_config);
+        assert!((2..=4).contains(&tokens));
+    }
+
+    #[test]
+    fn test_chunk_validation() {
+        let config = TokenConfig::default().with_max_tokens(100);
+
+        // Short text should pass
+        let short = "Hello world";
+        assert!(validate_chunk_tokens(short, &config).is_ok());
+
+        // Long text should fail
+        let long = "a".repeat(1000); // Way more than 100 * 3 = 300 chars
+        assert!(validate_chunk_tokens(&long, &config).is_err());
+    }
+
+    #[test]
+    fn test_safe_chunk_size() {
+        let config = TokenConfig::default(); // 8192 tokens, 3 chars/token
+
+        let safe = safe_chunk_size(&config);
+        // 8192 * 0.8 * 3 = 19660 chars
+        assert!(safe > 15000 && safe < 25000);
+    }
+
+    #[test]
+    fn test_batch_validation() {
+        let config = TokenConfig::default().with_max_tokens(10);
+
+        let texts = vec![
+            "short".to_string(),      // OK
+            "a".repeat(100),          // Too long
+            "also short".to_string(), // OK
+            "b".repeat(200),          // Too long
+        ];
+
+        let failures = validate_batch_tokens(&texts, &config);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].0, 1); // Index 1
+        assert_eq!(failures[1].0, 3); // Index 3
     }
 }

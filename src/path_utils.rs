@@ -1,4 +1,4 @@
-//! Path sanitization utilities for TUI wizard.
+//! Path sanitization utilities.
 //!
 //! Provides secure path handling to prevent path traversal attacks.
 //! All user-provided paths must be validated through this module.
