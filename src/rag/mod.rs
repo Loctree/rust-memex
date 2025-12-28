@@ -1727,7 +1727,7 @@ impl SearchOptions {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub id: String,
     pub namespace: String,

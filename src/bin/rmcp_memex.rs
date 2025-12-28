@@ -10,8 +10,8 @@ use walkdir::WalkDir;
 use rmcp_memex::{
     EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
     IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
-    RAGPipeline, RerankerConfig, SearchMode, ServerConfig, SliceLayer, SliceMode, StorageManager,
-    WizardConfig, run_stdio_server, run_wizard,
+    QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig,
+    SliceLayer, SliceMode, StorageManager, WizardConfig, run_stdio_server, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -460,6 +460,11 @@ enum Commands {
         /// Hybrid combines vector and BM25 using score fusion for best results.
         #[arg(long, short = 'm', default_value = "hybrid", value_parser = ["vector", "keyword", "bm25", "hybrid"])]
         mode: String,
+
+        /// Auto-detect query intent and select optimal search mode.
+        /// Overrides --mode when enabled. Uses QueryRouter to analyze query.
+        #[arg(long)]
+        auto_route: bool,
 
         /// Show relevance scores prominently (enabled by default)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
@@ -1927,6 +1932,7 @@ async fn main() -> Result<()> {
             deep,
             layer,
             mode,
+            auto_route,
             ..
         }) => {
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -1957,8 +1963,33 @@ async fn main() -> Result<()> {
                 None // Default: all layers (for backward compatibility)
             };
 
-            // Parse search mode (default: hybrid)
-            let search_mode: SearchMode = mode.parse().unwrap_or_default();
+            // Parse search mode - use QueryRouter if --auto-route enabled
+            let search_mode: SearchMode = if auto_route {
+                let router = QueryRouter::new();
+                let decision = router.route(&query);
+                eprintln!(
+                    "Query intent: {} (confidence: {:.2})",
+                    decision.intent, decision.confidence
+                );
+                if let Some(ref suggestion) = decision.loctree_suggestion {
+                    eprintln!(
+                        "Consider: {} - {}",
+                        suggestion.command, suggestion.explanation
+                    );
+                }
+                if let Some(ref hints) = decision.temporal_hints
+                    && !hints.date_references.is_empty()
+                {
+                    eprintln!("Date references: {}", hints.date_references.join(", "));
+                }
+                match decision.recommended_mode.mode {
+                    SearchModeRecommendation::Vector => SearchMode::Vector,
+                    SearchModeRecommendation::Bm25 => SearchMode::Keyword,
+                    SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
+                }
+            } else {
+                mode.parse().unwrap_or_default()
+            };
 
             run_search(
                 namespace,

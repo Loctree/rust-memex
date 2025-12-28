@@ -36,13 +36,16 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::embeddings::{EmbeddingClient, EmbeddingConfig};
-use crate::rag::SearchResult;
-use crate::search::{BM25Config, BM25Index};
+use crate::rag::{SearchResult, SliceLayer};
+use crate::search::{
+    BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
+};
 use crate::storage::{ChromaDocument, StorageManager};
 
 // Re-export SearchResult for convenience
@@ -66,12 +69,22 @@ pub struct MemexConfig {
     /// Embedding provider configuration
     #[serde(default)]
     pub embedding_config: EmbeddingConfig,
-    /// Enable BM25 keyword search (hybrid search)
+    /// Enable BM25 keyword search
     #[serde(default)]
     pub enable_bm25: bool,
     /// BM25 configuration (if enabled)
     #[serde(default)]
     pub bm25_config: Option<BM25Config>,
+    /// Enable hybrid search (vector + BM25 fusion)
+    #[serde(default = "default_enable_hybrid")]
+    pub enable_hybrid: bool,
+    /// Hybrid search configuration
+    #[serde(default)]
+    pub hybrid_config: Option<HybridConfig>,
+}
+
+fn default_enable_hybrid() -> bool {
+    true // Hybrid enabled by default
 }
 
 fn default_dimension() -> usize {
@@ -88,6 +101,8 @@ impl Default for MemexConfig {
             embedding_config: EmbeddingConfig::default(),
             enable_bm25: false,
             bm25_config: None,
+            enable_hybrid: default_enable_hybrid(),
+            hybrid_config: None,
         }
     }
 }
@@ -279,6 +294,68 @@ pub struct BatchResult {
     pub failed_ids: Vec<String>,
 }
 
+/// Statistics for a single layer in dive results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerStats {
+    /// Total number of chunks found in this layer
+    pub total_chunks: usize,
+    /// Average score of results in this layer
+    pub avg_score: f32,
+    /// Top keywords across results in this layer
+    pub top_keywords: Vec<String>,
+}
+
+impl LayerStats {
+    /// Create empty layer stats
+    pub fn empty() -> Self {
+        Self {
+            total_chunks: 0,
+            avg_score: 0.0,
+            top_keywords: vec![],
+        }
+    }
+
+    /// Create layer stats from search results
+    pub fn from_results(results: &[SearchResult]) -> Self {
+        if results.is_empty() {
+            return Self::empty();
+        }
+
+        let total_chunks = results.len();
+        let avg_score = results.iter().map(|r| r.score).sum::<f32>() / total_chunks as f32;
+
+        // Aggregate keywords across results
+        let mut keyword_counts: HashMap<String, usize> = HashMap::new();
+        for result in results {
+            for keyword in &result.keywords {
+                *keyword_counts.entry(keyword.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Sort by frequency and take top 10
+        let mut keywords: Vec<_> = keyword_counts.into_iter().collect();
+        keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_keywords = keywords.into_iter().take(10).map(|(k, _)| k).collect();
+
+        Self {
+            total_chunks,
+            avg_score,
+            top_keywords,
+        }
+    }
+}
+
+/// Result of a dive operation for a single layer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiveResult {
+    /// The layer this result is for
+    pub layer: SliceLayer,
+    /// Search results for this layer
+    pub results: Vec<SearchResult>,
+    /// Statistics for this layer
+    pub layer_stats: LayerStats,
+}
+
 /// High-level API for vector memory operations.
 ///
 /// MemexEngine provides a simple interface for storing, searching, and managing
@@ -287,6 +364,7 @@ pub struct MemexEngine {
     storage: Arc<StorageManager>,
     embeddings: Arc<Mutex<EmbeddingClient>>,
     bm25: Option<BM25Index>,
+    hybrid_searcher: Option<HybridSearcher>,
     namespace: String,
     config: MemexConfig,
 }
@@ -343,10 +421,21 @@ impl MemexEngine {
             None
         };
 
+        let storage_arc = Arc::new(storage);
+
+        // Initialize HybridSearcher if hybrid mode is enabled
+        let hybrid_searcher = if config.enable_hybrid {
+            let hybrid_config = config.hybrid_config.clone().unwrap_or_default();
+            Some(HybridSearcher::new(storage_arc.clone(), hybrid_config).await?)
+        } else {
+            None
+        };
+
         Ok(Self {
-            storage: Arc::new(storage),
+            storage: storage_arc,
             embeddings: Arc::new(Mutex::new(embeddings)),
             bm25,
+            hybrid_searcher,
             namespace: config.namespace.clone(),
             config,
         })
@@ -396,6 +485,8 @@ impl MemexEngine {
             },
             enable_bm25: false,
             bm25_config: None,
+            enable_hybrid: true, // Hybrid enabled for Vista
+            hybrid_config: None,
         };
         Self::new(config).await
     }
@@ -517,6 +608,91 @@ impl MemexEngine {
 
         debug!("Search returned {} results", results.len());
         Ok(results)
+    }
+
+    /// Hybrid search combining vector similarity and BM25 keyword matching.
+    ///
+    /// Returns results with combined scores from both methods.
+    /// Requires `enable_hybrid: true` in config.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let results = engine.search_hybrid("when did we buy dragon", 10).await?;
+    /// for r in results {
+    ///     println!("{}: combined={:.3}, vector={:?}, bm25={:?}",
+    ///         r.id, r.combined_score, r.vector_score, r.bm25_score);
+    /// }
+    /// ```
+    pub async fn search_hybrid(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HybridSearchResult>> {
+        debug!("Hybrid search: query='{}', limit={}", query, limit);
+
+        let hybrid = self.hybrid_searcher.as_ref().ok_or_else(|| {
+            anyhow!("Hybrid search not enabled. Set enable_hybrid: true in MemexConfig.")
+        })?;
+
+        // Generate query embedding
+        let query_embedding = self.embeddings.lock().await.embed(query).await?;
+
+        // Perform hybrid search
+        let results = hybrid
+            .search(query, query_embedding, Some(&self.namespace), limit, None)
+            .await?;
+
+        debug!("Hybrid search returned {} results", results.len());
+        Ok(results)
+    }
+
+    /// Search with explicit mode selection.
+    ///
+    /// Allows choosing between vector-only, keyword-only, or hybrid search.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use rmcp_memex::SearchMode;
+    ///
+    /// // Keyword-only for exact matches
+    /// let results = engine.search_with_mode("dragon", 10, SearchMode::Keyword).await?;
+    /// ```
+    pub async fn search_with_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        mode: SearchMode,
+    ) -> Result<Vec<HybridSearchResult>> {
+        debug!("Search with mode: query='{}', mode={:?}", query, mode);
+
+        match mode {
+            SearchMode::Vector => {
+                // Use regular vector search and convert to HybridSearchResult
+                let results = self.search(query, limit).await?;
+                Ok(results
+                    .into_iter()
+                    .map(|r| HybridSearchResult {
+                        id: r.id,
+                        namespace: r.namespace,
+                        document: r.text,
+                        combined_score: r.score,
+                        vector_score: Some(r.score),
+                        bm25_score: None,
+                        metadata: r.metadata,
+                        layer: r.layer,
+                        parent_id: r.parent_id,
+                        children_ids: r.children_ids,
+                        keywords: r.keywords,
+                    })
+                    .collect())
+            }
+            SearchMode::Keyword | SearchMode::Hybrid => {
+                // Use hybrid searcher
+                self.search_hybrid(query, limit).await
+            }
+        }
     }
 
     /// Get a document by ID.
@@ -769,7 +945,11 @@ impl MemexEngine {
     /// * `query` - Search query
     /// * `limit` - Maximum results
     /// * `bm25_weight` - Weight for BM25 scores (0.0-1.0, default 0.3)
-    pub async fn search_hybrid(
+    #[deprecated(
+        since = "0.3.1",
+        note = "Use search_hybrid() with HybridSearcher instead"
+    )]
+    pub async fn search_bm25_fusion(
         &self,
         query: &str,
         limit: usize,

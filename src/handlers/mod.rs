@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::{
     ServerConfig,
     embeddings::EmbeddingClient,
-    rag::RAGPipeline,
+    query::{QueryRouter, SearchModeRecommendation},
+    rag::{RAGPipeline, SliceLayer},
     search::{HybridSearcher, SearchMode},
     security::NamespaceAccessManager,
     storage::StorageManager,
@@ -231,7 +232,8 @@ impl MCPServer {
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 10},
                                 "namespace": {"type": "string"},
-                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"}
+                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                                "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
                             },
                             "required": ["query"]
                         }
@@ -274,6 +276,7 @@ impl MCPServer {
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 5},
                                 "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                                "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
                                 "token": {"type": "string", "description": "Access token for protected namespaces"}
                             },
                             "required": ["namespace", "query"]
@@ -343,6 +346,20 @@ impl MCPServer {
                             "type": "object",
                             "properties": {},
                             "required": []
+                        }
+                    },
+                    {
+                        "name": "dive",
+                        "description": "Deep exploration with all onion layers. Shows ALL layers (outer/middle/inner/core), both BM25 and vector scores, full metadata, and related chunks.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": {"type": "string", "description": "Namespace to search in"},
+                                "query": {"type": "string", "description": "Search query text"},
+                                "limit": {"type": "integer", "default": 5, "description": "Maximum results per layer"},
+                                "verbose": {"type": "boolean", "default": false, "description": "Show full text and metadata"}
+                            },
+                            "required": ["namespace", "query"]
                         }
                     }
                 ]
@@ -415,10 +432,23 @@ impl MCPServer {
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(10) as usize;
                         let namespace = args["namespace"].as_str();
-                        let mode = match args["mode"].as_str() {
-                            Some("vector") => SearchMode::Vector,
-                            Some("bm25") | Some("keyword") => SearchMode::Keyword,
-                            _ => SearchMode::Hybrid, // default to hybrid
+                        let auto_route = args["auto_route"].as_bool().unwrap_or(false);
+
+                        // Determine search mode - QueryRouter if auto_route enabled
+                        let mode = if auto_route {
+                            let router = QueryRouter::new();
+                            let decision = router.route(query);
+                            match decision.recommended_mode.mode {
+                                SearchModeRecommendation::Vector => SearchMode::Vector,
+                                SearchModeRecommendation::Bm25 => SearchMode::Keyword,
+                                SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
+                            }
+                        } else {
+                            match args["mode"].as_str() {
+                                Some("vector") => SearchMode::Vector,
+                                Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                                _ => SearchMode::Hybrid, // default to hybrid
+                            }
                         };
 
                         // Use hybrid search if available and mode is not pure vector
@@ -567,10 +597,23 @@ impl MCPServer {
 
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(5) as usize;
-                        let mode = match args["mode"].as_str() {
-                            Some("vector") => SearchMode::Vector,
-                            Some("bm25") | Some("keyword") => SearchMode::Keyword,
-                            _ => SearchMode::Hybrid, // default to hybrid
+                        let auto_route = args["auto_route"].as_bool().unwrap_or(false);
+
+                        // Determine search mode - QueryRouter if auto_route enabled
+                        let mode = if auto_route {
+                            let router = QueryRouter::new();
+                            let decision = router.route(query);
+                            match decision.recommended_mode.mode {
+                                SearchModeRecommendation::Vector => SearchMode::Vector,
+                                SearchModeRecommendation::Bm25 => SearchMode::Keyword,
+                                SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
+                            }
+                        } else {
+                            match args["mode"].as_str() {
+                                Some("vector") => SearchMode::Vector,
+                                Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                                _ => SearchMode::Hybrid, // default to hybrid
+                            }
                         };
 
                         // Use hybrid search if available and mode is not pure vector
@@ -778,6 +821,89 @@ impl MCPServer {
                                     protected_count
                                 )
                             }]
+                        })
+                    }
+                    "dive" => {
+                        let namespace = args["namespace"].as_str().unwrap_or("");
+                        let query = args["query"].as_str().unwrap_or("");
+                        let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+                        let verbose = args["verbose"].as_bool().unwrap_or(false);
+
+                        if namespace.is_empty() || query.is_empty() {
+                            return json!({
+                                "jsonrpc": "2.0",
+                                "error": {"code": -32602, "message": "namespace and query are required"},
+                                "id": id
+                            });
+                        }
+
+                        // Search each layer
+                        let layers = [
+                            (Some(SliceLayer::Outer), "outer"),
+                            (Some(SliceLayer::Middle), "middle"),
+                            (Some(SliceLayer::Inner), "inner"),
+                            (Some(SliceLayer::Core), "core"),
+                        ];
+
+                        let mut all_results: Vec<serde_json::Value> = Vec::new();
+
+                        for (layer_filter, layer_name) in &layers {
+                            match self
+                                .rag
+                                .memory_search_with_layer(namespace, query, limit, *layer_filter)
+                                .await
+                            {
+                                Ok(results) => {
+                                    let layer_results: Vec<serde_json::Value> = results
+                                        .iter()
+                                        .map(|r| {
+                                            let mut obj = json!({
+                                                "id": r.id,
+                                                "score": r.score,
+                                                "keywords": r.keywords,
+                                                "layer": r.layer.map(|l| l.name()),
+                                                "can_expand": r.can_expand(),
+                                                "parent_id": r.parent_id,
+                                            });
+                                            if verbose {
+                                                obj["text"] = json!(r.text);
+                                                obj["metadata"] = r.metadata.clone();
+                                                obj["children_ids"] = json!(r.children_ids);
+                                            } else {
+                                                // Truncated preview
+                                                let preview: String =
+                                                    r.text.chars().take(200).collect();
+                                                obj["preview"] = json!(preview);
+                                            }
+                                            obj
+                                        })
+                                        .collect();
+
+                                    all_results.push(json!({
+                                        "layer": layer_name,
+                                        "count": results.len(),
+                                        "results": layer_results
+                                    }));
+                                }
+                                Err(e) => {
+                                    all_results.push(json!({
+                                        "layer": layer_name,
+                                        "error": e.to_string()
+                                    }));
+                                }
+                            }
+                        }
+
+                        let output = json!({
+                            "query": query,
+                            "namespace": namespace,
+                            "limit_per_layer": limit,
+                            "verbose": verbose,
+                            "layers": all_results
+                        });
+
+                        json!({
+                            "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default()}]
                         })
                     }
                     _ => {
