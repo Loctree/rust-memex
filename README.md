@@ -44,16 +44,17 @@ RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 |------|-------------|
 | `rag_index` | Index document from file |
 | `rag_index_text` | Index raw text |
-| `rag_search` | Search documents semantically |
+| `rag_search` | Search documents semantically (supports `auto_route`) |
 
 ### Memory Tools
 | Tool | Description |
 |------|-------------|
 | `memory_upsert` | Add/update chunk in namespace |
 | `memory_get` | Get chunk by ID |
-| `memory_search` | Search semantically in namespace |
+| `memory_search` | Search semantically in namespace (supports `auto_route`) |
 | `memory_delete` | Delete chunk |
 | `memory_purge_namespace` | Delete all chunks in namespace |
+| `dive` | Deep exploration with all onion layers (outer/middle/inner/core) |
 
 ### Security Tools
 | Tool | Description |
@@ -160,6 +161,26 @@ let engine = MemexEngine::for_app("my-app", "patients").await?;
 let filter = MetaFilter::for_patient("P-123");
 let deleted = engine.delete_by_filter(filter).await?;
 println!("Deleted {} documents", deleted);
+```
+
+### Hybrid Search (BM25 + Vector)
+
+```rust
+use rmcp_memex::{MemexEngine, SearchMode};
+
+let engine = MemexEngine::for_app("my-app", "documents").await?;
+
+// Hybrid search with BM25 + vector fusion (recommended)
+let results = engine.search_hybrid("dragon mac studio", 10).await?;
+for r in &results {
+    println!("{}: {} (combined: {:.2}, vector: {:.2}, bm25: {:.2})",
+        r.id, r.document, r.combined_score, r.vector_score, r.bm25_score);
+}
+
+// Explicit mode selection
+let results = engine.search_with_mode("exact keyword", 10, SearchMode::Keyword).await?;
+let results = engine.search_with_mode("semantic concept", 10, SearchMode::Vector).await?;
+let results = engine.search_with_mode("best of both", 10, SearchMode::Hybrid).await?;
 ```
 
 ### Agent Tools API
@@ -505,6 +526,34 @@ Instead of traditional flat chunking, rmcp-memex offers hierarchical "onion slic
 ```
 
 **Philosophy:** "Minimum info → Maximum navigation paths"
+
+### QueryRouter & Auto-Route
+
+Intelligent query intent detection for automatic search mode selection:
+
+```bash
+# Auto-detect query intent and select optimal mode
+rmcp-memex search -n memories -q "when did we buy dragon" --auto-route
+# Output: Query intent: temporal (confidence: 0.70)
+#         Selects: hybrid mode with date boosting
+
+# Structural queries suggest loctree
+rmcp-memex search -n code -q "who imports main.rs" --auto-route
+# Output: Query intent: structural (confidence: 0.80)
+#         Consider: loctree query --kind who-imports --target main.rs
+
+# Deep exploration with all onion layers
+rmcp-memex dive -n memories -q "dragon" --verbose
+```
+
+**Intent Types:**
+| Intent | Trigger Keywords | Recommended Mode |
+|--------|-----------------|------------------|
+| Temporal | when, date, yesterday, ago, 2024 | Hybrid (date boost) |
+| Structural | import, depends, module, who uses | BM25 + loctree suggestion |
+| Semantic | similar, related, explain | Vector |
+| Exact | "quoted strings" | BM25 |
+| Hybrid | (default) | Vector + BM25 fusion |
 
 ### CLI Commands
 

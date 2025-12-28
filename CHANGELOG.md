@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2025-12-29
+
+### Added
+- **QueryRouter** - Intelligent query intent detection and automatic search mode selection
+  - `detect_intent()` - Fast heuristic-based intent detection (Temporal/Structural/Semantic/Exact/Hybrid)
+  - `QueryRouter::route()` - Full routing with confidence scores and recommendations
+  - Intent types: Temporal (date queries), Structural (code/import queries → loctree), Semantic, Exact (quoted), Hybrid
+  - Polish language support for temporal keywords (kiedy, wczoraj, dzisiaj, etc.)
+- **CLI `--auto-route` flag** - Automatic search mode selection for `search` command
+  - Analyzes query intent and selects optimal mode (vector/bm25/hybrid)
+  - Displays intent, confidence, and loctree suggestions when applicable
+  - Example: `rmcp-memex search -n memories -q "when did we buy dragon" --auto-route`
+- **MCP `auto_route` parameter** - Added to `rag_search` and `memory_search` tools
+  - When `true`, QueryRouter overrides explicit `mode` parameter
+  - Enables intelligent mode selection for AI agents
+- **MCP `dive` tool** - Deep exploration with all onion layers
+  - Searches all 4 layers (outer/middle/inner/core) simultaneously
+  - Returns structured results per layer with scores and metadata
+  - Parameters: `namespace`, `query`, `limit` (per layer), `verbose`
+- **MemexEngine Hybrid Search** - Library-level hybrid search methods
+  - `search_hybrid()` - BM25 + vector fusion search returning `HybridSearchResult`
+  - `search_with_mode()` - Explicit mode selection (Vector/Keyword/Hybrid)
+  - `search_bm25_fusion()` - Deprecated alias for backward compatibility
+  - `HybridConfig` in `MemexConfig` for library consumers
+
+### Changed
+- Reranker config updated to Qwen3-Reranker-8B on port 12346 (from 4B)
+- MCP tool schemas now include `auto_route` parameter documentation
+
 ## [0.3.0] - 2025-12-28
 
 ### Added
