@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-memex"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
@@ -9,6 +9,18 @@ repository = "https://github.com/Loctree/rmcp-memex"
 keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 
+[features]
+default = ["cli", "provider-cascade"]
+
+# CLI feature: enables the binary, TUI wizard, and progress bars
+cli = ["clap", "indicatif", "ratatui", "crossterm"]
+
+# Provider cascade: current Ollama/OpenAI-compatible embedding approach
+provider-cascade = []
+
+# Embedded Candle embeddings (placeholder for future)
+# embedded-candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+
 [lib]
 name = "rmcp_memex"
 path = "src/lib.rs"
@@ -16,6 +28,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "rmcp-memex"
 path = "src/bin/rmcp_memex.rs"
+required-features = ["cli"]
 
 [dependencies]
 # Core MCP
@@ -57,16 +70,14 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 shellexpand = "3.1"
 
-# TUI (wizard configurator)
-ratatui = "0.29"
-crossterm = "0.29"
-
-# Progress bar for CLI
-indicatif = "0.17"
+# CLI-only dependencies (optional, enabled by "cli" feature)
+clap = { version = "4.5", features = ["derive"], optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.29", optional = true }
+indicatif = { version = "0.17", optional = true }
 
 # BM25 keyword search (hybrid search with vector)
 tantivy = "0.22"

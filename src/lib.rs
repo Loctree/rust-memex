@@ -1,15 +1,21 @@
 pub mod common;
 pub mod embeddings;
+pub mod engine;
 pub mod handlers;
 pub mod path_utils;
 pub mod preprocessing;
-pub mod progress;
 pub mod rag;
 pub mod search;
 pub mod security;
 pub mod storage;
 #[cfg(test)]
 mod tests;
+pub mod tools;
+
+// CLI-only modules (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub mod progress;
+#[cfg(feature = "cli")]
 pub mod tui;
 
 use anyhow::Result;
@@ -23,7 +29,6 @@ pub use embeddings::{
 };
 pub use handlers::{MCPServer, create_server};
 pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
-pub use progress::IndexProgressTracker;
 pub use rag::{
     ContextPrefixConfig, EnrichedChunk, IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline,
     SearchOptions, SearchResult, SliceLayer, SliceMode, compute_content_hash,
@@ -35,6 +40,20 @@ pub use search::{
 };
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{ChromaDocument, StorageManager};
+
+// High-level engine API
+pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
+
+// Agent tools API (MCP-compatible)
+pub use tools::{
+    ToolDefinition, ToolResult, memory_delete, memory_delete_by_filter, memory_get, memory_search,
+    memory_store, memory_store_batch, tool_definitions,
+};
+
+// CLI-only re-exports (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub use progress::IndexProgressTracker;
+#[cfg(feature = "cli")]
 pub use tui::{HostDetection, HostKind, WizardConfig, detect_hosts, run_wizard};
 
 #[derive(Debug, Clone)]

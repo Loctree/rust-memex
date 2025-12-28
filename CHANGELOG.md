@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2025-12-28
+
+### Added
+- **MemexEngine** - High-level API for library consumers
+  - `MemexEngine::for_app()` - quick setup for any application with auto-config
+  - `MemexEngine::for_vista()` - Vista-optimized defaults (1024 dims, qwen3-embedding:0.6b)
+  - CRUD operations: `store()`, `search()`, `get()`, `delete()`
+  - Batch operations: `store_batch()` for efficient bulk inserts
+  - Filtered operations: `search_filtered()`, `delete_by_filter()` for GDPR-compliant deletion
+  - Hybrid search: `search_hybrid()` combining BM25 keyword + vector similarity
+  - Builder pattern: `MemexConfig` with `with_dimension()`, `with_db_path()`, `with_bm25()`
+- **Agent Tools API** - MCP-compatible tool functions for AI agents
+  - `memory_store` - Store text with automatic embedding generation
+  - `memory_search` - Semantic search with optional metadata filtering
+  - `memory_get` - Retrieve document by ID
+  - `memory_delete` - Delete document by ID
+  - `memory_store_batch` - Efficient batch storage
+  - `memory_delete_by_filter` - GDPR deletion by metadata filter
+  - `tool_definitions()` - Returns all tool schemas for MCP registration
+  - `ToolDefinition` struct matching MCP schema format
+  - `ToolResult` struct for consistent tool responses
+- **Feature Flags** - Library-only builds without CLI dependencies
+  - `default = ["cli", "provider-cascade"]`
+  - `cargo build --no-default-features` for minimal library build
+  - CLI deps (clap, indicatif, ratatui, crossterm) now optional
+- **MetaFilter** - Metadata filtering for searches and deletions
+  - `for_patient()` - GDPR-compliant patient data filtering
+  - `for_visit()` - Visit-specific filtering
+  - `with_custom()` - Custom key-value filters
+  - Date range support (`date_from`, `date_to`)
+- **StoreItem** - Builder for batch storage items
+- **BatchResult** - Result type for batch operations
+
+### Changed
+- CLI dependencies now optional (enabled by `cli` feature flag)
+- Binary requires `cli` feature (`required-features = ["cli"]`)
+- `progress` and `tui` modules conditional on `cli` feature
+- Restructured lib.rs exports for lib-first usage
+
+### Documentation
+- **Configuration Guide** - Complete integration guide for any Rust project
+  - Environment variables reference (`.env` configuration)
+  - Quick start with `for_app()` auto-config
+  - Custom `MemexConfig` with provider configuration
+  - Provider cascade setup (multiple fallback providers)
+  - Namespace strategy best practices
+  - Embedding models reference table (dimensions, sizes, use cases)
+  - Troubleshooting section for common errors
+- **Library Usage** - Comprehensive examples
+  - Basic CRUD operations
+  - Batch operations with `store_batch()`
+  - GDPR-compliant deletion with `MetaFilter`
+  - Agent Tools API for MCP integration
+
 ## [0.2.4] - 2025-12-28
 
 ### Added

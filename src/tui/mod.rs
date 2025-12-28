@@ -11,6 +11,8 @@
 //! 6. HealthCheck - Verify embedder connectivity + dimension
 //! 7. DataSetup - Optional directory indexing
 //! 8. Summary - Write config and finish
+//!
+//! This module is only available when the `cli` feature is enabled.
 
 mod app;
 mod detection;

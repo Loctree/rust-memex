@@ -4,6 +4,8 @@
 //! 1. Pre-scan: Count files and estimate chunks
 //! 2. Calibration: Measure embedding speed on first file
 //! 3. Indexing: Progress bar with ETA based on calibration
+//!
+//! This module is only available when the `cli` feature is enabled.
 
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
