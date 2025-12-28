@@ -61,7 +61,9 @@ impl Default for PreprocessingConfig {
         Self {
             remove_tool_artifacts: true,
             remove_cli_output: true,
-            remove_metadata: true,
+            // CRITICAL: Preserve timestamps by default for temporal queries!
+            // Use --sanitize-metadata CLI flag for opt-in sanitization.
+            remove_metadata: false,
             min_content_length: 50,
             dedupe_threshold: 0.95,
             remove_empty_content: true,

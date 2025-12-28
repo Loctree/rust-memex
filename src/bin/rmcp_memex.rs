@@ -8,9 +8,10 @@ use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, MlxConfig, NamespaceSecurityConfig,
-    PreprocessingConfig, ProviderConfig, RAGPipeline, RerankerConfig, ServerConfig, SliceLayer,
-    SliceMode, StorageManager, WizardConfig, run_stdio_server, run_wizard,
+    EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
+    IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
+    RAGPipeline, RerankerConfig, SearchMode, ServerConfig, SliceLayer, SliceMode, StorageManager,
+    WizardConfig, run_stdio_server, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -322,6 +323,52 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Quick stats and health check for namespaces
+    ///
+    /// Shows chunk count, date range, top topics, and storage info.
+    ///
+    /// Examples:
+    ///   rmcp-memex overview           # All namespaces
+    ///   rmcp-memex overview memories  # Specific namespace
+    Overview {
+        /// Namespace to get overview for (optional, shows all if not specified)
+        namespace: Option<String>,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Deep exploration with all details - drill into onion layers
+    ///
+    /// Shows ALL onion layers (outer/middle/inner/core), both BM25 and vector scores,
+    /// full metadata, and related chunks.
+    ///
+    /// Examples:
+    ///   rmcp-memex dive -n memories -q "dragon"
+    ///   rmcp-memex dive -n memories -q "dragon" --verbose
+    Dive {
+        /// Namespace to search in
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Search query text
+        #[arg(long, short = 'q', required = true)]
+        query: String,
+
+        /// Maximum number of results per layer
+        #[arg(long, short = 'l', default_value = "5")]
+        limit: usize,
+
+        /// Show extra verbose output (full text, all metadata)
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Batch index documents into vector store
     Index {
         /// Path to file or directory to index
@@ -344,10 +391,17 @@ enum Commands {
         #[arg(long, default_value = "0")]
         max_depth: usize,
 
-        /// Enable preprocessing to filter noise (tool artifacts, CLI output, metadata)
+        /// Enable preprocessing to filter noise (tool artifacts, CLI output)
         /// before indexing. Reduces vector storage size and improves search quality.
+        /// Note: timestamps are preserved by default; use --sanitize-metadata to remove them.
         #[arg(long, short = 'p')]
         preprocess: bool,
+
+        /// Sanitize timestamps, UUIDs, and session IDs from content.
+        /// By default, these are preserved for temporal queries.
+        /// Use this flag when you want to anonymize or normalize the data.
+        #[arg(long)]
+        sanitize_metadata: bool,
 
         /// Slicing mode for document chunking:
         /// - "onion" (default): Hierarchical slices (outer/middle/inner/core) for efficient context
@@ -367,7 +421,16 @@ enum Commands {
         progress: bool,
     },
 
-    /// Semantic search within a namespace
+    /// Smart semantic search within a namespace
+    ///
+    /// Finds relevant information using vector similarity search with intelligent
+    /// defaults. Results include relevance scores, timestamps, and metadata.
+    ///
+    /// Examples:
+    ///   rmcp-memex search -n memories -q "when did we buy dragon"
+    ///   rmcp-memex search -n memories -q "dragon" --deep
+    ///   rmcp-memex search -n memories -q "dragon" -l 20
+    ///   rmcp-memex search -n memories -q "dragon" --mode hybrid
     Search {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -377,7 +440,7 @@ enum Commands {
         #[arg(long, short = 'q', required = true)]
         query: String,
 
-        /// Maximum number of results to return
+        /// Maximum number of results to return (default: 10)
         #[arg(long, short = 'l', default_value = "10")]
         limit: usize,
 
@@ -392,6 +455,15 @@ enum Commands {
         /// Filter by specific layer (outer, middle, inner, core)
         #[arg(long, value_parser = ["outer", "middle", "inner", "core"])]
         layer: Option<String>,
+
+        /// Search mode: vector (similarity only), keyword/bm25 (lexical only), or hybrid (default)
+        /// Hybrid combines vector and BM25 using score fusion for best results.
+        #[arg(long, short = 'm', default_value = "hybrid", value_parser = ["vector", "keyword", "bm25", "hybrid"])]
+        mode: String,
+
+        /// Show relevance scores prominently (enabled by default)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        scores: bool,
     },
 
     /// Expand a slice to get its children (drill down in onion hierarchy)
@@ -546,6 +618,7 @@ impl Cli {
                 token_store_path,
             },
             embeddings,
+            hybrid: base_cfg.hybrid,
         })
     }
 }
@@ -705,7 +778,123 @@ fn json_search_results(
     })
 }
 
+/// Format and display hybrid search results (human-readable)
+fn display_hybrid_search_results(
+    query: &str,
+    namespace: Option<&str>,
+    results: &[HybridSearchResult],
+    layer_filter: Option<SliceLayer>,
+    search_mode: SearchMode,
+) {
+    let ns_display = namespace.unwrap_or("all namespaces");
+    let layer_display = layer_filter
+        .map(|l| format!(" (layer: {})", l.name()))
+        .unwrap_or_default();
+    let mode_display = match search_mode {
+        SearchMode::Hybrid => "hybrid",
+        SearchMode::Keyword => "keyword/bm25",
+        SearchMode::Vector => "vector",
+    };
+
+    eprintln!(
+        "\n-> Search Results for \"{}\" in [{}]{} [mode: {}]\n",
+        query, ns_display, layer_display, mode_display
+    );
+
+    if results.is_empty() {
+        eprintln!("No results found.");
+        return;
+    }
+
+    for (i, result) in results.iter().enumerate() {
+        // Truncate text for display
+        let preview: String = result
+            .document
+            .chars()
+            .take(100)
+            .collect::<String>()
+            .replace('\n', " ");
+        let ellipsis = if result.document.len() > 100 {
+            "..."
+        } else {
+            ""
+        };
+
+        // Layer info
+        let layer_str = result
+            .layer
+            .map(|l| format!("[{}]", l.name()))
+            .unwrap_or_default();
+
+        // Score breakdown
+        let score_details = match (result.vector_score, result.bm25_score) {
+            (Some(v), Some(b)) => format!(
+                "[combined: {:.2}, vec: {:.2}, bm25: {:.2}]",
+                result.combined_score, v, b
+            ),
+            (Some(v), None) => format!("[vec: {:.2}]", v),
+            (None, Some(b)) => format!("[bm25: {:.2}]", b),
+            (None, None) => format!("[score: {:.2}]", result.combined_score),
+        };
+
+        eprintln!(
+            "{}. {} {} {}",
+            i + 1,
+            score_details,
+            result.namespace,
+            layer_str
+        );
+        eprintln!("   \"{}{ellipsis}\"", preview);
+        eprintln!("   ID: {}", result.id);
+        if !result.keywords.is_empty() {
+            eprintln!("   Keywords: {}", result.keywords.join(", "));
+        }
+        if !result.children_ids.is_empty() {
+            eprintln!("   [expandable: {} children]", result.children_ids.len());
+        }
+        if !result.metadata.is_null() && result.metadata != serde_json::json!({}) {
+            eprintln!("   Metadata: {}", result.metadata);
+        }
+        eprintln!();
+    }
+}
+
+/// Format hybrid search results as JSON
+fn json_hybrid_search_results(
+    query: &str,
+    namespace: Option<&str>,
+    results: &[HybridSearchResult],
+    layer_filter: Option<SliceLayer>,
+    search_mode: SearchMode,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "namespace": namespace,
+        "layer_filter": layer_filter.map(|l| l.name()),
+        "search_mode": match search_mode {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Keyword => "keyword",
+            SearchMode::Vector => "vector",
+        },
+        "count": results.len(),
+        "results": results.iter().map(|r| serde_json::json!({
+            "id": r.id,
+            "namespace": r.namespace,
+            "combined_score": r.combined_score,
+            "vector_score": r.vector_score,
+            "bm25_score": r.bm25_score,
+            "text": r.document,
+            "layer": r.layer.map(|l| l.name()),
+            "keywords": r.keywords,
+            "parent_id": r.parent_id,
+            "children_ids": r.children_ids,
+            "metadata": r.metadata
+        })).collect::<Vec<_>>()
+    })
+}
+
 /// Run semantic search within a namespace
+#[allow(clippy::too_many_arguments)] // CLI entry point - args from clap parser
 async fn run_search(
     namespace: String,
     query: String,
@@ -713,21 +902,65 @@ async fn run_search(
     json_output: bool,
     db_path: String,
     layer_filter: Option<SliceLayer>,
+    search_mode: SearchMode,
     embedding_config: &EmbeddingConfig,
 ) -> Result<()> {
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
-    let rag = RAGPipeline::new(embedding_client, storage).await?;
 
-    let results = rag
-        .memory_search_with_layer(&namespace, &query, limit, layer_filter)
-        .await?;
+    // Use hybrid search if mode is not pure vector
+    if search_mode != SearchMode::Vector {
+        // Create hybrid config with specified mode
+        let hybrid_config = HybridConfig {
+            mode: search_mode,
+            ..Default::default()
+        };
+        let hybrid_searcher = HybridSearcher::new(storage, hybrid_config).await?;
 
-    if json_output {
-        let json = json_search_results(&query, Some(&namespace), &results, layer_filter);
-        println!("{}", serde_json::to_string_pretty(&json)?);
+        // Get query embedding
+        let query_embedding = embedding_client.lock().await.embed(&query).await?;
+
+        let results = hybrid_searcher
+            .search(
+                &query,
+                query_embedding,
+                Some(&namespace),
+                limit,
+                layer_filter,
+            )
+            .await?;
+
+        if json_output {
+            let json = json_hybrid_search_results(
+                &query,
+                Some(&namespace),
+                &results,
+                layer_filter,
+                search_mode,
+            );
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        } else {
+            display_hybrid_search_results(
+                &query,
+                Some(&namespace),
+                &results,
+                layer_filter,
+                search_mode,
+            );
+        }
     } else {
-        display_search_results(&query, Some(&namespace), &results, layer_filter);
+        // Legacy vector-only search
+        let rag = RAGPipeline::new(embedding_client, storage).await?;
+        let results = rag
+            .memory_search_with_layer(&namespace, &query, limit, layer_filter)
+            .await?;
+
+        if json_output {
+            let json = json_search_results(&query, Some(&namespace), &results, layer_filter);
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        } else {
+            display_search_results(&query, Some(&namespace), &results, layer_filter);
+        }
     }
 
     Ok(())
@@ -928,6 +1161,331 @@ async fn run_list_namespaces(stats: bool, json_output: bool, db_path: String) ->
     Ok(())
 }
 
+/// Namespace overview stats
+#[derive(Debug, Clone, serde::Serialize)]
+struct NamespaceStats {
+    name: String,
+    total_chunks: usize,
+    layer_counts: std::collections::HashMap<String, usize>,
+    top_keywords: Vec<(String, usize)>,
+    has_timestamps: bool,
+    earliest_indexed: Option<String>,
+    latest_indexed: Option<String>,
+}
+
+/// Run overview command - quick stats and health check
+async fn run_overview(namespace: Option<String>, json_output: bool, db_path: String) -> Result<()> {
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+    let storage = Arc::new(storage);
+
+    // Use a zero embedding to get all documents
+    let zero_embedding = vec![0.0_f32; 4096];
+    let all_docs = storage
+        .search_store(namespace.as_deref(), zero_embedding, 100000)
+        .await?;
+
+    if all_docs.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "empty",
+                    "message": "No documents found",
+                    "namespace": namespace,
+                    "db_path": db_path
+                }))?
+            );
+        } else {
+            eprintln!("\n-> Overview for {}\n", storage.lance_path());
+            if let Some(ns) = &namespace {
+                eprintln!("No documents found in namespace '{}'", ns);
+            } else {
+                eprintln!("Database is empty. Use 'rmcp-memex index' to add documents.");
+            }
+        }
+        return Ok(());
+    }
+
+    // Group by namespace
+    let mut by_namespace: std::collections::HashMap<String, Vec<_>> =
+        std::collections::HashMap::new();
+    for doc in &all_docs {
+        by_namespace
+            .entry(doc.namespace.clone())
+            .or_default()
+            .push(doc);
+    }
+
+    let mut stats_list: Vec<NamespaceStats> = Vec::new();
+
+    for (ns_name, docs) in &by_namespace {
+        // Count layers
+        let mut layer_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for doc in docs {
+            let layer_name = match doc.layer {
+                1 => "outer",
+                2 => "middle",
+                3 => "inner",
+                4 => "core",
+                _ => "flat",
+            };
+            *layer_counts.entry(layer_name.to_string()).or_insert(0) += 1;
+        }
+
+        // Collect all keywords and count frequency
+        let mut keyword_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for doc in docs {
+            for kw in &doc.keywords {
+                *keyword_counts.entry(kw.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut top_keywords: Vec<_> = keyword_counts.into_iter().collect();
+        top_keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_keywords: Vec<(String, usize)> = top_keywords.into_iter().take(10).collect();
+
+        // Check for timestamps in metadata (look for common timestamp patterns)
+        let has_timestamps = docs.iter().any(|d| {
+            let meta_str = d.metadata.to_string();
+            meta_str.contains("timestamp")
+                || meta_str.contains("created_at")
+                || meta_str.contains("indexed_at")
+                || meta_str.contains("date")
+        });
+
+        // Try to extract date range from metadata
+        let mut dates: Vec<String> = Vec::new();
+        for doc in docs {
+            if let Some(obj) = doc.metadata.as_object() {
+                for (k, v) in obj {
+                    if (k.contains("date") || k.contains("timestamp") || k.contains("time"))
+                        && let Some(s) = v.as_str()
+                    {
+                        dates.push(s.to_string());
+                    }
+                }
+            }
+        }
+        dates.sort();
+
+        stats_list.push(NamespaceStats {
+            name: ns_name.clone(),
+            total_chunks: docs.len(),
+            layer_counts,
+            top_keywords,
+            has_timestamps,
+            earliest_indexed: dates.first().cloned(),
+            latest_indexed: dates.last().cloned(),
+        });
+    }
+
+    stats_list.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if json_output {
+        let json = serde_json::json!({
+            "db_path": db_path,
+            "total_chunks": all_docs.len(),
+            "namespace_count": stats_list.len(),
+            "namespaces": stats_list
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        eprintln!("\n=== RMCP-MEMEX OVERVIEW ===\n");
+        eprintln!("Database: {}", db_path);
+        eprintln!("Total chunks: {}", all_docs.len());
+        eprintln!("Namespaces: {}\n", stats_list.len());
+
+        for stats in &stats_list {
+            eprintln!("--- {} ---", stats.name);
+            eprintln!("  Chunks: {}", stats.total_chunks);
+
+            // Layer breakdown
+            if !stats.layer_counts.is_empty() {
+                let layer_str: Vec<String> = stats
+                    .layer_counts
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect();
+                eprintln!("  Layers: {}", layer_str.join(", "));
+            }
+
+            // Top keywords
+            if !stats.top_keywords.is_empty() {
+                let kw_str: Vec<String> = stats
+                    .top_keywords
+                    .iter()
+                    .take(5)
+                    .map(|(k, v)| format!("{}({})", k, v))
+                    .collect();
+                eprintln!("  Top topics: {}", kw_str.join(", "));
+            }
+
+            // Date range
+            if let (Some(earliest), Some(latest)) = (&stats.earliest_indexed, &stats.latest_indexed)
+            {
+                if earliest != latest {
+                    eprintln!("  Date range: {} -> {}", earliest, latest);
+                } else {
+                    eprintln!("  Date: {}", earliest);
+                }
+            }
+
+            // Timestamps warning
+            if !stats.has_timestamps {
+                eprintln!("  [!] No timestamp metadata found");
+            }
+
+            eprintln!();
+        }
+
+        eprintln!("Tip: Use 'rmcp-memex search -n <namespace> -q <query>' to search");
+        eprintln!("     Use 'rmcp-memex dive -n <namespace> -q <query>' for deep exploration");
+    }
+
+    Ok(())
+}
+
+/// Run dive command - deep exploration with all onion layers
+async fn run_dive(
+    namespace: String,
+    query: String,
+    limit: usize,
+    verbose: bool,
+    json_output: bool,
+    db_path: String,
+    embedding_config: &EmbeddingConfig,
+) -> Result<()> {
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+    let rag = RAGPipeline::new(embedding_client, storage).await?;
+
+    // Search each layer separately
+    let layers = [
+        (Some(SliceLayer::Outer), "OUTER"),
+        (Some(SliceLayer::Middle), "MIDDLE"),
+        (Some(SliceLayer::Inner), "INNER"),
+        (Some(SliceLayer::Core), "CORE"),
+    ];
+
+    let mut all_results: Vec<serde_json::Value> = Vec::new();
+
+    if !json_output {
+        eprintln!("\n=== DEEP DIVE: \"{}\" in [{}] ===\n", query, namespace);
+    }
+
+    for (layer_filter, layer_name) in &layers {
+        let results = rag
+            .memory_search_with_layer(&namespace, &query, limit, *layer_filter)
+            .await?;
+
+        if json_output {
+            let layer_results: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    let mut obj = serde_json::json!({
+                        "id": r.id,
+                        "score": r.score,
+                        "keywords": r.keywords,
+                        "layer": r.layer.map(|l| l.name()),
+                        "can_expand": r.can_expand(),
+                        "parent_id": r.parent_id,
+                    });
+                    if verbose {
+                        obj["text"] = serde_json::json!(r.text);
+                        obj["metadata"] = r.metadata.clone();
+                        obj["children_ids"] = serde_json::json!(r.children_ids);
+                    } else {
+                        // Truncated preview
+                        let preview: String = r.text.chars().take(200).collect();
+                        obj["preview"] = serde_json::json!(preview);
+                    }
+                    obj
+                })
+                .collect();
+
+            all_results.push(serde_json::json!({
+                "layer": layer_name,
+                "count": results.len(),
+                "results": layer_results
+            }));
+        } else {
+            eprintln!("--- {} LAYER ({} results) ---", layer_name, results.len());
+
+            if results.is_empty() {
+                eprintln!("  (no results)\n");
+                continue;
+            }
+
+            for (i, result) in results.iter().enumerate() {
+                eprintln!("  {}. [score: {:.3}] {}", i + 1, result.score, result.id);
+
+                // Keywords
+                if !result.keywords.is_empty() {
+                    eprintln!("     Keywords: {}", result.keywords.join(", "));
+                }
+
+                // Text preview or full text
+                if verbose {
+                    eprintln!("     ---");
+                    // Indent each line of text
+                    for line in result.text.lines().take(20) {
+                        eprintln!("     {}", line);
+                    }
+                    if result.text.lines().count() > 20 {
+                        eprintln!("     ... ({} more lines)", result.text.lines().count() - 20);
+                    }
+                    eprintln!("     ---");
+
+                    // Full metadata
+                    if !result.metadata.is_null() && result.metadata != serde_json::json!({}) {
+                        eprintln!("     Metadata: {}", result.metadata);
+                    }
+                } else {
+                    // Short preview
+                    let preview: String = result
+                        .text
+                        .chars()
+                        .take(100)
+                        .collect::<String>()
+                        .replace('\n', " ");
+                    let ellipsis = if result.text.len() > 100 { "..." } else { "" };
+                    eprintln!("     \"{}{}\"", preview, ellipsis);
+                }
+
+                // Hierarchy info
+                if result.can_expand() {
+                    eprintln!("     [expandable: {} children]", result.children_ids.len());
+                }
+                if result.parent_id.is_some() {
+                    eprintln!("     [has parent: can drill up]");
+                }
+
+                eprintln!();
+            }
+        }
+    }
+
+    if json_output {
+        let output = serde_json::json!({
+            "query": query,
+            "namespace": namespace,
+            "limit_per_layer": limit,
+            "verbose": verbose,
+            "layers": all_results
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        eprintln!("=== END DIVE ===\n");
+        eprintln!(
+            "Tip: Use 'rmcp-memex expand -n {} -i <id>' to expand a result",
+            namespace
+        );
+    }
+
+    Ok(())
+}
+
 /// Export a namespace to JSON file
 async fn run_export(
     namespace: String,
@@ -1005,6 +1563,8 @@ struct BatchIndexConfig {
     max_depth: usize,
     db_path: String,
     preprocess: bool,
+    /// Sanitize timestamps/UUIDs/session IDs (default: false = preserve for temporal queries)
+    sanitize_metadata: bool,
     slice_mode: SliceMode,
     dedup: bool,
     embedding_config: EmbeddingConfig,
@@ -1022,6 +1582,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         max_depth,
         db_path,
         preprocess,
+        sanitize_metadata,
         slice_mode,
         dedup,
         embedding_config,
@@ -1119,13 +1680,19 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         // Get file size for calibration adjustment
         let file_bytes = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
 
+        // Build preprocessing config with optional metadata sanitization
+        let preprocess_config = PreprocessingConfig {
+            remove_metadata: sanitize_metadata,
+            ..Default::default()
+        };
+
         if dedup {
             // Use dedup-enabled indexing
             let result = if preprocess {
                 rag.index_document_with_preprocessing_and_dedup(
                     file_path,
                     ns,
-                    PreprocessingConfig::default(),
+                    preprocess_config.clone(),
                 )
                 .await
             } else {
@@ -1179,7 +1746,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         } else {
             // Use original indexing without dedup
             let result = if preprocess {
-                rag.index_document_with_preprocessing(file_path, ns, PreprocessingConfig::default())
+                rag.index_document_with_preprocessing(file_path, ns, preprocess_config.clone())
                     .await
             } else {
                 rag.index_document_with_mode(file_path, ns, effective_mode)
@@ -1268,6 +1835,7 @@ async fn main() -> Result<()> {
             glob,
             max_depth,
             preprocess,
+            sanitize_metadata,
             slice_mode,
             dedup,
             progress,
@@ -1298,11 +1866,57 @@ async fn main() -> Result<()> {
                 max_depth,
                 db_path,
                 preprocess,
+                sanitize_metadata,
                 slice_mode,
                 dedup,
                 embedding_config,
                 show_progress: progress,
             })
+            .await
+        }
+        Some(Commands::Overview { namespace, json }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_overview(namespace, json, db_path).await
+        }
+        Some(Commands::Dive {
+            namespace,
+            query,
+            limit,
+            verbose,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_dive(
+                namespace,
+                query,
+                limit,
+                verbose,
+                json,
+                db_path,
+                &embedding_config,
+            )
             .await
         }
         Some(Commands::Search {
@@ -1312,6 +1926,8 @@ async fn main() -> Result<()> {
             json,
             deep,
             layer,
+            mode,
+            ..
         }) => {
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
             if let Some(ref path) = config_path {
@@ -1341,6 +1957,9 @@ async fn main() -> Result<()> {
                 None // Default: all layers (for backward compatibility)
             };
 
+            // Parse search mode (default: hybrid)
+            let search_mode: SearchMode = mode.parse().unwrap_or_default();
+
             run_search(
                 namespace,
                 query,
@@ -1348,6 +1967,7 @@ async fn main() -> Result<()> {
                 json,
                 db_path,
                 layer_filter,
+                search_mode,
                 &embedding_config,
             )
             .await

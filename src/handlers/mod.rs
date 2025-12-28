@@ -7,8 +7,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    ServerConfig, embeddings::EmbeddingClient, rag::RAGPipeline, security::NamespaceAccessManager,
-    storage::StorageManager,
+    ServerConfig, embeddings::EmbeddingClient, rag::RAGPipeline, search::HybridSearcher,
+    security::NamespaceAccessManager, storage::StorageManager,
 };
 
 /// Validates a file path to prevent path traversal attacks.
@@ -91,6 +91,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
 pub struct MCPServer {
     rag: Arc<RAGPipeline>,
+    /// Hybrid searcher for Phase A integration - will be wired to MCP handlers
+    /// when `rag_search` gains `search_mode` parameter support.
+    #[allow(dead_code)]
+    hybrid_searcher: Option<Arc<HybridSearcher>>,
     max_request_bytes: usize,
     allowed_paths: Vec<String>,
     access_manager: Arc<NamespaceAccessManager>,
@@ -673,7 +677,18 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
     let storage = Arc::new(StorageManager::new(config.cache_mb, &db_path).await?);
     // NOTE: Removed ensure_collection() - table opens lazily on first use
     // This speeds up MCP server startup significantly
-    let rag = Arc::new(RAGPipeline::new(embedding_client, storage).await?);
+    let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage.clone()).await?);
+
+    // Initialize hybrid searcher if mode is not vector-only
+    let hybrid_searcher = if config.hybrid.mode != crate::search::SearchMode::Vector {
+        tracing::info!("Hybrid search: mode={:?}", config.hybrid.mode);
+        Some(Arc::new(
+            HybridSearcher::new(storage, config.hybrid.clone()).await?,
+        ))
+    } else {
+        tracing::info!("Hybrid search: disabled (vector-only mode)");
+        None
+    };
 
     // Initialize namespace access manager
     let access_manager = NamespaceAccessManager::new(config.security.clone());
@@ -682,6 +697,7 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
 
     Ok(MCPServer {
         rag,
+        hybrid_searcher,
         max_request_bytes: config.max_request_bytes,
         allowed_paths: config.allowed_paths,
         access_manager,

@@ -4,6 +4,7 @@ pub mod engine;
 pub mod handlers;
 pub mod path_utils;
 pub mod preprocessing;
+pub mod query;
 pub mod rag;
 pub mod search;
 pub mod security;
@@ -29,6 +30,10 @@ pub use embeddings::{
 };
 pub use handlers::{MCPServer, create_server};
 pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
+pub use query::{
+    LoctreeSuggestion, QueryIntent, QueryRouter, RecommendedSearchMode, RoutingDecision,
+    SearchModeRecommendation, TemporalHints, detect_intent,
+};
 pub use rag::{
     ContextPrefixConfig, EnrichedChunk, IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline,
     SearchOptions, SearchResult, SliceLayer, SliceMode, compute_content_hash,
@@ -83,6 +88,9 @@ pub struct ServerConfig {
 
     /// Embedding provider configuration (universal, config-driven)
     pub embeddings: EmbeddingConfig,
+
+    /// Hybrid search configuration (vector + BM25)
+    pub hybrid: HybridConfig,
 }
 
 impl Default for ServerConfig {
@@ -100,6 +108,7 @@ impl Default for ServerConfig {
             allowed_paths: vec![],
             security: NamespaceSecurityConfig::default(),
             embeddings: EmbeddingConfig::default(),
+            hybrid: HybridConfig::default(),
         }
     }
 }
