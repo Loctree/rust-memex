@@ -7,8 +7,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    ServerConfig, embeddings::EmbeddingClient, rag::RAGPipeline, search::HybridSearcher,
-    security::NamespaceAccessManager, storage::StorageManager,
+    ServerConfig,
+    embeddings::EmbeddingClient,
+    rag::RAGPipeline,
+    search::{HybridSearcher, SearchMode},
+    security::NamespaceAccessManager,
+    storage::StorageManager,
 };
 
 /// Validates a file path to prevent path traversal attacks.
@@ -91,10 +95,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
 pub struct MCPServer {
     rag: Arc<RAGPipeline>,
-    /// Hybrid searcher for Phase A integration - will be wired to MCP handlers
-    /// when `rag_search` gains `search_mode` parameter support.
-    #[allow(dead_code)]
+    /// Hybrid searcher for BM25 + vector fusion search
     hybrid_searcher: Option<Arc<HybridSearcher>>,
+    /// Embedding client for generating query vectors
+    embedding_client: Arc<Mutex<EmbeddingClient>>,
     max_request_bytes: usize,
     allowed_paths: Vec<String>,
     access_manager: Arc<NamespaceAccessManager>,
@@ -226,7 +230,8 @@ impl MCPServer {
                             "properties": {
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 10},
-                                "namespace": {"type": "string"}
+                                "namespace": {"type": "string"},
+                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"}
                             },
                             "required": ["query"]
                         }
@@ -268,6 +273,7 @@ impl MCPServer {
                                 "namespace": {"type": "string"},
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 5},
+                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
                                 "token": {"type": "string", "description": "Access token for protected namespaces"}
                             },
                             "required": ["namespace", "query"]
@@ -409,7 +415,75 @@ impl MCPServer {
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(10) as usize;
                         let namespace = args["namespace"].as_str();
+                        let mode = match args["mode"].as_str() {
+                            Some("vector") => SearchMode::Vector,
+                            Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                            _ => SearchMode::Hybrid, // default to hybrid
+                        };
 
+                        // Use hybrid search if available and mode is not pure vector
+                        if mode != SearchMode::Vector
+                            && let Some(ref hybrid) = self.hybrid_searcher
+                        {
+                            // Generate query embedding
+                            let query_embedding = match self
+                                .embedding_client
+                                .lock()
+                                .await
+                                .embed(query)
+                                .await
+                            {
+                                Ok(emb) => emb,
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Embedding failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            };
+
+                            match hybrid
+                                .search(query, query_embedding, namespace, k, None)
+                                .await
+                            {
+                                Ok(results) => {
+                                    // Convert HybridSearchResult to JSON with scores
+                                    let results_json: Vec<serde_json::Value> = results.iter().map(|r| json!({
+                                        "id": r.id,
+                                        "namespace": r.namespace,
+                                        "document": r.document,
+                                        "combined_score": r.combined_score,
+                                        "vector_score": r.vector_score,
+                                        "bm25_score": r.bm25_score,
+                                        "metadata": r.metadata,
+                                        "layer": r.layer.as_ref().map(|l| format!("{:?}", l)),
+                                        "keywords": r.keywords
+                                    })).collect();
+
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "result": {
+                                            "content": [{
+                                                "type": "text",
+                                                "text": serde_json::to_string(&results_json).unwrap_or_default()
+                                            }]
+                                        },
+                                        "id": id
+                                    });
+                                }
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Hybrid search failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            }
+                        }
+                        // Fall through to vector search if hybrid not available
+
+                        // Fallback to vector-only search
                         match self.rag.search_inner(namespace, query, k).await {
                             Ok(results) => json!({
                                 "content": [{
@@ -493,6 +567,75 @@ impl MCPServer {
 
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(5) as usize;
+                        let mode = match args["mode"].as_str() {
+                            Some("vector") => SearchMode::Vector,
+                            Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                            _ => SearchMode::Hybrid, // default to hybrid
+                        };
+
+                        // Use hybrid search if available and mode is not pure vector
+                        if mode != SearchMode::Vector
+                            && let Some(ref hybrid) = self.hybrid_searcher
+                        {
+                            let query_embedding = match self
+                                .embedding_client
+                                .lock()
+                                .await
+                                .embed(query)
+                                .await
+                            {
+                                Ok(emb) => emb,
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Embedding failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            };
+
+                            match hybrid
+                                .search(query, query_embedding, Some(namespace), k, None)
+                                .await
+                            {
+                                Ok(results) => {
+                                    let results_json: Vec<serde_json::Value> = results
+                                        .iter()
+                                        .map(|r| {
+                                            json!({
+                                                "id": r.id,
+                                                "namespace": r.namespace,
+                                                "text": r.document,
+                                                "score": r.combined_score,
+                                                "vector_score": r.vector_score,
+                                                "bm25_score": r.bm25_score,
+                                                "metadata": r.metadata
+                                            })
+                                        })
+                                        .collect();
+
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "result": {
+                                            "content": [{
+                                                "type": "text",
+                                                "text": serde_json::to_string(&results_json).unwrap_or_default()
+                                            }]
+                                        },
+                                        "id": id
+                                    });
+                                }
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Hybrid search failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            }
+                        }
+
+                        // Fallback to vector-only search
                         match self.rag.memory_search(namespace, query, k).await {
                             Ok(results) => json!({
                                 "content": [{
@@ -698,6 +841,7 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
     Ok(MCPServer {
         rag,
         hybrid_searcher,
+        embedding_client,
         max_request_bytes: config.max_request_bytes,
         allowed_paths: config.allowed_paths,
         access_manager,
