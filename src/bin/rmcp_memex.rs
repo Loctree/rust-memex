@@ -588,6 +588,34 @@ enum Commands {
         #[arg(long, short = 'm', default_value = "{}")]
         metadata: String,
     },
+
+    /// Optimize database: compact files and cleanup old versions
+    ///
+    /// Runs both compaction (merge small files) and pruning (remove old versions).
+    /// Use this after large indexing operations to improve query performance
+    /// and reduce file descriptor usage.
+    Optimize,
+
+    /// Compact database files into larger chunks
+    ///
+    /// Merges small data files into larger ones for better read performance.
+    /// Run this after many small inserts to reduce "too many open files" errors.
+    Compact,
+
+    /// Cleanup old database versions
+    ///
+    /// Removes old versions of the data that are no longer needed.
+    /// By default, keeps versions from the last 7 days.
+    Cleanup {
+        /// Remove versions older than N days (default: 7)
+        #[arg(long, default_value = "7")]
+        older_than_days: u64,
+    },
+
+    /// Show database statistics
+    ///
+    /// Displays row count, version count, and storage information.
+    Stats,
 }
 
 impl Cli {
@@ -2462,6 +2490,126 @@ async fn main() -> Result<()> {
             eprintln!("✓ Upserted chunk '{}' to namespace '{}'", id, namespace);
             eprintln!("  Text: {} chars", content.len());
             eprintln!("  DB: {}", db_path);
+
+            Ok(())
+        }
+        Some(Commands::Optimize) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            eprintln!("Optimizing database at: {}", db_path);
+            eprintln!("This may take a while for large databases...");
+
+            let storage = StorageManager::new_lance_only(&db_path).await?;
+            let stats = storage.optimize().await?;
+
+            eprintln!();
+            eprintln!("Optimization complete:");
+            if let Some(ref c) = stats.compaction {
+                eprintln!("  Files rewritten:    {}", c.files_removed);
+                eprintln!("  Files added:        {}", c.files_added);
+                eprintln!("  Fragments removed:  {}", c.fragments_removed);
+                eprintln!("  Fragments added:    {}", c.fragments_added);
+            }
+            if let Some(ref p) = stats.prune {
+                eprintln!("  Versions removed:   {}", p.old_versions);
+                eprintln!("  Bytes freed:        {}", p.bytes_removed);
+            }
+
+            Ok(())
+        }
+        Some(Commands::Compact) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            eprintln!("Compacting database at: {}", db_path);
+
+            let storage = StorageManager::new_lance_only(&db_path).await?;
+            let stats = storage.compact().await?;
+
+            eprintln!();
+            eprintln!("Compaction complete:");
+            if let Some(ref c) = stats.compaction {
+                eprintln!("  Files rewritten:    {}", c.files_removed);
+                eprintln!("  Files added:        {}", c.files_added);
+                eprintln!("  Fragments removed:  {}", c.fragments_removed);
+                eprintln!("  Fragments added:    {}", c.fragments_added);
+            } else {
+                eprintln!("  No compaction needed");
+            }
+
+            Ok(())
+        }
+        Some(Commands::Cleanup { older_than_days }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            eprintln!(
+                "Cleaning up versions older than {} days at: {}",
+                older_than_days, db_path
+            );
+
+            let storage = StorageManager::new_lance_only(&db_path).await?;
+            let stats = storage.cleanup(Some(older_than_days)).await?;
+
+            eprintln!();
+            eprintln!("Cleanup complete:");
+            if let Some(ref p) = stats.prune {
+                eprintln!("  Versions removed:   {}", p.old_versions);
+                eprintln!("  Bytes freed:        {}", p.bytes_removed);
+            } else {
+                eprintln!("  No old versions to remove");
+            }
+
+            Ok(())
+        }
+        Some(Commands::Stats) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            let storage = StorageManager::new_lance_only(&db_path).await?;
+            let stats = storage.stats().await?;
+
+            eprintln!("Database Statistics:");
+            eprintln!("  Table:       {}", stats.table_name);
+            eprintln!("  Path:        {}", stats.db_path);
+            eprintln!("  Total rows:  {}", stats.row_count);
+            eprintln!("  Versions:    {}", stats.version_count);
+
+            // Also output as JSON for scripting
+            println!("{}", serde_json::to_string_pretty(&stats)?);
 
             Ok(())
         }

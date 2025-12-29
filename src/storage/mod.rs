@@ -8,6 +8,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::{OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -822,4 +823,82 @@ impl StorageManager {
             .filter(|h| !existing_hashes.contains(h.as_str()))
             .collect())
     }
+
+    // =========================================================================
+    // MAINTENANCE OPERATIONS
+    // =========================================================================
+
+    /// Run all optimizations (compact + prune old versions)
+    pub async fn optimize(&self) -> Result<OptimizeStats> {
+        let table = self.ensure_table(4096).await?;
+        let stats = table.optimize(OptimizeAction::All).await?;
+        info!(
+            "Optimize complete: compaction={:?}, prune={:?}",
+            stats.compaction, stats.prune
+        );
+        Ok(stats)
+    }
+
+    /// Compact small files into larger ones for better performance
+    pub async fn compact(&self) -> Result<OptimizeStats> {
+        let table = self.ensure_table(4096).await?;
+        let stats = table
+            .optimize(OptimizeAction::Compact {
+                options: Default::default(),
+                remap_options: None,
+            })
+            .await?;
+        info!("Compaction complete: {:?}", stats.compaction);
+        Ok(stats)
+    }
+
+    /// Remove old versions older than specified duration (default: 7 days)
+    pub async fn cleanup(&self, older_than_days: Option<u64>) -> Result<OptimizeStats> {
+        let table = self.ensure_table(4096).await?;
+        let days = older_than_days.unwrap_or(7) as i64;
+        let duration = chrono::TimeDelta::days(days);
+        let stats = table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(duration),
+                delete_unverified: Some(false),
+                error_if_tagged_old_versions: None,
+            })
+            .await?;
+        info!("Cleanup complete: {:?}", stats.prune);
+        Ok(stats)
+    }
+
+    /// Get table statistics (row count, fragments, etc.)
+    pub async fn stats(&self) -> Result<TableStats> {
+        let table = self.ensure_table(4096).await?;
+        let row_count = table.count_rows(None).await?;
+
+        // Get version count
+        let versions = table.list_versions().await.unwrap_or_default();
+        let version_count = versions.len();
+
+        Ok(TableStats {
+            row_count,
+            version_count,
+            table_name: self.collection_name.clone(),
+            db_path: self.lance_path.clone(),
+        })
+    }
+
+    /// Count rows in a specific namespace
+    pub async fn count_namespace(&self, namespace: &str) -> Result<usize> {
+        let table = self.ensure_table(4096).await?;
+        let filter = self.namespace_filter(namespace);
+        let count = table.count_rows(Some(filter)).await?;
+        Ok(count)
+    }
+}
+
+/// Statistics about the LanceDB table
+#[derive(Debug, Clone, Serialize)]
+pub struct TableStats {
+    pub row_count: usize,
+    pub version_count: usize,
+    pub table_name: String,
+    pub db_path: String,
 }

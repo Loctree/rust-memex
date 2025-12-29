@@ -22,6 +22,14 @@ All notable changes to this project will be documented in this file.
   - Example: `rmcp-memex index ~/documents -n docs --parallel 8`
   - Combines with all existing flags: `--dedup`, `--resume`, `--progress`, `--preprocess`
   - Note: Ignored when `--pipeline` is enabled (pipeline has its own concurrency model)
+- **LanceDB Maintenance Commands** - Database optimization and cleanup
+  - `rmcp-memex optimize` - Run all optimizations (compact + prune old versions)
+  - `rmcp-memex compact` - Merge small fragment files into larger ones
+  - `rmcp-memex cleanup --older-than-days N` - Remove old versions (default: 7 days)
+  - `rmcp-memex stats` - Show database statistics (row count, version count)
+  - Fixes "too many open files" errors from LanceDB fragment accumulation
+  - Library API: `StorageManager::optimize()`, `compact()`, `cleanup()`, `stats()`
+  - New type: `TableStats` exported from lib.rs
 
 ## [0.3.1] - 2025-12-29
 
