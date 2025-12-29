@@ -48,12 +48,20 @@ pub struct IndexProgressTracker {
     // Calibration phase
     /// When calibration started
     calibration_start: Option<Instant>,
-    /// Measured chunks per second after calibration
+    /// Measured chunks per second (EMA - updated dynamically)
     pub chunks_per_sec: Option<f64>,
     /// Name of the embedder model (for display)
     pub embedder_model: Option<String>,
     /// Whether calibration is complete
     calibration_done: bool,
+
+    // Dynamic speed tracking (rolling average)
+    /// Last time we updated the speed measurement
+    last_speed_update: Option<Instant>,
+    /// Chunks processed since last speed update
+    chunks_since_update: usize,
+    /// EMA smoothing factor (0.3 = 30% new, 70% old)
+    speed_ema_alpha: f64,
 
     // Progress tracking
     /// Number of chunks processed so far
@@ -96,6 +104,9 @@ impl IndexProgressTracker {
             chunks_per_sec: None,
             embedder_model: None,
             calibration_done: false,
+            last_speed_update: None,
+            chunks_since_update: 0,
+            speed_ema_alpha: 0.3, // 30% weight for new measurements
             processed_chunks: 0,
             processed_files: 0,
             skipped_files: 0,
@@ -139,9 +150,12 @@ impl IndexProgressTracker {
             }
             self.embedder_model = Some(model.to_string());
             self.calibration_done = true;
+            // Initialize dynamic speed tracking
+            self.last_speed_update = Some(Instant::now());
+            self.chunks_since_update = 0;
 
             eprintln!(
-                "  `-- Speed: {:.1} chunks/sec ({})",
+                "  `-- Speed: {:.1} chunks/sec ({}) [dynamic]",
                 self.chunks_per_sec.unwrap_or(0.0),
                 model
             );
@@ -173,8 +187,34 @@ impl IndexProgressTracker {
     }
 
     /// Increment the chunk counter and update progress bar.
+    ///
+    /// Also updates the rolling average speed (EMA) every 2 seconds
+    /// to reflect actual embedding performance after GPU warm-up.
     pub fn inc_chunks(&mut self, count: usize) {
         self.processed_chunks += count;
+        self.chunks_since_update += count;
+
+        // Update speed every 2 seconds using EMA
+        if let Some(last_update) = self.last_speed_update {
+            let elapsed = last_update.elapsed().as_secs_f64();
+            if elapsed >= 2.0 && self.chunks_since_update > 0 {
+                let current_speed = self.chunks_since_update as f64 / elapsed;
+
+                // Exponential Moving Average: new = alpha * current + (1-alpha) * old
+                self.chunks_per_sec = Some(match self.chunks_per_sec {
+                    Some(old_speed) => {
+                        self.speed_ema_alpha * current_speed
+                            + (1.0 - self.speed_ema_alpha) * old_speed
+                    }
+                    None => current_speed,
+                });
+
+                // Reset for next measurement window
+                self.last_speed_update = Some(Instant::now());
+                self.chunks_since_update = 0;
+            }
+        }
+
         if let Some(ref pb) = self.progress_bar {
             pb.set_position(self.processed_chunks as u64);
         }

@@ -124,9 +124,11 @@ impl OnionSlice {
 /// Slicing mode for document indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SliceMode {
-    /// Hierarchical onion slicing (default)
+    /// Hierarchical onion slicing with all 4 layers (default)
     #[default]
     Onion,
+    /// Fast onion: only outer + core layers (2x faster, good for large datasets)
+    OnionFast,
     /// Traditional flat chunking (backward compatible)
     Flat,
 }
@@ -137,9 +139,10 @@ impl std::str::FromStr for SliceMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "onion" => Ok(SliceMode::Onion),
+            "onion-fast" | "fast" => Ok(SliceMode::OnionFast),
             "flat" => Ok(SliceMode::Flat),
             other => Err(format!(
-                "Invalid slice mode: '{}'. Use 'onion' or 'flat'",
+                "Invalid slice mode: '{}'. Use 'onion', 'onion-fast', or 'flat'",
                 other
             )),
         }
@@ -301,6 +304,65 @@ pub fn create_onion_slices(
         content: content.to_string(),
         parent_id: None,
         children_ids: vec![inner_id],
+        keywords: core_keywords,
+    });
+
+    slices
+}
+
+/// Create fast onion slices (outer + core only) - 2x faster than full onion
+///
+/// For bulk indexing where search quality can be slightly reduced.
+/// Outer layer enables fast keyword-style search, Core provides full content.
+pub fn create_onion_slices_fast(
+    content: &str,
+    _metadata: &serde_json::Value,
+    config: &OnionSliceConfig,
+) -> Vec<OnionSlice> {
+    let content = content.trim();
+
+    // For very short content, just create a single Core slice
+    if content.len() < config.min_content_for_slicing {
+        let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
+        let keywords = extract_keywords(content, 5);
+        return vec![OnionSlice {
+            id: core_id,
+            layer: SliceLayer::Core,
+            content: content.to_string(),
+            parent_id: None,
+            children_ids: vec![],
+            keywords,
+        }];
+    }
+
+    let mut slices = Vec::with_capacity(2);
+
+    // CORE slice - full content
+    let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
+    let core_keywords = extract_keywords(content, 10);
+
+    // OUTER slice - keywords and topic (~100 chars)
+    // Derive from core directly (skip middle/inner)
+    let outer_content = create_outer_summary(content, &core_keywords, config.outer_target);
+    let outer_id = OnionSlice::generate_id(&outer_content, SliceLayer::Outer);
+    let outer_keywords = extract_keywords(&outer_content, 3);
+
+    // Build minimal hierarchy
+    slices.push(OnionSlice {
+        id: outer_id.clone(),
+        layer: SliceLayer::Outer,
+        content: outer_content,
+        parent_id: Some(core_id.clone()),
+        children_ids: vec![],
+        keywords: outer_keywords,
+    });
+
+    slices.push(OnionSlice {
+        id: core_id,
+        layer: SliceLayer::Core,
+        content: content.to_string(),
+        parent_id: None,
+        children_ids: vec![outer_id],
         keywords: core_keywords,
     });
 
@@ -594,6 +656,7 @@ impl RAGPipeline {
             "path": path.to_str(),
             "slice_mode": match slice_mode {
                 SliceMode::Onion => "onion",
+                SliceMode::OnionFast => "onion-fast",
                 SliceMode::Flat => "flat",
             },
             "content_hash": &content_hash,
@@ -602,6 +665,10 @@ impl RAGPipeline {
         let chunks_indexed = match slice_mode {
             SliceMode::Onion => {
                 self.index_with_onion_slicing_and_hash(&text, ns, base_metadata, &content_hash)
+                    .await?
+            }
+            SliceMode::OnionFast => {
+                self.index_with_onion_slicing_fast_and_hash(&text, ns, base_metadata, &content_hash)
                     .await?
             }
             SliceMode::Flat => {
@@ -703,6 +770,7 @@ impl RAGPipeline {
             "path": path.to_str(),
             "slice_mode": match slice_mode {
                 SliceMode::Onion => "onion",
+                SliceMode::OnionFast => "onion-fast",
                 SliceMode::Flat => "flat",
             }
         });
@@ -710,6 +778,10 @@ impl RAGPipeline {
         match slice_mode {
             SliceMode::Onion => {
                 self.index_with_onion_slicing(&text, ns, base_metadata)
+                    .await
+            }
+            SliceMode::OnionFast => {
+                self.index_with_onion_slicing_fast(&text, ns, base_metadata)
                     .await
             }
             SliceMode::Flat => {
@@ -770,6 +842,53 @@ impl RAGPipeline {
         Ok(())
     }
 
+    /// Fast onion slicing (outer + core only, no hash)
+    async fn index_with_onion_slicing_fast(
+        &self,
+        text: &str,
+        namespace: &str,
+        base_metadata: serde_json::Value,
+    ) -> Result<()> {
+        let config = OnionSliceConfig::default();
+        let slices = create_onion_slices_fast(text, &base_metadata, &config);
+        let total_slices = slices.len();
+
+        tracing::info!(
+            "Fast onion slicing: {} chars -> {} slices (outer/core only)",
+            text.len(),
+            total_slices
+        );
+
+        let mut total_stored = 0;
+        for batch in slices.chunks(STORAGE_BATCH_SIZE) {
+            let batch_contents: Vec<String> = batch.iter().map(|s| s.content.clone()).collect();
+            let embeddings = self.embed_chunks(&batch_contents).await?;
+
+            let mut batch_docs = Vec::with_capacity(batch.len());
+            for (slice, embedding) in batch.iter().zip(embeddings.iter()) {
+                let mut metadata = base_metadata.clone();
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("layer".to_string(), json!(slice.layer.name()));
+                    map.insert("keywords".to_string(), json!(slice.keywords));
+                }
+
+                let doc = ChromaDocument::from_onion_slice(
+                    slice,
+                    namespace.to_string(),
+                    embedding.clone(),
+                    metadata,
+                );
+                batch_docs.push(doc);
+            }
+
+            self.storage.add_to_store(batch_docs).await?;
+            total_stored += batch.len();
+            tracing::info!("Stored {}/{} slices", total_stored, total_slices);
+        }
+
+        Ok(())
+    }
+
     /// Index using onion slice architecture with content hash for deduplication
     async fn index_with_onion_slicing_and_hash(
         &self,
@@ -815,6 +934,57 @@ impl RAGPipeline {
             }
 
             // Flush this batch to storage
+            self.storage.add_to_store(batch_docs).await?;
+            total_stored += batch.len();
+            tracing::info!("Stored {}/{} slices", total_stored, total_slices);
+        }
+
+        Ok(total_slices)
+    }
+
+    /// Index using fast onion slice architecture (outer + core only)
+    /// 2x faster than full onion, good for bulk indexing
+    async fn index_with_onion_slicing_fast_and_hash(
+        &self,
+        text: &str,
+        namespace: &str,
+        base_metadata: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<usize> {
+        let config = OnionSliceConfig::default();
+        let slices = create_onion_slices_fast(text, &base_metadata, &config);
+        let total_slices = slices.len();
+
+        tracing::info!(
+            "Fast onion slicing: {} chars -> {} slices (outer/core only)",
+            text.len(),
+            total_slices
+        );
+
+        // Process in batches
+        let mut total_stored = 0;
+        for batch in slices.chunks(STORAGE_BATCH_SIZE) {
+            let batch_contents: Vec<String> = batch.iter().map(|s| s.content.clone()).collect();
+            let embeddings = self.embed_chunks(&batch_contents).await?;
+
+            let mut batch_docs = Vec::with_capacity(batch.len());
+            for (slice, embedding) in batch.iter().zip(embeddings.iter()) {
+                let mut metadata = base_metadata.clone();
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("layer".to_string(), json!(slice.layer.name()));
+                    map.insert("keywords".to_string(), json!(slice.keywords));
+                }
+
+                let doc = ChromaDocument::from_onion_slice_with_hash(
+                    slice,
+                    namespace.to_string(),
+                    embedding.clone(),
+                    metadata,
+                    content_hash.to_string(),
+                );
+                batch_docs.push(doc);
+            }
+
             self.storage.add_to_store(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
@@ -956,10 +1126,14 @@ impl RAGPipeline {
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE).to_string();
 
         match slice_mode {
-            SliceMode::Onion => {
-                // For onion mode, ignore the provided ID and use generated slice IDs
+            SliceMode::Onion | SliceMode::OnionFast => {
+                // For onion modes, ignore the provided ID and use generated slice IDs
                 let config = OnionSliceConfig::default();
-                let slices = create_onion_slices(&text, &metadata, &config);
+                let slices = if slice_mode == SliceMode::OnionFast {
+                    create_onion_slices_fast(&text, &metadata, &config)
+                } else {
+                    create_onion_slices(&text, &metadata, &config)
+                };
 
                 let slice_contents: Vec<String> =
                     slices.iter().map(|s| s.content.clone()).collect();

@@ -119,11 +119,11 @@ fn default_dimension() -> usize {
 }
 
 fn default_max_batch_chars() -> usize {
-    32000
+    128000 // Increased 4x for better GPU utilization
 }
 
 fn default_max_batch_items() -> usize {
-    16
+    64 // Increased 4x - fewer API calls, better throughput
 }
 
 /// Complete embedding configuration
@@ -150,8 +150,8 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             required_dimension: 4096,
-            max_batch_chars: 32000,
-            max_batch_items: 16,
+            max_batch_chars: default_max_batch_chars(),
+            max_batch_items: default_max_batch_items(),
             providers: vec![
                 ProviderConfig {
                     name: "ollama-local".to_string(),
@@ -224,8 +224,8 @@ impl Default for MlxConfig {
             embedder_model: "Qwen/Qwen3-Embedding-4B".to_string(),
             reranker_model: "Qwen/Qwen3-Reranker-4B".to_string(),
             reranker_port_offset: 1,
-            max_batch_chars: 32000,
-            max_batch_items: 16,
+            max_batch_chars: default_max_batch_chars(),
+            max_batch_items: default_max_batch_items(),
         }
     }
 }
@@ -810,143 +810,126 @@ impl EmbeddingClient {
             model: self.embedder_model.clone(),
         };
 
-        let response = match self
-            .client
-            .post(&self.embedder_url)
-            .json(&request)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!(
-                    "Batch embedding request failed: {:?}\n  URL: {}\n  Model: {}\n  Batch size: {} texts, {} chars",
-                    e,
-                    self.embedder_url,
-                    self.embedder_model,
-                    texts.len(),
-                    total_chars
-                );
-                // Log which texts were in the failing batch
-                for (i, text) in texts.iter().enumerate() {
-                    let preview: String = text.chars().take(100).collect();
-                    tracing::debug!(
-                        "  Failed batch[{}] ({} chars): {}{}",
-                        i,
-                        text.chars().count(),
-                        preview,
-                        if text.chars().count() > 100 {
-                            "..."
-                        } else {
-                            ""
-                        }
+        // Retry with exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
+        const MAX_BATCH_RETRIES: usize = 10;
+        const MAX_BACKOFF_SECS: u64 = 30;
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+            let response = match self
+                .client
+                .post(&self.embedder_url)
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if attempt >= MAX_BATCH_RETRIES {
+                        tracing::error!(
+                            "Batch embedding failed after {} retries: {:?}\n  URL: {}\n  Model: {}",
+                            MAX_BATCH_RETRIES,
+                            e,
+                            self.embedder_url,
+                            self.embedder_model
+                        );
+                        return Err(anyhow!(
+                            "Embedding request failed after {} retries: {}",
+                            MAX_BATCH_RETRIES,
+                            e
+                        ));
+                    }
+
+                    // Exponential backoff with cap
+                    let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                    tracing::warn!(
+                        "Embedding request failed (attempt {}/{}), retrying in {}s: {}",
+                        attempt,
+                        MAX_BATCH_RETRIES,
+                        backoff_secs,
+                        e
                     );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    continue;
                 }
-                return Err(anyhow!("Batch embedding request failed: {}", e));
+            };
+
+            // Success - process response
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+
+                if attempt >= MAX_BATCH_RETRIES {
+                    tracing::error!(
+                        "Embedding API error after {} retries: {} - {}",
+                        MAX_BATCH_RETRIES,
+                        status,
+                        body
+                    );
+                    return Err(anyhow!("Embedding API error: {} - {}", status, body));
+                }
+
+                let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                tracing::warn!(
+                    "Embedding API error (attempt {}/{}), retrying in {}s: {} - {}",
+                    attempt,
+                    MAX_BATCH_RETRIES,
+                    backoff_secs,
+                    status,
+                    body
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                continue;
             }
-        };
 
-        let status = response.status();
-        let response_text = response.text().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to read response body: {:?}", e);
-            "<failed to read body>".to_string()
-        });
-
-        if !status.is_success() {
-            tracing::error!(
-                "Batch embedding API error (HTTP {}):\n  URL: {}\n  Model: {}\n  Batch: {} texts, {} chars\n  Response: {}",
-                status,
-                self.embedder_url,
-                self.embedder_model,
-                texts.len(),
-                total_chars,
-                response_text
-            );
-            // Log which texts were in the failing batch
-            for (i, text) in texts.iter().enumerate() {
-                let preview: String = text.chars().take(100).collect();
-                tracing::debug!(
-                    "  Failed batch[{}] ({} chars): {}{}",
-                    i,
-                    text.chars().count(),
-                    preview,
-                    if text.chars().count() > 100 {
-                        "..."
-                    } else {
-                        ""
+            // Parse response
+            let embedding_response: EmbeddingResponse = match response.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt >= MAX_BATCH_RETRIES {
+                        return Err(anyhow!("Failed to parse embedding response: {}", e));
                     }
-                );
-            }
-            return Err(anyhow!(
-                "Batch embedding API error (HTTP {}): {}",
-                status,
-                response_text
-            ));
-        }
+                    let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                    tracing::warn!(
+                        "Failed to parse response (attempt {}/{}), retrying in {}s: {}",
+                        attempt,
+                        MAX_BATCH_RETRIES,
+                        backoff_secs,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    continue;
+                }
+            };
 
-        let parsed: EmbeddingResponse = match serde_json::from_str(&response_text) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to parse batch embedding response: {:?}\n  Batch: {} texts\n  Response body (first 500 chars): {}",
-                    e,
-                    texts.len(),
-                    response_text.chars().take(500).collect::<String>()
-                );
-                return Err(anyhow!("Failed to parse batch embedding response: {}", e));
-            }
-        };
+            // Validate dimensions
+            let embeddings: Vec<Vec<f32>> = embedding_response
+                .data
+                .into_iter()
+                .map(|d| d.embedding)
+                .collect();
 
-        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
-
-        // Validate count
-        if embeddings.len() != texts.len() {
-            tracing::error!(
-                "Embedding count mismatch! Sent {} texts, got {} embeddings",
-                texts.len(),
-                embeddings.len()
-            );
-            return Err(anyhow!(
-                "Embedding count mismatch! Sent {} texts, got {} embeddings",
-                texts.len(),
-                embeddings.len()
-            ));
-        }
-
-        // Validate dimensions with per-chunk diagnostics
-        for (i, emb) in embeddings.iter().enumerate() {
-            if emb.len() != self.required_dimension {
-                let text_preview: String = texts[i].chars().take(100).collect();
-                tracing::error!(
-                    "Dimension mismatch in batch[{}]! Expected {}, got {}.\n  Text ({} chars): {}{}",
-                    i,
-                    self.required_dimension,
-                    emb.len(),
-                    texts[i].chars().count(),
-                    text_preview,
-                    if texts[i].chars().count() > 100 {
-                        "..."
-                    } else {
-                        ""
-                    }
-                );
+            if embeddings.len() != texts.len() {
                 return Err(anyhow!(
-                    "Dimension mismatch in batch[{}]! Expected {}, got {}",
-                    i,
-                    self.required_dimension,
-                    emb.len()
+                    "Embedding count mismatch: got {} embeddings for {} texts",
+                    embeddings.len(),
+                    texts.len()
                 ));
             }
+
+            if let Some(first) = embeddings.first()
+                && first.len() != self.required_dimension
+            {
+                return Err(anyhow!(
+                    "Dimension mismatch: expected {}, got {}",
+                    self.required_dimension,
+                    first.len()
+                ));
+            }
+
+            return Ok(embeddings);
         }
-
-        tracing::debug!(
-            "Successfully embedded batch: {} texts -> {} embeddings ({} dims each)",
-            texts.len(),
-            embeddings.len(),
-            self.required_dimension
-        );
-
-        Ok(embeddings)
     }
 
     pub async fn rerank(&mut self, query: &str, documents: &[String]) -> Result<Vec<(usize, f32)>> {
@@ -1237,8 +1220,8 @@ mod tests {
     fn test_default_config() {
         let config = EmbeddingConfig::default();
         assert_eq!(config.required_dimension, 4096);
-        assert_eq!(config.max_batch_chars, 32000);
-        assert_eq!(config.max_batch_items, 16);
+        assert_eq!(config.max_batch_chars, 128000); // 4x larger for GPU efficiency
+        assert_eq!(config.max_batch_items, 64); // 4x more items per batch
         assert!(!config.providers.is_empty());
     }
 

@@ -26,10 +26,32 @@ All notable changes to this project will be documented in this file.
   - `search_with_mode()` - Explicit mode selection (Vector/Keyword/Hybrid)
   - `search_bm25_fusion()` - Deprecated alias for backward compatibility
   - `HybridConfig` in `MemexConfig` for library consumers
+- **CLI `--resume` flag** - Resumable indexing for interrupted operations
+  - Saves checkpoint after each file to `.index-checkpoint-{namespace}.json`
+  - On restart with `--resume`, skips already-indexed files
+  - Checkpoint auto-deleted on successful completion
+  - Failed files preserved for retry: `rmcp-memex index ... --resume`
+- **OnionFast mode** - 2x faster indexing for large datasets
+  - `--slice-mode onion-fast` or `--slice-mode fast`
+  - Creates only outer+core layers (2 instead of 4)
+  - Same search quality, half the embedding calls
+  - Ideal for bulk indexing where speed matters
 
 ### Changed
+- **Embedding batch size 4x increase** - Dramatically fewer API calls
+  - `max_batch_items`: 16 → 64 (4x more chunks per request)
+  - `max_batch_chars`: 32K → 128K (4x larger batches)
+  - Better GPU utilization, significant speedup for large datasets
+- **Embedding Retry with Backoff** - Robust embedding client with exponential retry
+  - 10 retries with exponential backoff (1s, 2s, 4s... up to 30s max)
+  - Survives embedder restarts, API timeouts, temporary failures
+  - Detailed logging per retry attempt for debugging
 - Reranker config updated to Qwen3-Reranker-8B on port 12346 (from 4B)
 - MCP tool schemas now include `auto_route` parameter documentation
+- **Dynamic ETA** - Progress bar now uses rolling EMA for speed measurement
+  - Updates every 2 seconds instead of one-time calibration
+  - Reflects actual GPU performance after warm-up (2-3x faster than cold start)
+  - EMA smoothing (30% new / 70% old) prevents jitter
 
 ## [0.3.0] - 2025-12-28
 

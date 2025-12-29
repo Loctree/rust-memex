@@ -1,5 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -405,8 +407,9 @@ enum Commands {
 
         /// Slicing mode for document chunking:
         /// - "onion" (default): Hierarchical slices (outer/middle/inner/core) for efficient context
+        /// - "onion-fast" / "fast": Only outer+core layers (2x faster, good for large datasets)
         /// - "flat": Traditional fixed-size chunks with overlap
-        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "flat"])]
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
         slice_mode: String,
 
         /// Enable exact-match deduplication (default: enabled).
@@ -419,6 +422,12 @@ enum Commands {
         /// Displays three phases: pre-scan, calibration, and indexing progress.
         #[arg(long)]
         progress: bool,
+
+        /// Resume from last checkpoint if interrupted.
+        /// Saves progress after each file to .index-checkpoint.json.
+        /// On restart, skips already indexed files and continues.
+        #[arg(long)]
+        resume: bool,
     },
 
     /// Smart semantic search within a namespace
@@ -1559,6 +1568,69 @@ async fn run_export(
     Ok(())
 }
 
+/// Checkpoint for resumable indexing
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexCheckpoint {
+    /// Namespace being indexed
+    namespace: String,
+    /// Files that have been successfully indexed (canonical paths)
+    indexed_files: HashSet<String>,
+    /// When checkpoint was last updated
+    updated_at: String,
+}
+
+impl IndexCheckpoint {
+    fn new(namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            indexed_files: HashSet::new(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn checkpoint_path(db_path: &str, namespace: &str) -> PathBuf {
+        let expanded = shellexpand::tilde(db_path).to_string();
+        Path::new(&expanded)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!(".index-checkpoint-{}.json", namespace))
+    }
+
+    fn load(db_path: &str, namespace: &str) -> Option<Self> {
+        let path = Self::checkpoint_path(db_path, namespace);
+        if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        } else {
+            None
+        }
+    }
+
+    fn save(&mut self, db_path: &str) -> Result<()> {
+        self.updated_at = chrono::Utc::now().to_rfc3339();
+        let path = Self::checkpoint_path(db_path, &self.namespace);
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
+    fn delete(db_path: &str, namespace: &str) {
+        let path = Self::checkpoint_path(db_path, namespace);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn mark_indexed(&mut self, file_path: &Path) {
+        self.indexed_files
+            .insert(file_path.to_string_lossy().to_string());
+    }
+
+    fn is_indexed(&self, file_path: &Path) -> bool {
+        self.indexed_files
+            .contains(&file_path.to_string_lossy().to_string())
+    }
+}
+
 /// Configuration for batch indexing operation
 struct BatchIndexConfig {
     path: PathBuf,
@@ -1575,6 +1647,8 @@ struct BatchIndexConfig {
     embedding_config: EmbeddingConfig,
     /// Show smart progress bar with calibration-based ETA
     show_progress: bool,
+    /// Resume from checkpoint if interrupted
+    resume: bool,
 }
 
 /// Run batch indexing
@@ -1592,6 +1666,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         dedup,
         embedding_config,
         show_progress,
+        resume,
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
     let expanded = shellexpand::tilde(path.to_str().unwrap_or("")).to_string();
@@ -1608,8 +1683,9 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     }
 
     let mode_name = match slice_mode {
-        SliceMode::Onion => "onion (hierarchical)",
-        SliceMode::Flat => "flat (traditional)",
+        SliceMode::Onion => "onion (hierarchical, 4 layers)",
+        SliceMode::OnionFast => "onion-fast (outer+core, 2 layers)",
+        SliceMode::Flat => "flat (traditional chunks)",
     };
 
     // Initialize progress tracker if --progress flag is set
@@ -1649,8 +1725,29 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     };
 
     let ns = namespace.as_deref();
+    let ns_name = ns.unwrap_or("rag");
+
+    // Initialize checkpoint for resume capability
+    let mut checkpoint = if resume {
+        if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
+            let resumed_count = cp.indexed_files.len();
+            eprintln!(
+                "Resuming from checkpoint: {} files already indexed",
+                resumed_count
+            );
+            cp
+        } else {
+            IndexCheckpoint::new(ns_name)
+        }
+    } else {
+        // Clean start - remove any stale checkpoint
+        IndexCheckpoint::delete(&db_path, ns_name);
+        IndexCheckpoint::new(ns_name)
+    };
+
     let mut indexed = 0;
     let mut skipped = 0;
+    let mut skipped_resume = 0; // Files skipped due to checkpoint
     let mut failed = 0;
     let mut total_chunks = 0;
 
@@ -1673,6 +1770,15 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             .strip_prefix(&canonical)
             .unwrap_or(file_path)
             .display();
+
+        // Skip files already indexed (resume mode)
+        if resume && checkpoint.is_indexed(file_path) {
+            skipped_resume += 1;
+            if let Some(ref mut t) = tracker {
+                t.file_skipped();
+            }
+            continue;
+        }
 
         // Update progress bar message or print progress line
         if let Some(ref mut t) = tracker {
@@ -1720,6 +1826,12 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     }
                     indexed += 1;
                     total_chunks += chunks_indexed;
+
+                    // Save checkpoint after successful indexing
+                    if resume {
+                        checkpoint.mark_indexed(file_path);
+                        let _ = checkpoint.save(&db_path);
+                    }
                 }
                 Ok(rmcp_memex::IndexResult::Skipped { reason, .. }) => {
                     if let Some(ref mut t) = tracker {
@@ -1734,6 +1846,12 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         eprintln!("SKIPPED ({})", reason);
                     }
                     skipped += 1;
+
+                    // Mark as indexed even if skipped (content exists)
+                    if resume {
+                        checkpoint.mark_indexed(file_path);
+                        let _ = checkpoint.save(&db_path);
+                    }
                 }
                 Err(e) => {
                     if let Some(ref mut t) = tracker {
@@ -1773,6 +1891,12 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         eprintln!("done");
                     }
                     indexed += 1;
+
+                    // Save checkpoint after successful indexing
+                    if resume {
+                        checkpoint.mark_indexed(file_path);
+                        let _ = checkpoint.save(&db_path);
+                    }
                 }
                 Err(e) => {
                     if let Some(ref mut t) = tracker {
@@ -1794,6 +1918,9 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     if let Some(ref mut t) = tracker {
         t.finish();
         t.display_summary();
+        if skipped_resume > 0 {
+            eprintln!("  Skipped (resumed): {}", skipped_resume);
+        }
     } else {
         eprintln!();
         eprintln!("Indexing complete:");
@@ -1801,6 +1928,9 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         eprintln!("  Files indexed:     {}", indexed);
         if dedup && skipped > 0 {
             eprintln!("  Skipped (duplicate): {}", skipped);
+        }
+        if skipped_resume > 0 {
+            eprintln!("  Skipped (resumed): {}", skipped_resume);
         }
         if failed > 0 {
             eprintln!("  Failed:            {}", failed);
@@ -1815,6 +1945,17 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             if dedup { "enabled" } else { "disabled" }
         );
         eprintln!("  DB path:           {}", expanded_db);
+    }
+
+    // Clean up checkpoint on successful completion
+    if resume && failed == 0 {
+        IndexCheckpoint::delete(&db_path, ns_name);
+        eprintln!("Checkpoint cleared (all files indexed successfully)");
+    } else if resume && failed > 0 {
+        eprintln!(
+            "Checkpoint preserved ({} files failed - rerun with --resume to retry)",
+            failed
+        );
     }
 
     Ok(())
@@ -1844,6 +1985,7 @@ async fn main() -> Result<()> {
             slice_mode,
             dedup,
             progress,
+            resume,
         }) => {
             // Get db_path and cache_mb from config or defaults
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -1876,6 +2018,7 @@ async fn main() -> Result<()> {
                 dedup,
                 embedding_config,
                 show_progress: progress,
+                resume,
             })
             .await
         }
