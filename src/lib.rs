@@ -35,9 +35,27 @@ pub use query::{
     SearchModeRecommendation, TemporalHints, detect_intent,
 };
 pub use rag::{
-    ContextPrefixConfig, EnrichedChunk, IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline,
-    SearchOptions, SearchResult, SliceLayer, SliceMode, compute_content_hash,
-    create_enriched_chunks, create_onion_slices,
+    Chunk as PipelineChunk,
+    ContextPrefixConfig,
+    EmbeddedChunk,
+    EnrichedChunk,
+    FileContent,
+    IndexResult,
+    OnionSlice,
+    OnionSliceConfig,
+    PipelineConfig,
+    PipelineResult,
+    PipelineStats,
+    RAGPipeline,
+    SearchOptions,
+    SearchResult,
+    SliceLayer,
+    SliceMode,
+    compute_content_hash,
+    create_enriched_chunks,
+    create_onion_slices,
+    // Async pipeline exports
+    run_pipeline,
 };
 pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,

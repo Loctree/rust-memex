@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2025-12-29
+
+### Added
+- **Async Pipeline Mode** - Concurrent indexing with `--pipeline` flag
+  - Runs file reading, chunking, embedding, and storage in parallel stages
+  - Uses `tokio::sync::mpsc` channels with bounded buffers (100 items) for backpressure
+  - Each stage runs in its own `tokio::spawn` for maximum concurrency
+  - Ideal for large batch operations with significant I/O and GPU overlap
+  - Example: `rmcp-memex index ~/documents -n docs --pipeline`
+  - Library API: `run_pipeline()`, `PipelineConfig`, `PipelineResult`, `PipelineStats`
+  - Note: `--progress` and `--resume` flags are not supported in pipeline mode
+- **Parallel File Processing** - `--parallel N` flag for concurrent file indexing
+  - Processes N files concurrently using `tokio::Semaphore` for rate limiting
+  - Default: 4 parallel workers, configurable 1-16 via `-P N` or `--parallel N`
+  - Uses atomic counters (`AtomicUsize`, `AtomicBool`) for thread-safe progress tracking
+  - Preserves checkpoint/resume functionality with `Arc<Mutex<IndexCheckpoint>>`
+  - One file failure doesn't stop others - graceful error handling
+  - Example: `rmcp-memex index ~/documents -n docs --parallel 8`
+  - Combines with all existing flags: `--dedup`, `--resume`, `--progress`, `--preprocess`
+  - Note: Ignored when `--pipeline` is enabled (pipeline has its own concurrency model)
+
 ## [0.3.1] - 2025-12-29
 
 ### Added

@@ -16,6 +16,12 @@ use crate::{
     storage::{ChromaDocument, StorageManager},
 };
 
+// Async pipeline module for concurrent indexing
+pub mod pipeline;
+pub use pipeline::{
+    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineResult, PipelineStats, run_pipeline,
+};
+
 const DEFAULT_NAMESPACE: &str = "rag";
 
 /// Storage batch size - write to LanceDB every N documents to avoid RAM explosion

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
@@ -428,6 +429,20 @@ enum Commands {
         /// On restart, skips already indexed files and continues.
         #[arg(long)]
         resume: bool,
+
+        /// Enable async pipeline mode for concurrent indexing.
+        /// Runs file reading, chunking, embedding, and storage in parallel
+        /// using tokio channels. Can significantly speed up large batch operations.
+        /// Note: Pipeline mode ignores --progress and --resume flags.
+        #[arg(long)]
+        pipeline: bool,
+
+        /// Number of files to process in parallel (default: 4, max: 16).
+        /// Higher values can speed up indexing on multi-core systems,
+        /// but may increase memory usage and API pressure.
+        /// Note: This is ignored when --pipeline is enabled.
+        #[arg(long, short = 'P', default_value = "4", value_parser = clap::value_parser!(u8).range(1..=16))]
+        parallel: u8,
     },
 
     /// Smart semantic search within a namespace
@@ -1649,9 +1664,31 @@ struct BatchIndexConfig {
     show_progress: bool,
     /// Resume from checkpoint if interrupted
     resume: bool,
+    /// Enable async pipeline mode for concurrent stages
+    pipeline: bool,
+    /// Number of files to process in parallel (1-16, ignored in pipeline mode)
+    parallel: u8,
 }
 
-/// Run batch indexing
+/// Result of indexing a single file (for parallel processing)
+#[derive(Debug)]
+#[allow(dead_code)]
+enum FileIndexResult {
+    /// File was indexed successfully
+    Indexed {
+        file_path: PathBuf,
+        chunks: usize,
+        file_bytes: u64,
+    },
+    /// File was skipped (duplicate content)
+    Skipped { file_path: PathBuf, reason: String },
+    /// File was skipped (already in checkpoint)
+    SkippedResume { file_path: PathBuf },
+    /// Indexing failed
+    Failed { file_path: PathBuf, error: String },
+}
+
+/// Run batch indexing with optional pipeline mode for concurrent processing
 async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     let BatchIndexConfig {
         path,
@@ -1667,6 +1704,8 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         embedding_config,
         show_progress,
         resume,
+        pipeline,
+        parallel,
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
     let expanded = shellexpand::tilde(path.to_str().unwrap_or("")).to_string();
@@ -1689,7 +1728,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     };
 
     // Initialize progress tracker if --progress flag is set
-    let mut tracker = if show_progress {
+    let tracker = if show_progress {
         let t = IndexProgressTracker::pre_scan(&files);
         t.display_pre_scan();
         Some(t)
@@ -1715,7 +1754,62 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     // Use lance-only storage for CLI - smaller cache for CLI use
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
     let storage = Arc::new(StorageManager::new_lance_only(&expanded_db).await?);
-    let rag = RAGPipeline::new(embedding_client, storage).await?;
+
+    let ns_name = namespace.as_deref().unwrap_or("rag");
+
+    // Pipeline mode: concurrent stages with channels
+    if pipeline {
+        if preprocess {
+            eprintln!("Warning: --preprocess is not supported in pipeline mode (ignoring)");
+        }
+        if resume {
+            eprintln!("Warning: --resume is not supported in pipeline mode (ignoring)");
+        }
+        if show_progress {
+            eprintln!("Warning: --progress is not supported in pipeline mode (ignoring)");
+        }
+
+        eprintln!(
+            "Pipeline mode: {} files, slice mode: {:?}",
+            total, slice_mode
+        );
+        eprintln!("Running concurrent stages: reader -> chunker -> embedder -> storage");
+
+        let pipeline_config = rmcp_memex::PipelineConfig {
+            slice_mode,
+            dedup_enabled: dedup,
+            ..Default::default()
+        };
+
+        let result = rmcp_memex::run_pipeline(
+            files,
+            ns_name.to_string(),
+            storage,
+            embedding_client,
+            pipeline_config,
+        )
+        .await?;
+
+        eprintln!();
+        eprintln!("Pipeline complete:");
+        eprintln!("  Files read:        {}", result.stats.files_read);
+        if result.stats.files_skipped > 0 {
+            eprintln!("  Files skipped:     {}", result.stats.files_skipped);
+        }
+        eprintln!("  Chunks created:    {}", result.stats.chunks_created);
+        eprintln!("  Chunks embedded:   {}", result.stats.chunks_embedded);
+        eprintln!("  Chunks stored:     {}", result.stats.chunks_stored);
+        if result.stats.errors > 0 {
+            eprintln!("  Errors:            {}", result.stats.errors);
+        }
+        eprintln!("  Namespace:         {}", ns_name);
+        eprintln!("  DB path:           {}", expanded_db);
+
+        return Ok(());
+    }
+
+    // Standard (non-pipeline) mode with parallel file processing
+    let rag = Arc::new(RAGPipeline::new(embedding_client, storage).await?);
 
     // Note: preprocessing currently uses flat mode
     let effective_mode = if preprocess {
@@ -1724,32 +1818,34 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         slice_mode
     };
 
-    let ns = namespace.as_deref();
-    let ns_name = ns.unwrap_or("rag");
-
-    // Initialize checkpoint for resume capability
-    let mut checkpoint = if resume {
+    // Initialize checkpoint for resume capability (wrapped for thread-safe access)
+    let checkpoint = if resume {
         if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
             let resumed_count = cp.indexed_files.len();
             eprintln!(
                 "Resuming from checkpoint: {} files already indexed",
                 resumed_count
             );
-            cp
+            Arc::new(Mutex::new(cp))
         } else {
-            IndexCheckpoint::new(ns_name)
+            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name)))
         }
     } else {
         // Clean start - remove any stale checkpoint
         IndexCheckpoint::delete(&db_path, ns_name);
-        IndexCheckpoint::new(ns_name)
+        Arc::new(Mutex::new(IndexCheckpoint::new(ns_name)))
     };
 
-    let mut indexed = 0;
-    let mut skipped = 0;
-    let mut skipped_resume = 0; // Files skipped due to checkpoint
-    let mut failed = 0;
-    let mut total_chunks = 0;
+    // Atomic counters for thread-safe progress tracking
+    let indexed_count = Arc::new(AtomicUsize::new(0));
+    let skipped_count = Arc::new(AtomicUsize::new(0));
+    let skipped_resume_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let total_chunks_count = Arc::new(AtomicUsize::new(0));
+    let processed_count = Arc::new(AtomicUsize::new(0));
+
+    // Semaphore to limit concurrent file processing
+    let semaphore = Arc::new(Semaphore::new(parallel as usize));
 
     // Get embedder model name for calibration display
     let embedder_model = embedding_config
@@ -1758,166 +1854,235 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         .map(|p| p.model.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    for (i, file_path) in files.iter().enumerate() {
-        // Start calibration on first file if progress mode
-        if i == 0
-            && let Some(ref mut t) = tracker
-        {
-            t.start_calibration();
-        }
+    // Flag to track if calibration is complete (for progress bar)
+    let calibration_done = Arc::new(AtomicBool::new(false));
 
-        let display_path = file_path
-            .strip_prefix(&canonical)
-            .unwrap_or(file_path)
-            .display();
+    // Wrap tracker for shared access
+    let tracker = tracker.map(|t| Arc::new(Mutex::new(t)));
 
-        // Skip files already indexed (resume mode)
-        if resume && checkpoint.is_indexed(file_path) {
-            skipped_resume += 1;
-            if let Some(ref mut t) = tracker {
-                t.file_skipped();
+    // Start calibration if progress mode
+    if let Some(ref t) = tracker {
+        t.lock().await.start_calibration();
+    }
+
+    // Create task handles for parallel processing
+    let mut handles = Vec::with_capacity(files.len());
+
+    for file_path in files.into_iter() {
+        // Clone shared resources for this task
+        let semaphore = Arc::clone(&semaphore);
+        let rag = Arc::clone(&rag);
+        let checkpoint = Arc::clone(&checkpoint);
+        let tracker = tracker.clone();
+        let indexed_count = Arc::clone(&indexed_count);
+        let skipped_count = Arc::clone(&skipped_count);
+        let skipped_resume_count = Arc::clone(&skipped_resume_count);
+        let failed_count = Arc::clone(&failed_count);
+        let total_chunks_count = Arc::clone(&total_chunks_count);
+        let processed_count = Arc::clone(&processed_count);
+        let calibration_done = Arc::clone(&calibration_done);
+        let db_path = db_path.clone();
+        let ns = namespace.clone();
+        let canonical = canonical.clone();
+        let embedder_model = embedder_model.clone();
+        let _ns_name = ns_name.to_string();
+
+        let handle = tokio::spawn(async move {
+            // Acquire semaphore permit to limit concurrency
+            let _permit = semaphore.acquire().await.expect("semaphore closed");
+
+            let display_path = file_path
+                .strip_prefix(&canonical)
+                .unwrap_or(&file_path)
+                .display()
+                .to_string();
+
+            // Check if file already indexed (resume mode)
+            if resume {
+                let cp = checkpoint.lock().await;
+                if cp.is_indexed(&file_path) {
+                    drop(cp);
+                    skipped_resume_count.fetch_add(1, Ordering::SeqCst);
+                    processed_count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(ref t) = tracker {
+                        t.lock().await.file_skipped();
+                    }
+                    return FileIndexResult::SkippedResume { file_path };
+                }
             }
-            continue;
-        }
 
-        // Update progress bar message or print progress line
-        if let Some(ref mut t) = tracker {
-            t.set_message(&format!("{}", display_path));
-        } else {
-            let progress = format!("[{}/{}]", i + 1, total);
-            eprint!("{} Indexing {}... ", progress, display_path);
-        }
+            // Get file size for calibration
+            let file_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
-        // Get file size for calibration adjustment
-        let file_bytes = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-
-        // Build preprocessing config with optional metadata sanitization
-        let preprocess_config = PreprocessingConfig {
-            remove_metadata: sanitize_metadata,
-            ..Default::default()
-        };
-
-        if dedup {
-            // Use dedup-enabled indexing
-            let result = if preprocess {
-                rag.index_document_with_preprocessing_and_dedup(
-                    file_path,
-                    ns,
-                    preprocess_config.clone(),
-                )
-                .await
+            // Update progress display
+            let current_processed = processed_count.load(Ordering::SeqCst);
+            if let Some(ref t) = tracker {
+                t.lock().await.set_message(&display_path);
             } else {
-                rag.index_document_with_dedup(file_path, ns, effective_mode)
-                    .await
+                let progress = format!("[{}/{}]", current_processed + 1, total);
+                eprintln!("{} Indexing {}... ", progress, display_path);
+            }
+
+            // Build preprocessing config
+            let preprocess_config = PreprocessingConfig {
+                remove_metadata: sanitize_metadata,
+                ..Default::default()
             };
 
-            match result {
-                Ok(rmcp_memex::IndexResult::Indexed { chunks_indexed, .. }) => {
-                    if let Some(ref mut t) = tracker {
-                        // Finish calibration after first file
-                        if i == 0 {
-                            t.finish_calibration(chunks_indexed, &embedder_model);
-                            t.adjust_estimate(file_bytes, chunks_indexed);
-                            t.start_progress_bar();
-                        }
-                        t.file_indexed(chunks_indexed);
-                    } else {
-                        eprintln!("done ({} chunks)", chunks_indexed);
-                    }
-                    indexed += 1;
-                    total_chunks += chunks_indexed;
+            let result = if dedup {
+                // Use dedup-enabled indexing
+                if preprocess {
+                    rag.index_document_with_preprocessing_and_dedup(
+                        &file_path,
+                        ns.as_deref(),
+                        preprocess_config,
+                    )
+                    .await
+                } else {
+                    rag.index_document_with_dedup(&file_path, ns.as_deref(), effective_mode)
+                        .await
+                }
+            } else {
+                // Use original indexing without dedup (convert to IndexResult-like outcome)
+                if preprocess {
+                    rag.index_document_with_preprocessing(
+                        &file_path,
+                        ns.as_deref(),
+                        preprocess_config,
+                    )
+                    .await
+                    .map(|()| rmcp_memex::IndexResult::Indexed {
+                        chunks_indexed: (file_bytes as usize / 500).max(1),
+                        content_hash: String::new(),
+                    })
+                } else {
+                    rag.index_document_with_mode(&file_path, ns.as_deref(), effective_mode)
+                        .await
+                        .map(|()| rmcp_memex::IndexResult::Indexed {
+                            chunks_indexed: (file_bytes as usize / 500).max(1),
+                            content_hash: String::new(),
+                        })
+                }
+            };
 
-                    // Save checkpoint after successful indexing
+            let file_result = match result {
+                Ok(rmcp_memex::IndexResult::Indexed { chunks_indexed, .. }) => {
+                    // Handle calibration on first completed file
+                    if !calibration_done.swap(true, Ordering::SeqCst)
+                        && let Some(ref t) = tracker
+                    {
+                        let mut guard = t.lock().await;
+                        guard.finish_calibration(chunks_indexed, &embedder_model);
+                        guard.adjust_estimate(file_bytes, chunks_indexed);
+                        guard.start_progress_bar();
+                    }
+
+                    indexed_count.fetch_add(1, Ordering::SeqCst);
+                    total_chunks_count.fetch_add(chunks_indexed, Ordering::SeqCst);
+
+                    if let Some(ref t) = tracker {
+                        t.lock().await.file_indexed(chunks_indexed);
+                    } else {
+                        eprintln!("  -> {} done ({} chunks)", display_path, chunks_indexed);
+                    }
+
+                    // Update checkpoint
                     if resume {
-                        checkpoint.mark_indexed(file_path);
-                        let _ = checkpoint.save(&db_path);
+                        let mut cp = checkpoint.lock().await;
+                        cp.mark_indexed(&file_path);
+                        let _ = cp.save(&db_path);
+                    }
+
+                    FileIndexResult::Indexed {
+                        file_path,
+                        chunks: chunks_indexed,
+                        file_bytes,
                     }
                 }
                 Ok(rmcp_memex::IndexResult::Skipped { reason, .. }) => {
-                    if let Some(ref mut t) = tracker {
-                        // If first file is skipped, we need to handle calibration differently
-                        if i == 0 {
-                            // Use a default speed estimate since we couldn't calibrate
-                            t.finish_calibration(0, &embedder_model);
-                            t.start_progress_bar();
-                        }
-                        t.file_skipped();
-                    } else {
-                        eprintln!("SKIPPED ({})", reason);
+                    // Handle calibration if this was the first file
+                    if !calibration_done.swap(true, Ordering::SeqCst)
+                        && let Some(ref t) = tracker
+                    {
+                        let mut guard = t.lock().await;
+                        guard.finish_calibration(0, &embedder_model);
+                        guard.start_progress_bar();
                     }
-                    skipped += 1;
+
+                    skipped_count.fetch_add(1, Ordering::SeqCst);
+
+                    if let Some(ref t) = tracker {
+                        t.lock().await.file_skipped();
+                    } else {
+                        eprintln!("  -> {} SKIPPED ({})", display_path, reason);
+                    }
 
                     // Mark as indexed even if skipped (content exists)
                     if resume {
-                        checkpoint.mark_indexed(file_path);
-                        let _ = checkpoint.save(&db_path);
+                        let mut cp = checkpoint.lock().await;
+                        cp.mark_indexed(&file_path);
+                        let _ = cp.save(&db_path);
                     }
+
+                    FileIndexResult::Skipped { file_path, reason }
                 }
                 Err(e) => {
-                    if let Some(ref mut t) = tracker {
-                        if i == 0 {
-                            t.finish_calibration(0, &embedder_model);
-                            t.start_progress_bar();
-                        }
-                        t.file_failed();
-                    } else {
-                        eprintln!("FAILED: {}", e);
+                    // Handle calibration if this was the first file
+                    if !calibration_done.swap(true, Ordering::SeqCst)
+                        && let Some(ref t) = tracker
+                    {
+                        let mut guard = t.lock().await;
+                        guard.finish_calibration(0, &embedder_model);
+                        guard.start_progress_bar();
                     }
-                    failed += 1;
+
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+
+                    if let Some(ref t) = tracker {
+                        t.lock().await.file_failed();
+                    } else {
+                        eprintln!("  -> {} FAILED: {}", display_path, e);
+                    }
+
+                    FileIndexResult::Failed {
+                        file_path,
+                        error: e.to_string(),
+                    }
                 }
-            }
-        } else {
-            // Use original indexing without dedup
-            let result = if preprocess {
-                rag.index_document_with_preprocessing(file_path, ns, preprocess_config.clone())
-                    .await
-            } else {
-                rag.index_document_with_mode(file_path, ns, effective_mode)
-                    .await
             };
 
-            match result {
-                Ok(()) => {
-                    if let Some(ref mut t) = tracker {
-                        // Without dedup, we don't know chunk count, estimate based on file size
-                        let estimated_chunks = (file_bytes as usize) / 500;
-                        if i == 0 {
-                            t.finish_calibration(estimated_chunks.max(1), &embedder_model);
-                            t.adjust_estimate(file_bytes, estimated_chunks.max(1));
-                            t.start_progress_bar();
-                        }
-                        t.file_indexed(estimated_chunks.max(1));
-                    } else {
-                        eprintln!("done");
-                    }
-                    indexed += 1;
+            processed_count.fetch_add(1, Ordering::SeqCst);
+            file_result
+        });
 
-                    // Save checkpoint after successful indexing
-                    if resume {
-                        checkpoint.mark_indexed(file_path);
-                        let _ = checkpoint.save(&db_path);
-                    }
-                }
-                Err(e) => {
-                    if let Some(ref mut t) = tracker {
-                        if i == 0 {
-                            t.finish_calibration(0, &embedder_model);
-                            t.start_progress_bar();
-                        }
-                        t.file_failed();
-                    } else {
-                        eprintln!("FAILED: {}", e);
-                    }
-                    failed += 1;
-                }
+        handles.push(handle);
+    }
+
+    // Wait for all tasks to complete
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                // Task panicked - count as failure
+                failed_count.fetch_add(1, Ordering::SeqCst);
+                eprintln!("Task panicked: {}", e);
             }
         }
     }
 
+    // Get final counts from atomics
+    let indexed = indexed_count.load(Ordering::SeqCst);
+    let skipped = skipped_count.load(Ordering::SeqCst);
+    let skipped_resume = skipped_resume_count.load(Ordering::SeqCst);
+    let failed = failed_count.load(Ordering::SeqCst);
+    let total_chunks = total_chunks_count.load(Ordering::SeqCst);
+
     // Display summary
-    if let Some(ref mut t) = tracker {
-        t.finish();
-        t.display_summary();
+    if let Some(ref t) = tracker {
+        let mut guard = t.lock().await;
+        guard.finish();
+        guard.display_summary();
         if skipped_resume > 0 {
             eprintln!("  Skipped (resumed): {}", skipped_resume);
         }
@@ -1936,10 +2101,11 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             eprintln!("  Failed:            {}", failed);
         }
         eprintln!("  Total processed:   {}", total);
-        if let Some(ns) = ns {
+        if let Some(ref ns) = namespace {
             eprintln!("  Namespace:         {}", ns);
         }
         eprintln!("  Slice mode:        {}", mode_name);
+        eprintln!("  Parallel workers:  {}", parallel);
         eprintln!(
             "  Deduplication:     {}",
             if dedup { "enabled" } else { "disabled" }
@@ -1986,6 +2152,8 @@ async fn main() -> Result<()> {
             dedup,
             progress,
             resume,
+            pipeline,
+            parallel,
         }) => {
             // Get db_path and cache_mb from config or defaults
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -2019,6 +2187,8 @@ async fn main() -> Result<()> {
                 embedding_config,
                 show_progress: progress,
                 resume,
+                pipeline,
+                parallel,
             })
             .await
         }
