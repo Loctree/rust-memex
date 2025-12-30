@@ -813,7 +813,10 @@ impl App {
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(handle) = rt {
                 let mode = self.data_setup.import_mode.clone();
-                match handle.block_on(import_lancedb(&source, &target, mode)) {
+                let result = tokio::task::block_in_place(|| {
+                    handle.block_on(import_lancedb(&source, &target, mode))
+                });
+                match result {
                     Ok(msg) => {
                         self.messages.push(format!("[OK] {}", msg));
                     }
@@ -1042,10 +1045,18 @@ pub fn run_wizard(config: WizardConfig) -> Result<()> {
 fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     use crate::tui::ui::render;
 
-    // Create a runtime for async operations
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    // Get handle to existing runtime (from async main) or create new one
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(_) => {
+            // No runtime exists, create one (shouldn't happen with async main)
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            // Leak to keep it alive - this is a fallback path
+            Box::leak(Box::new(rt)).handle().clone()
+        }
+    };
 
     loop {
         terminal.draw(|f| render(f, app))?;
@@ -1055,15 +1066,21 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
 
         // Handle async provider detection
         if app.embedder_state.detecting {
-            rt.block_on(async {
-                app.run_provider_detection().await;
+            let rt_clone = rt.clone();
+            tokio::task::block_in_place(|| {
+                rt_clone.block_on(async {
+                    app.run_provider_detection().await;
+                });
             });
         }
 
         // Handle async health check if triggered
         if app.health_running && app.health_result.is_none() {
-            rt.block_on(async {
-                app.run_async_health_check().await;
+            let rt_clone = rt.clone();
+            tokio::task::block_in_place(|| {
+                rt_clone.block_on(async {
+                    app.run_async_health_check().await;
+                });
             });
         }
 
