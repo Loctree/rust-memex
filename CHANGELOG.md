@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.3] - 2025-12-30
+
+### Fixed
+- **TUI Wizard Runtime Panic** - "Cannot start a runtime from within a runtime"
+  - Use `tokio::task::block_in_place()` when calling `block_on()` from async context
+  - `Handle::try_current()` to get existing runtime handle instead of creating new one
+  - Fixes crash when running `rmcp-memex wizard` from `#[tokio::main]` async context
+
+### Added
+- **LanceDB Maintenance Commands** (from 0.3.2-dev)
+  - `rmcp-memex optimize` - Run all optimizations (compact + prune old versions)
+  - `rmcp-memex compact` - Merge small fragment files into larger ones
+  - `rmcp-memex cleanup --older-than-days N` - Remove old versions (default: 7 days)
+  - `rmcp-memex stats` - Show database statistics (row count, version count)
+  - Fixes "too many open files" errors from LanceDB fragment accumulation
+  - Library API: `StorageManager::optimize()`, `compact()`, `cleanup()`, `stats()`
+  - New type: `TableStats` exported from lib.rs
+
 ## [0.3.2] - 2025-12-29
 
 ### Added
@@ -22,14 +40,6 @@ All notable changes to this project will be documented in this file.
   - Example: `rmcp-memex index ~/documents -n docs --parallel 8`
   - Combines with all existing flags: `--dedup`, `--resume`, `--progress`, `--preprocess`
   - Note: Ignored when `--pipeline` is enabled (pipeline has its own concurrency model)
-- **LanceDB Maintenance Commands** - Database optimization and cleanup
-  - `rmcp-memex optimize` - Run all optimizations (compact + prune old versions)
-  - `rmcp-memex compact` - Merge small fragment files into larger ones
-  - `rmcp-memex cleanup --older-than-days N` - Remove old versions (default: 7 days)
-  - `rmcp-memex stats` - Show database statistics (row count, version count)
-  - Fixes "too many open files" errors from LanceDB fragment accumulation
-  - Library API: `StorageManager::optimize()`, `compact()`, `cleanup()`, `stats()`
-  - New type: `TableStats` exported from lib.rs
 
 ## [0.3.1] - 2025-12-29
 
