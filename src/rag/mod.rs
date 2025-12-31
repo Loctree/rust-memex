@@ -419,6 +419,143 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
         .collect()
 }
 
+/// Extract meaningful text content from a JSON element (object or value).
+/// Handles common patterns: messages, conversations, entities, generic objects.
+fn extract_json_element_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => {
+            let mut parts = Vec::new();
+
+            // Priority fields for conversation/chat data
+            for key in ["content", "text", "message", "summary", "description", "body"] {
+                if let Some(serde_json::Value::String(s)) = map.get(key)
+                    && !s.is_empty()
+                {
+                    parts.push(s.clone());
+                }
+            }
+
+            // Handle role-based messages (user/assistant)
+            if let Some(serde_json::Value::String(role)) = map.get("role")
+                && let Some(content) = map.get("content")
+            {
+                match content {
+                    serde_json::Value::String(s) => {
+                        parts.push(format!("{}: {}", role, s));
+                    }
+                    serde_json::Value::Array(arr) => {
+                        // Content blocks (Claude format)
+                        for item in arr {
+                            if let serde_json::Value::Object(block) = item
+                                && let Some(serde_json::Value::String(t)) = block.get("text")
+                            {
+                                parts.push(format!("{}: {}", role, t));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Handle nested messages array
+            if let Some(serde_json::Value::Array(messages)) = map.get("messages") {
+                for msg in messages.iter().take(50) {
+                    // Limit to avoid huge outputs
+                    let msg_content = extract_json_element_content(msg);
+                    if !msg_content.is_empty() && msg_content.len() > 10 {
+                        parts.push(msg_content);
+                    }
+                }
+            }
+
+            // Handle chat_messages (ChatGPT format)
+            if let Some(serde_json::Value::Array(messages)) = map.get("chat_messages") {
+                for msg in messages.iter().take(50) {
+                    let msg_content = extract_json_element_content(msg);
+                    if !msg_content.is_empty() && msg_content.len() > 10 {
+                        parts.push(msg_content);
+                    }
+                }
+            }
+
+            // Handle entity memories
+            if let Some(serde_json::Value::String(name)) = map.get("name")
+                && let Some(serde_json::Value::Array(obs)) = map.get("observations")
+            {
+                let observations: Vec<String> = obs
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .take(10)
+                    .collect();
+                if !observations.is_empty() {
+                    parts.push(format!("{}: {}", name, observations.join("; ")));
+                }
+            }
+
+            // Title/name for context
+            for key in ["title", "name", "uuid", "id"] {
+                if let Some(serde_json::Value::String(s)) = map.get(key) {
+                    if !s.is_empty() && parts.iter().all(|p| !p.contains(s)) {
+                        parts.insert(0, format!("[{}]", s));
+                    }
+                    break;
+                }
+            }
+
+            if parts.is_empty() {
+                // Fallback: serialize the whole object (limited)
+                serde_json::to_string(value)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(5000)
+                    .collect()
+            } else {
+                parts.join("\n")
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            // For arrays, extract each element
+            arr.iter()
+                .take(20)
+                .map(extract_json_element_content)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Detect the type of JSON element for metadata
+fn detect_json_element_type(value: &serde_json::Value) -> &'static str {
+    if let serde_json::Value::Object(map) = value {
+        // Check for conversation patterns
+        if map.contains_key("chat_messages") || map.contains_key("mapping") {
+            return "conversation";
+        }
+        if map.contains_key("messages") && map.contains_key("sessions") {
+            return "session";
+        }
+        if map.contains_key("role") && map.contains_key("content") {
+            return "message";
+        }
+        if map.contains_key("observations") && map.contains_key("name") {
+            return "entity";
+        }
+        if map.contains_key("messages") {
+            return "thread";
+        }
+        "object"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_string() {
+        "text"
+    } else {
+        "value"
+    }
+}
+
 /// Extract key content from text, targeting a specific character count
 /// Uses sentence-based extraction to maintain coherence
 fn extract_key_content(text: &str, target_chars: usize) -> String {
@@ -633,14 +770,26 @@ impl RAGPipeline {
     }
 
     /// Index a document with deduplication (skips if exact content already exists)
+    ///
+    /// For JSON files with arrays (conversations, sessions), automatically splits
+    /// into multiple documents when using Onion or OnionFast slice modes.
     pub async fn index_document_with_dedup(
         &self,
         path: &Path,
         namespace: Option<&str>,
         slice_mode: SliceMode,
     ) -> Result<IndexResult> {
-        let text = self.extract_text(path).await?;
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
+
+        // For Onion modes, use JSON-aware extraction to split arrays into documents
+        if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
+            return self
+                .index_document_with_json_awareness(path, ns, slice_mode)
+                .await;
+        }
+
+        // For Flat mode, use existing behavior (single document)
+        let text = self.extract_text(path).await?;
 
         // Compute content hash BEFORE any processing
         let content_hash = compute_content_hash(&text);
@@ -660,38 +809,122 @@ impl RAGPipeline {
 
         let base_metadata = json!({
             "path": path.to_str(),
-            "slice_mode": match slice_mode {
-                SliceMode::Onion => "onion",
-                SliceMode::OnionFast => "onion-fast",
-                SliceMode::Flat => "flat",
-            },
+            "slice_mode": "flat",
             "content_hash": &content_hash,
         });
 
-        let chunks_indexed = match slice_mode {
-            SliceMode::Onion => {
-                self.index_with_onion_slicing_and_hash(&text, ns, base_metadata, &content_hash)
-                    .await?
-            }
-            SliceMode::OnionFast => {
-                self.index_with_onion_slicing_fast_and_hash(&text, ns, base_metadata, &content_hash)
-                    .await?
-            }
-            SliceMode::Flat => {
-                self.index_with_flat_chunking_and_hash(
-                    &text,
-                    ns,
-                    path,
-                    base_metadata,
-                    &content_hash,
-                )
-                .await?
-            }
-        };
+        let chunks_indexed = self
+            .index_with_flat_chunking_and_hash(&text, ns, path, base_metadata, &content_hash)
+            .await?;
 
         Ok(IndexResult::Indexed {
             chunks_indexed,
             content_hash,
+        })
+    }
+
+    /// Index a document with JSON-awareness: for JSON arrays, each element
+    /// becomes a separate onion-sliced document.
+    ///
+    /// This is critical for conversation/session files where a single JSON file
+    /// may contain hundreds of messages that should each have their own onion slices.
+    async fn index_document_with_json_awareness(
+        &self,
+        path: &Path,
+        namespace: &str,
+        slice_mode: SliceMode,
+    ) -> Result<IndexResult> {
+        // Extract documents (may be multiple for JSON arrays)
+        let documents = self.extract_json_documents(path).await?;
+
+        let mut total_chunks = 0;
+        let mut skipped_docs = 0;
+        let file_content_hash = compute_content_hash(
+            &tokio::fs::read_to_string(path).await.unwrap_or_default(),
+        );
+
+        for (doc_id, content, mut doc_metadata) in documents {
+            if content.len() < 50 {
+                continue; // Skip very small documents
+            }
+
+            // Compute per-document hash for dedup
+            let doc_hash = compute_content_hash(&content);
+
+            // Check if this document already exists
+            if self.storage.has_content_hash(namespace, &doc_hash).await? {
+                skipped_docs += 1;
+                continue;
+            }
+
+            // Merge file-level metadata into document metadata
+            if let serde_json::Value::Object(ref mut map) = doc_metadata {
+                map.insert("doc_id".to_string(), json!(doc_id));
+                map.insert("content_hash".to_string(), json!(doc_hash));
+                map.insert("file_hash".to_string(), json!(&file_content_hash));
+                map.insert(
+                    "slice_mode".to_string(),
+                    json!(match slice_mode {
+                        SliceMode::Onion => "onion",
+                        SliceMode::OnionFast => "onion-fast",
+                        SliceMode::Flat => "flat",
+                    }),
+                );
+            }
+
+            // Index with onion slicing
+            let chunks = match slice_mode {
+                SliceMode::Onion => {
+                    self.index_with_onion_slicing_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::OnionFast => {
+                    self.index_with_onion_slicing_fast_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::Flat => {
+                    // Shouldn't reach here, but handle anyway
+                    self.index_with_flat_chunking_and_hash(
+                        &content,
+                        namespace,
+                        path,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+            };
+
+            total_chunks += chunks;
+        }
+
+        if total_chunks == 0 && skipped_docs > 0 {
+            return Ok(IndexResult::Skipped {
+                reason: format!("all {} documents already indexed", skipped_docs),
+                content_hash: file_content_hash,
+            });
+        }
+
+        tracing::info!(
+            "JSON-aware indexing: {} -> {} chunks ({} docs skipped)",
+            path.display(),
+            total_chunks,
+            skipped_docs
+        );
+
+        Ok(IndexResult::Indexed {
+            chunks_indexed: total_chunks,
+            content_hash: file_content_hash,
         })
     }
 
@@ -1403,6 +1636,81 @@ impl RAGPipeline {
         // Path is validated by caller (handlers::validate_path) before reaching this private method
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         tokio::fs::read_to_string(path).await.map_err(|e| e.into())
+    }
+
+    /// Extract multiple documents from a JSON file if it contains an array.
+    /// For non-array JSON or other file types, returns a single document.
+    ///
+    /// This enables proper onion slicing for conversation/session files where
+    /// each array element (message, conversation) should be indexed separately.
+    ///
+    /// Returns: Vec of (doc_id, content, metadata) tuples
+    async fn extract_json_documents(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<(String, String, serde_json::Value)>> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Only process JSON files specially
+        if ext != "json" {
+            let text = self.extract_text(path).await?;
+            let doc_id = format!("{}:0", path.display());
+            let metadata = json!({ "path": path.to_str(), "index": 0 });
+            return Ok(vec![(doc_id, text, metadata)]);
+        }
+
+        // Try to parse as JSON
+        let raw = tokio::fs::read_to_string(path).await?;
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => {
+                // Not valid JSON, treat as text
+                let doc_id = format!("{}:0", path.display());
+                let metadata = json!({ "path": path.to_str(), "index": 0 });
+                return Ok(vec![(doc_id, raw, metadata)]);
+            }
+        };
+
+        // Check if it's an array
+        if let serde_json::Value::Array(arr) = parsed {
+            let mut docs = Vec::with_capacity(arr.len());
+            for (idx, item) in arr.iter().enumerate() {
+                let doc_id = format!("{}:{}", path.display(), idx);
+                let content = extract_json_element_content(item);
+                if content.len() > 50 {
+                    // Skip very small elements
+                    let metadata = json!({
+                        "path": path.to_str(),
+                        "index": idx,
+                        "total_elements": arr.len(),
+                        "element_type": detect_json_element_type(item),
+                    });
+                    docs.push((doc_id, content, metadata));
+                }
+            }
+            if docs.is_empty() {
+                // Fallback if all elements were too small
+                let doc_id = format!("{}:0", path.display());
+                let metadata = json!({ "path": path.to_str(), "index": 0 });
+                return Ok(vec![(doc_id, raw, metadata)]);
+            }
+            tracing::info!(
+                "JSON array detected: {} -> {} documents",
+                path.display(),
+                docs.len()
+            );
+            return Ok(docs);
+        }
+
+        // Not an array, treat as single document
+        let content = extract_json_element_content(&parsed);
+        let doc_id = format!("{}:0", path.display());
+        let metadata = json!({ "path": path.to_str(), "index": 0 });
+        Ok(vec![(doc_id, content, metadata)])
     }
 
     async fn embed_chunks(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>> {
