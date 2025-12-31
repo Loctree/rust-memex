@@ -187,6 +187,50 @@ impl EmbedderState {
     }
 }
 
+/// Get current hostname (machine-agnostic)
+fn get_hostname() -> String {
+    // Try gethostname syscall first
+    if let Some(name) = std::process::Command::new("hostname")
+        .arg("-s") // short name without domain
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        let hostname = String::from_utf8_lossy(&name.stdout).trim().to_string();
+        if !hostname.is_empty() {
+            return hostname;
+        }
+    }
+
+    // Fallback to environment variables
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "local".to_string())
+}
+
+#[allow(dead_code)]
+pub fn detect_hostname() -> String {
+    get_hostname()
+}
+
+/// Database path mode for multi-host setups
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbPathMode {
+    /// Single shared path (e.g., ~/.ai-memories/lancedb)
+    Shared,
+    /// Per-host path with hostname suffix (e.g., ~/.ai-memories/lancedb.dragon)
+    PerHost,
+}
+
+impl DbPathMode {
+    pub fn description(&self) -> &'static str {
+        match self {
+            DbPathMode::Shared => "Shared database (all hosts use same path)",
+            DbPathMode::PerHost => "Per-host database (separate DB per machine)",
+        }
+    }
+}
+
 /// Editable memex configuration.
 #[derive(Debug, Clone)]
 pub struct MemexCfg {
@@ -195,10 +239,17 @@ pub struct MemexCfg {
     pub log_level: String,
     pub max_request_bytes: usize,
     pub mode: String,
+    /// Current machine hostname (auto-detected)
+    pub hostname: String,
+    /// Database path mode (shared vs per-host)
+    pub db_path_mode: DbPathMode,
+    /// HTTP/SSE server port (None = disabled, Some(port) = enabled)
+    pub http_port: Option<u16>,
 }
 
 impl Default for MemexCfg {
     fn default() -> Self {
+        let hostname = get_hostname();
         Self {
             // New default path per requirements
             db_path: "~/.ai-memories/lancedb".to_string(),
@@ -206,6 +257,28 @@ impl Default for MemexCfg {
             log_level: "info".to_string(),
             max_request_bytes: 10 * 1024 * 1024, // 10MB
             mode: "full".to_string(),
+            hostname,
+            db_path_mode: DbPathMode::Shared,
+            http_port: None,
+        }
+    }
+}
+
+impl MemexCfg {
+    /// Get the effective database path (with hostname suffix if per-host mode)
+    pub fn effective_db_path(&self) -> String {
+        match self.db_path_mode {
+            DbPathMode::Shared => self.db_path.clone(),
+            DbPathMode::PerHost => format!("{}.{}", self.db_path, self.hostname),
+        }
+    }
+
+    /// Get description of current path configuration
+    #[allow(dead_code)]
+    pub fn path_description(&self) -> String {
+        match self.db_path_mode {
+            DbPathMode::Shared => format!("{} (shared)", self.db_path),
+            DbPathMode::PerHost => format!("{}.{} (per-host)", self.db_path, self.hostname),
         }
     }
 }
@@ -322,11 +395,19 @@ impl App {
     }
 
     pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
+        let effective_path = self.memex_cfg.effective_db_path();
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
-                let snippet =
-                    generate_extended_snippet(*kind, &self.binary_path, &self.memex_cfg.db_path);
+                let mut snippet =
+                    generate_extended_snippet(*kind, &self.binary_path, &effective_path);
+                // Add HTTP port arg if configured
+                if let Some(port) = self.memex_cfg.http_port {
+                    snippet = snippet.replace(
+                        "\"serve\"",
+                        &format!("\"serve\", \"--http-port\", \"{}\"", port),
+                    );
+                }
                 (*kind, snippet)
             })
             .collect()
@@ -353,8 +434,15 @@ impl App {
             }
         }
 
-        // Check db_path
-        let expanded_path = shellexpand::tilde(&self.memex_cfg.db_path).to_string();
+        // Show hostname info
+        self.messages.push(format!(
+            "[INFO] Host: {} (path mode: {:?})",
+            self.memex_cfg.hostname, self.memex_cfg.db_path_mode
+        ));
+
+        // Check db_path (use effective path)
+        let effective_path = self.memex_cfg.effective_db_path();
+        let expanded_path = shellexpand::tilde(&effective_path).to_string();
         let db_path = PathBuf::from(&expanded_path);
         if db_path.exists() {
             self.messages
@@ -363,18 +451,27 @@ impl App {
             self.messages
                 .push(format!("[-] DB path will be created: {}", expanded_path));
         }
+
+        // Show HTTP port info
+        if let Some(port) = self.memex_cfg.http_port {
+            self.messages
+                .push(format!("[INFO] HTTP/SSE server will run on port {}", port));
+        }
     }
 
     pub fn write_configs(&mut self) -> Result<()> {
+        let effective_path = self.memex_cfg.effective_db_path();
+
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
+            self.messages.push(format!(
+                "Host: {} | Path mode: {:?}",
+                self.memex_cfg.hostname, self.memex_cfg.db_path_mode
+            ));
             for &idx in &self.selected_hosts.clone() {
                 if let Some((kind, detection)) = self.hosts.get(idx) {
-                    let snippet = generate_extended_snippet(
-                        *kind,
-                        &self.binary_path,
-                        &self.memex_cfg.db_path,
-                    );
+                    let snippet =
+                        generate_extended_snippet(*kind, &self.binary_path, &effective_path);
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
                         kind.display_name(),
@@ -391,8 +488,7 @@ impl App {
 
         for &idx in &self.selected_hosts.clone() {
             if let Some((kind, _detection)) = self.hosts.get(idx) {
-                match write_extended_host_config(*kind, &self.binary_path, &self.memex_cfg.db_path)
-                {
+                match write_extended_host_config(*kind, &self.binary_path, &effective_path) {
                     Ok(result) => {
                         success_count += 1;
                         if let Some(backup) = result.backup_path {
@@ -442,16 +538,57 @@ impl App {
     }
 
     fn settings_field_count(&self) -> usize {
-        5 // db_path, cache_mb, log_level, max_request_bytes, mode
+        7 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes, mode
+    }
+
+    /// Get field labels for settings display
+    #[allow(dead_code)]
+    pub fn get_field_label(&self, field: usize) -> &'static str {
+        match field {
+            0 => "Database Path",
+            1 => "Path Mode",
+            2 => "HTTP Port",
+            3 => "Cache (MB)",
+            4 => "Log Level",
+            5 => "Max Request (bytes)",
+            6 => "Mode",
+            _ => "",
+        }
+    }
+
+    /// Get field hint/description
+    #[allow(dead_code)]
+    pub fn get_field_hint(&self, field: usize) -> String {
+        match field {
+            0 => format!("Effective: {}", self.memex_cfg.effective_db_path()),
+            1 => self.memex_cfg.db_path_mode.description().to_string(),
+            2 => match self.memex_cfg.http_port {
+                Some(p) => format!("HTTP/SSE enabled on port {}", p),
+                None => "Disabled (MCP stdio only)".to_string(),
+            },
+            3 => "Memory cache for vector lookups".to_string(),
+            4 => "trace/debug/info/warn/error".to_string(),
+            5 => "Max JSON-RPC request size".to_string(),
+            6 => "full (all features) or memory (no filesystem)".to_string(),
+            _ => String::new(),
+        }
     }
 
     pub fn get_field_value(&self, field: usize) -> String {
         match field {
             0 => self.memex_cfg.db_path.clone(),
-            1 => self.memex_cfg.cache_mb.to_string(),
-            2 => self.memex_cfg.log_level.clone(),
-            3 => self.memex_cfg.max_request_bytes.to_string(),
-            4 => self.memex_cfg.mode.clone(),
+            1 => match self.memex_cfg.db_path_mode {
+                DbPathMode::Shared => "shared".to_string(),
+                DbPathMode::PerHost => format!("per-host ({})", self.memex_cfg.hostname),
+            },
+            2 => match self.memex_cfg.http_port {
+                Some(port) => port.to_string(),
+                None => "disabled".to_string(),
+            },
+            3 => self.memex_cfg.cache_mb.to_string(),
+            4 => self.memex_cfg.log_level.clone(),
+            5 => self.memex_cfg.max_request_bytes.to_string(),
+            6 => self.memex_cfg.mode.clone(),
             _ => String::new(),
         }
     }
@@ -460,19 +597,52 @@ impl App {
         match field {
             0 => self.memex_cfg.db_path = value,
             1 => {
+                // Toggle between shared and per-host
+                self.memex_cfg.db_path_mode = match self.memex_cfg.db_path_mode {
+                    DbPathMode::Shared => DbPathMode::PerHost,
+                    DbPathMode::PerHost => DbPathMode::Shared,
+                };
+            }
+            2 => {
+                // Parse port or disable
+                if value.to_lowercase() == "disabled" || value.is_empty() {
+                    self.memex_cfg.http_port = None;
+                } else if let Ok(port) = value.parse() {
+                    self.memex_cfg.http_port = Some(port);
+                }
+            }
+            3 => {
                 if let Ok(v) = value.parse() {
                     self.memex_cfg.cache_mb = v;
                 }
             }
-            2 => self.memex_cfg.log_level = value,
-            3 => {
+            4 => self.memex_cfg.log_level = value,
+            5 => {
                 if let Ok(v) = value.parse() {
                     self.memex_cfg.max_request_bytes = v;
                 }
             }
-            4 => self.memex_cfg.mode = value,
+            6 => self.memex_cfg.mode = value,
             _ => {}
         }
+    }
+
+    /// Toggle db_path_mode (for space key)
+    #[allow(dead_code)]
+    pub fn toggle_db_path_mode(&mut self) {
+        self.memex_cfg.db_path_mode = match self.memex_cfg.db_path_mode {
+            DbPathMode::Shared => DbPathMode::PerHost,
+            DbPathMode::PerHost => DbPathMode::Shared,
+        };
+    }
+
+    /// Toggle http_port (for space key)
+    #[allow(dead_code)]
+    pub fn toggle_http_port(&mut self) {
+        self.memex_cfg.http_port = match self.memex_cfg.http_port {
+            None => Some(8237), // Default port
+            Some(_) => None,
+        };
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
@@ -881,17 +1051,34 @@ impl App {
 
         // Header
         toml.push_str("# rmcp-memex configuration\n");
-        toml.push_str("# Generated by wizard\n\n");
+        toml.push_str(&format!(
+            "# Generated by wizard on host: {}\n",
+            self.memex_cfg.hostname
+        ));
+        toml.push_str(&format!(
+            "# Path mode: {:?}\n\n",
+            self.memex_cfg.db_path_mode
+        ));
 
-        // Database settings
+        // Database settings (use effective path which includes hostname suffix if per-host)
         toml.push_str("# Database configuration\n");
-        toml.push_str(&format!("db_path = \"{}\"\n", self.memex_cfg.db_path));
+        toml.push_str(&format!(
+            "db_path = \"{}\"\n",
+            self.memex_cfg.effective_db_path()
+        ));
         toml.push_str(&format!("cache_mb = {}\n", self.memex_cfg.cache_mb));
         toml.push_str(&format!("log_level = \"{}\"\n", self.memex_cfg.log_level));
         toml.push_str(&format!(
-            "max_request_bytes = {}\n\n",
+            "max_request_bytes = {}\n",
             self.memex_cfg.max_request_bytes
         ));
+
+        // HTTP/SSE server configuration
+        if let Some(port) = self.memex_cfg.http_port {
+            toml.push_str("\n# HTTP/SSE server for multi-agent access\n");
+            toml.push_str(&format!("http_port = {}\n", port));
+        }
+        toml.push('\n');
 
         // Embeddings configuration
         toml.push_str("# Embedding provider configuration\n");

@@ -428,7 +428,14 @@ fn extract_json_element_content(value: &serde_json::Value) -> String {
             let mut parts = Vec::new();
 
             // Priority fields for conversation/chat data
-            for key in ["content", "text", "message", "summary", "description", "body"] {
+            for key in [
+                "content",
+                "text",
+                "message",
+                "summary",
+                "description",
+                "body",
+            ] {
                 if let Some(serde_json::Value::String(s)) = map.get(key)
                     && !s.is_empty()
                 {
@@ -839,9 +846,8 @@ impl RAGPipeline {
 
         let mut total_chunks = 0;
         let mut skipped_docs = 0;
-        let file_content_hash = compute_content_hash(
-            &tokio::fs::read_to_string(path).await.unwrap_or_default(),
-        );
+        let file_content_hash =
+            compute_content_hash(&tokio::fs::read_to_string(path).await.unwrap_or_default());
 
         for (doc_id, content, mut doc_metadata) in documents {
             if content.len() < 50 {

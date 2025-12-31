@@ -2,6 +2,7 @@ pub mod common;
 pub mod embeddings;
 pub mod engine;
 pub mod handlers;
+pub mod http;
 pub mod path_utils;
 pub mod preprocessing;
 pub mod query;

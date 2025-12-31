@@ -106,6 +106,11 @@ pub struct MCPServer {
 }
 
 impl MCPServer {
+    /// Get the RAGPipeline for sharing with HTTP server
+    pub fn rag(&self) -> Arc<RAGPipeline> {
+        self.rag.clone()
+    }
+
     pub async fn run_stdio(self) -> Result<()> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();

@@ -14,7 +14,7 @@ use rmcp_memex::{
     EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
     IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
     QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig,
-    SliceLayer, SliceMode, StorageManager, WizardConfig, run_stdio_server, run_wizard,
+    SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -311,6 +311,19 @@ struct Cli {
     /// Defaults to ~/.rmcp-servers/rmcp-memex/tokens.json when security is enabled.
     #[arg(long, global = true)]
     token_store_path: Option<String>,
+
+    /// HTTP/SSE server port for multi-agent access.
+    /// When set, starts an HTTP server alongside MCP stdio.
+    /// Agents can query via HTTP instead of holding LanceDB lock directly.
+    /// Example: --http-port 8237
+    #[arg(long, global = true)]
+    http_port: Option<u16>,
+
+    /// Run HTTP server only, without MCP stdio.
+    /// Use this for daemon mode where agents connect via HTTP.
+    /// Requires --http-port to be set.
+    #[arg(long, global = true)]
+    http_only: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2614,7 +2627,17 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Serve) | None => {
-            // Run MCP server
+            // Run MCP server (and optionally HTTP/SSE server)
+            let http_port = cli.http_port;
+            let http_only = cli.http_only;
+
+            // Validate http_only requires http_port
+            if http_only && http_port.is_none() {
+                return Err(anyhow::anyhow!(
+                    "--http-only requires --http-port to be set"
+                ));
+            }
+
             let config = cli.into_server_config()?;
 
             // Send logs to stderr to keep stdout clean for JSON-RPC.
@@ -2630,7 +2653,31 @@ async fn main() -> Result<()> {
             info!("Cache: {}MB", config.cache_mb);
             info!("DB Path: {}", config.db_path);
 
-            run_stdio_server(config).await
+            // Create MCP server (also initializes RAGPipeline)
+            let server = create_server(config).await?;
+
+            // HTTP-only mode: run HTTP server as main process (blocking)
+            if http_only {
+                let port = http_port.expect("validated above");
+                let rag = server.rag();
+                info!("Starting HTTP-only server on port {} (no MCP stdio)", port);
+                rmcp_memex::http::start_server(rag, port).await?;
+                return Ok(());
+            }
+
+            // If HTTP port specified, start HTTP/SSE server in background
+            if let Some(port) = http_port {
+                let rag = server.rag();
+                info!("Starting HTTP/SSE server on port {}", port);
+                tokio::spawn(async move {
+                    if let Err(e) = rmcp_memex::http::start_server(rag, port).await {
+                        tracing::error!("HTTP server error: {}", e);
+                    }
+                });
+            }
+
+            // Run MCP stdio server (blocking)
+            server.run_stdio().await
         }
     }
 }

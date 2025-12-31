@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2025-12-31
+
+### Added
+- **HTTP/SSE Server** - Multi-agent access without LanceDB lock conflicts
+  - `--http-port 8237` flag to start HTTP server alongside MCP stdio
+  - `--http-only` flag for daemon mode (HTTP only, no MCP stdio)
+  - Endpoints: `/health`, `/search`, `/sse/search`, `/upsert`, `/index`, `/expand`, `/parent`, `/get`, `/delete`, `/ns`
+  - SSE streaming for real-time search results with events: `start`, `result`, `done`
+  - Concurrent multi-agent access through shared RAGPipeline
+  - Built on axum with tower-http CORS support
+- **TUI Wizard Enhancements** - Machine-agnostic configuration
+  - Auto-detect hostname for per-host database paths
+  - **Path Mode**: Shared (`~/.ai-memories/lancedb`) or Per-Host (`~/.ai-memories/lancedb.{hostname}`)
+  - HTTP port configuration in wizard
+  - Host info displayed in health check
+  - Config TOML includes hostname and path mode comments
+- **Multi-Host Database Paths** - Separate databases per machine
+  - Pattern: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
+  - Avoids conflicts when syncing config across machines
+  - `MemexCfg::effective_db_path()` handles path resolution
+
+### Changed
+- Wizard settings now include 7 fields: db_path, path_mode, http_port, cache_mb, log_level, max_request_bytes, mode
+- Host config snippets include `--http-port` when configured
+- Health check shows hostname and path mode info
+
+### Dependencies
+- Added `axum` 0.8 with json feature
+- Added `tokio-stream` 0.1
+- Added `tower-http` 0.6 with cors feature
+- Added `async-stream` 0.3
+
 ## [0.3.3] - 2025-12-30
 
 ### Fixed

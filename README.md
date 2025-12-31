@@ -480,7 +480,98 @@ rmcp-memex serve --mode memory
 
 # With security enabled
 rmcp-memex serve --security-enabled
+
+# With HTTP/SSE server for multi-agent access
+rmcp-memex serve --http-port 8237
+
+# HTTP-only daemon mode (no MCP stdio)
+rmcp-memex serve --http-port 8237 --http-only
 ```
+
+## HTTP/SSE Server (Multi-Agent Access)
+
+LanceDB uses exclusive file locks - only one process can access the database at a time.
+The HTTP/SSE server solves this by providing a central access point for multiple agents.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     rmcp-memex daemon                        │
+│  ┌─────────────────┐    ┌─────────────────┐                 │
+│  │   MCP Server    │    │   HTTP/SSE      │                 │
+│  │   (stdio)       │    │   (port 8237)   │                 │
+│  └────────┬────────┘    └────────┬────────┘                 │
+│           │                      │                          │
+│           └──────────┬───────────┘                          │
+│                      ▼                                      │
+│              ┌─────────────┐                                │
+│              │ RAGPipeline │ ← Single lock holder           │
+│              └──────┬──────┘                                │
+│                     ▼                                       │
+│              ┌─────────────┐                                │
+│              │   LanceDB   │                                │
+│              └─────────────┘                                │
+└─────────────────────────────────────────────────────────────┘
+         ▲                    ▲
+         │                    │
+    Claude Desktop       HTTP Agents
+    (MCP stdio)          (curl, fetch)
+```
+
+### HTTP Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check (status, db_path, embedding_provider) |
+| `/search` | POST | Vector search with optional layer filter |
+| `/sse/search` | GET | SSE streaming search (real-time results) |
+| `/upsert` | POST | Add/update document |
+| `/index` | POST | Full pipeline indexing with onion slices |
+| `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |
+| `/parent/{ns}/{id}` | GET | Drill up to parent slice |
+| `/get/{ns}/{id}` | GET | Get document by ID |
+| `/delete/{ns}/{id}` | POST | Delete document |
+| `/ns/{namespace}` | DELETE | Purge entire namespace |
+
+### Usage Examples
+
+```bash
+# Start daemon
+rmcp-memex serve --http-port 8237 --http-only --db-path ~/.ai-memories/lancedb &
+
+# Health check
+curl http://localhost:8237/health
+
+# Store document
+curl -X POST http://localhost:8237/upsert \
+  -H "Content-Type: application/json" \
+  -d '{"namespace": "agent1", "id": "mem1", "content": "Important context..."}'
+
+# Search
+curl -X POST http://localhost:8237/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "context", "namespace": "agent1", "limit": 10}'
+
+# SSE streaming search
+curl -N "http://localhost:8237/sse/search?query=context&namespace=agent1&limit=5"
+```
+
+### Multi-Host Database Paths
+
+For setups with multiple machines (e.g., dragon, mgbook16), use per-host database paths:
+
+```bash
+# Per-host paths (each machine gets own database)
+rmcp-memex serve --db-path ~/.ai-memories/lancedb.$(hostname -s)
+
+# Or use the wizard for machine-agnostic configuration
+rmcp-memex wizard
+```
+
+The TUI wizard auto-detects hostname and offers:
+- **Shared mode**: `~/.ai-memories/lancedb` (same path everywhere)
+- **Per-host mode**: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
 
 ### Configuration (TOML)
 
