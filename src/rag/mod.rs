@@ -786,17 +786,19 @@ impl RAGPipeline {
         namespace: Option<&str>,
         slice_mode: SliceMode,
     ) -> Result<IndexResult> {
+        // Security: validate path before any file operations
+        let validated_path = crate::path_utils::validate_read_path(path)?;
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
 
         // For Onion modes, use JSON-aware extraction to split arrays into documents
         if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
             return self
-                .index_document_with_json_awareness(path, ns, slice_mode)
+                .index_document_with_json_awareness(&validated_path, ns, slice_mode)
                 .await;
         }
 
         // For Flat mode, use existing behavior (single document)
-        let text = self.extract_text(path).await?;
+        let text = self.extract_text(&validated_path).await?;
 
         // Compute content hash BEFORE any processing
         let content_hash = compute_content_hash(&text);
@@ -846,8 +848,11 @@ impl RAGPipeline {
 
         let mut total_chunks = 0;
         let mut skipped_docs = 0;
-        let file_content_hash =
-            compute_content_hash(&tokio::fs::read_to_string(path).await.unwrap_or_default());
+        // Path is validated by caller (index_document_with_dedup) via validate_read_path
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let file_content_hash = compute_content_hash(
+            &tokio::fs::read_to_string(path).await.unwrap_or_default(), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        );
 
         for (doc_id, content, mut doc_metadata) in documents {
             if content.len() < 50 {
@@ -993,7 +998,9 @@ impl RAGPipeline {
         preprocess_config: Option<PreprocessingConfig>,
         slice_mode: SliceMode,
     ) -> Result<()> {
-        let text = self.extract_text(path).await?;
+        // Security: validate path before any file operations
+        let validated_path = crate::path_utils::validate_read_path(path)?;
+        let text = self.extract_text(&validated_path).await?;
 
         // Optionally preprocess the text to remove noise
         let text = if let Some(config) = preprocess_config {
@@ -1012,7 +1019,7 @@ impl RAGPipeline {
 
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
         let base_metadata = json!({
-            "path": path.to_str(),
+            "path": validated_path.to_str(),
             "slice_mode": match slice_mode {
                 SliceMode::Onion => "onion",
                 SliceMode::OnionFast => "onion-fast",
@@ -1670,6 +1677,8 @@ impl RAGPipeline {
         }
 
         // Try to parse as JSON
+        // Path is validated by caller (index_document_with_dedup) via validate_read_path
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let raw = tokio::fs::read_to_string(path).await?;
         let parsed: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
