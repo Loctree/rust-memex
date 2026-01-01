@@ -482,10 +482,10 @@ rmcp-memex serve --mode memory
 rmcp-memex serve --security-enabled
 
 # With HTTP/SSE server for multi-agent access
-rmcp-memex serve --http-port 8237
+rmcp-memex serve --http-port 6660
 
 # HTTP-only daemon mode (no MCP stdio)
-rmcp-memex serve --http-port 8237 --http-only
+rmcp-memex serve --http-port 6660 --http-only
 ```
 
 ## HTTP/SSE Server (Multi-Agent Access)
@@ -500,7 +500,7 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 │                     rmcp-memex daemon                        │
 │  ┌─────────────────┐    ┌─────────────────┐                 │
 │  │   MCP Server    │    │   HTTP/SSE      │                 │
-│  │   (stdio)       │    │   (port 8237)   │                 │
+│  │   (stdio)       │    │   (port 6660)   │                 │
 │  └────────┬────────┘    └────────┬────────┘                 │
 │           │                      │                          │
 │           └──────────┬───────────┘                          │
@@ -538,23 +538,23 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 
 ```bash
 # Start daemon
-rmcp-memex serve --http-port 8237 --http-only --db-path ~/.ai-memories/lancedb &
+rmcp-memex serve --http-port 6660 --http-only --db-path ~/.ai-memories/lancedb &
 
 # Health check
-curl http://localhost:8237/health
+curl http://localhost:6660/health
 
 # Store document
-curl -X POST http://localhost:8237/upsert \
+curl -X POST http://localhost:6660/upsert \
   -H "Content-Type: application/json" \
   -d '{"namespace": "agent1", "id": "mem1", "content": "Important context..."}'
 
 # Search
-curl -X POST http://localhost:8237/search \
+curl -X POST http://localhost:6660/search \
   -H "Content-Type: application/json" \
   -d '{"query": "context", "namespace": "agent1", "limit": 10}'
 
 # SSE streaming search
-curl -N "http://localhost:8237/sse/search?query=context&namespace=agent1&limit=5"
+curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5"
 ```
 
 ### Multi-Host Database Paths

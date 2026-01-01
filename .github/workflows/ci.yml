@@ -37,7 +37,14 @@ jobs:
       - name: Rust clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Rust tests
-        run: cargo test
+        # Ubuntu runners have limited memory - doctests link the entire library
+        # each time and can crash the linker. Run lib+bin+tests only on Linux.
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo test --lib --bins --tests
+          else
+            cargo test
+          fi
 
   coverage:
     runs-on: ubuntu-latest

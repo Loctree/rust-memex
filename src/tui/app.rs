@@ -640,7 +640,7 @@ impl App {
     #[allow(dead_code)]
     pub fn toggle_http_port(&mut self) {
         self.memex_cfg.http_port = match self.memex_cfg.http_port {
-            None => Some(8237), // Default port
+            None => Some(6660), // Default port (823x reserved for Whisper STT)
             Some(_) => None,
         };
     }

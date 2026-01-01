@@ -315,7 +315,7 @@ struct Cli {
     /// HTTP/SSE server port for multi-agent access.
     /// When set, starts an HTTP server alongside MCP stdio.
     /// Agents can query via HTTP instead of holding LanceDB lock directly.
-    /// Example: --http-port 8237
+    /// Example: --http-port 6660
     #[arg(long, global = true)]
     http_port: Option<u16>,
 

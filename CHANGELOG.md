@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - **HTTP/SSE Server** - Multi-agent access without LanceDB lock conflicts
-  - `--http-port 8237` flag to start HTTP server alongside MCP stdio
+  - `--http-port 6660` flag to start HTTP server alongside MCP stdio
   - `--http-only` flag for daemon mode (HTTP only, no MCP stdio)
   - Endpoints: `/health`, `/search`, `/sse/search`, `/upsert`, `/index`, `/expand`, `/parent`, `/get`, `/delete`, `/ns`
   - SSE streaming for real-time search results with events: `start`, `result`, `done`
