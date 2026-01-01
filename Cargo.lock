@@ -5528,7 +5528,7 @@ dependencies = [
 
 [[package]]
 name = "rmcp-memex"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "arrow-array",

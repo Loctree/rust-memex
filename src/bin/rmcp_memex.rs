@@ -568,19 +568,30 @@ enum Commands {
         json: bool,
     },
 
-    /// Export a namespace to JSON file
+    /// Export a namespace to JSONL file for portable backup
+    ///
+    /// Each document is written as a JSON line with: id, text, metadata, content_hash,
+    /// and optionally embeddings. Use with 'import' command for backup/restore.
+    ///
+    /// Examples:
+    ///   rmcp-memex export -n memories -o backup.jsonl
+    ///   rmcp-memex export -n memories --include-embeddings -o full-backup.jsonl
     Export {
         /// Namespace to export
         #[arg(long, short = 'n', required = true)]
         namespace: String,
 
-        /// Output file path (stdout if not specified)
+        /// Output file path (.jsonl format, stdout if not specified)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        /// Include embeddings in export (large!)
+        /// Include vector embeddings in export (makes files much larger)
         #[arg(long)]
         include_embeddings: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
     },
 
     /// Upsert a text chunk directly into vector memory (for hooks/scripts)
@@ -629,6 +640,208 @@ enum Commands {
     ///
     /// Displays row count, version count, and storage information.
     Stats,
+
+    /// Garbage collection: clean up orphaned data
+    ///
+    /// Removes orphan embeddings, empty namespaces, and old documents.
+    /// Always runs in dry-run mode unless you pass the --execute flag.
+    ///
+    /// Examples:
+    ///   rmcp-memex gc --remove-orphans                    # Dry run: show orphans
+    ///   rmcp-memex gc --remove-orphans --execute          # Actually remove orphans
+    ///   rmcp-memex gc --older-than 90d                    # Dry run: docs older than 90 days
+    ///   rmcp-memex gc --older-than 6m --namespace logs    # Only in 'logs' namespace
+    ///   rmcp-memex gc --remove-orphans --remove-empty --older-than 1y --execute
+    Gc {
+        /// Remove orphan embeddings (documents with parent_id pointing to non-existent documents)
+        #[arg(long)]
+        remove_orphans: bool,
+
+        /// Remove empty namespaces (report namespaces with 0 documents)
+        #[arg(long)]
+        remove_empty: bool,
+
+        /// Remove documents older than this duration (e.g., "30d", "6m", "1y")
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Actually execute the cleanup (default is dry-run mode)
+        #[arg(long)]
+        execute: bool,
+
+        /// Limit to specific namespace (optional, applies to all if not set)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search across all namespaces
+    ///
+    /// Performs a unified search across every namespace, merging and ranking results.
+    ///
+    /// Examples:
+    ///   rmcp-memex cross-search "error handling"
+    ///   rmcp-memex cross-search "config" --mode hybrid --limit 5 --total-limit 20
+    ///   rmcp-memex cross-search "memory leak" --json
+    CrossSearch {
+        /// The search query
+        query: String,
+
+        /// Maximum results per namespace (default: 10)
+        #[arg(long, default_value = "10")]
+        limit: usize,
+
+        /// Maximum total results after merging (default: 50)
+        #[arg(long, default_value = "50")]
+        total_limit: usize,
+
+        /// Search mode: vector, bm25/keyword, or hybrid (default: hybrid)
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Merge multiple LanceDB databases into one with deduplication
+    ///
+    /// Combines documents from multiple source databases into a single target database.
+    /// Useful for consolidating memory across machines or instances.
+    ///
+    /// Examples:
+    ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged
+    ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged --dedup
+    ///   rmcp-memex merge --source ~/dragon-db --target ~/merged --namespace-prefix "dragon:"
+    ///   rmcp-memex merge --source ~/db1 --target ~/merged --dry-run
+    Merge {
+        /// Source database paths (can specify multiple times)
+        #[arg(long, short = 's', required = true, action = clap::ArgAction::Append)]
+        source: Vec<PathBuf>,
+
+        /// Target database path (will be created if not exists)
+        #[arg(long, short = 't', required = true)]
+        target: PathBuf,
+
+        /// Deduplicate by content_hash (skip documents with same hash)
+        #[arg(long, short = 'd')]
+        dedup: bool,
+
+        /// Prefix to add to source namespaces (e.g., "dragon:" -> "dragon:memories")
+        #[arg(long, short = 'p')]
+        namespace_prefix: Option<String>,
+
+        /// Show what would be merged without actually doing it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find and remove duplicate documents based on content hash
+    ///
+    /// Groups documents by content_hash and removes duplicates, keeping one
+    /// document per unique content based on the --keep strategy.
+    ///
+    /// Examples:
+    ///   rmcp-memex dedup                          # All namespaces, dry-run
+    ///   rmcp-memex dedup -n memories              # Specific namespace
+    ///   rmcp-memex dedup --dry-run false          # Actually remove duplicates
+    ///   rmcp-memex dedup --keep newest            # Keep newest duplicates
+    ///   rmcp-memex dedup --cross-namespace        # Dedup across all namespaces
+    Dedup {
+        /// Specific namespace to deduplicate (if not set, processes all namespaces separately)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Show duplicates without removing them (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        dry_run: bool,
+
+        /// Strategy for which document to keep when duplicates are found:
+        /// - "oldest": Keep the document with the earliest ID (lexicographic, default)
+        /// - "newest": Keep the document with the latest ID (lexicographic)
+        /// - "highest-score": Keep the document that appears first in vector search
+        #[arg(long, default_value = "oldest", value_parser = ["oldest", "newest", "highest-score"])]
+        keep: String,
+
+        /// Deduplicate across all namespaces (treat entire DB as one pool).
+        /// By default, deduplication is done within each namespace separately.
+        #[arg(long)]
+        cross_namespace: bool,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Migrate or rename a namespace
+    ///
+    /// Moves all documents from one namespace to another. Useful for renaming
+    /// namespaces or consolidating data.
+    ///
+    /// Examples:
+    ///   rmcp-memex migrate-namespace --from old-name --to new-name
+    ///   rmcp-memex migrate-namespace --from old --to new --merge
+    ///   rmcp-memex migrate-namespace --from old --to new --dry-run
+    ///   rmcp-memex migrate-namespace --from old --to new --delete-source false
+    #[command(alias = "mv-namespace")]
+    MigrateNamespace {
+        /// Source namespace name
+        #[arg(long, required = true)]
+        from: String,
+
+        /// Target namespace name
+        #[arg(long, required = true)]
+        to: String,
+
+        /// If target namespace exists, merge documents instead of erroring
+        #[arg(long)]
+        merge: bool,
+
+        /// Delete source namespace after migration (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        delete_source: bool,
+
+        /// Show what would happen without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Import documents from JSONL file into a namespace
+    ///
+    /// Reads documents exported with 'export' command and stores them.
+    /// Can re-embed text if embeddings were not included in export.
+    ///
+    /// Examples:
+    ///   rmcp-memex import -n memories -i backup.jsonl
+    ///   rmcp-memex import -n new-namespace -i backup.jsonl --skip-existing
+    Import {
+        /// Target namespace (can differ from original export)
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Input JSONL file path
+        #[arg(long, short = 'i', required = true)]
+        input: PathBuf,
+
+        /// Skip documents whose content_hash already exists in target namespace
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
 }
 
 impl Cli {
@@ -1231,6 +1444,167 @@ async fn run_list_namespaces(stats: bool, json_output: bool, db_path: String) ->
     Ok(())
 }
 
+/// Cross-search result with namespace information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrossSearchResult {
+    id: String,
+    namespace: String,
+    text: String,
+    score: f32,
+    metadata: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    keywords: Vec<String>,
+}
+
+/// Search across all namespaces, merge results by score
+async fn run_cross_search(
+    query: String,
+    limit_per_ns: usize,
+    total_limit: usize,
+    mode: String,
+    json_output: bool,
+    db_path: String,
+    embedding_config: &EmbeddingConfig,
+) -> Result<()> {
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+
+    // First, get list of all namespaces
+    let zero_embedding = vec![0.0_f32; embedding_config.required_dimension];
+    let all_docs = storage.search_store(None, zero_embedding, 10000).await?;
+
+    let mut namespace_set: HashSet<String> = HashSet::new();
+    for doc in &all_docs {
+        namespace_set.insert(doc.namespace.clone());
+    }
+
+    let namespaces: Vec<String> = namespace_set.into_iter().collect();
+
+    if namespaces.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({ "results": [], "total": 0, "namespaces_searched": 0 })
+            );
+        } else {
+            eprintln!("No namespaces found in database.");
+        }
+        return Ok(());
+    }
+
+    if !json_output {
+        eprintln!(
+            "Searching {} namespaces for: \"{}\"",
+            namespaces.len(),
+            query
+        );
+        eprintln!(
+            "Mode: {}, limit per namespace: {}, total limit: {}",
+            mode, limit_per_ns, total_limit
+        );
+        eprintln!();
+    }
+
+    // Parse search mode and configure hybrid searcher
+    let search_mode = match mode.as_str() {
+        "vector" => SearchMode::Vector,
+        "keyword" | "bm25" => SearchMode::Keyword,
+        _ => SearchMode::Hybrid,
+    };
+
+    // Create hybrid config with the specified mode
+    let hybrid_config = HybridConfig {
+        mode: search_mode,
+        ..Default::default()
+    };
+
+    let hybrid_searcher = HybridSearcher::new(storage.clone(), hybrid_config).await?;
+
+    // Embed the query once for all namespaces
+    let query_embedding = embedding_client.lock().await.embed(&query).await?;
+
+    // Search each namespace and collect results
+    let mut all_results: Vec<CrossSearchResult> = Vec::new();
+
+    for ns in &namespaces {
+        let ns_results = hybrid_searcher
+            .search(
+                &query,
+                query_embedding.clone(),
+                Some(ns.as_str()),
+                limit_per_ns,
+                None,
+            )
+            .await?;
+
+        for r in ns_results {
+            all_results.push(CrossSearchResult {
+                id: r.id,
+                namespace: r.namespace,
+                text: r.document,
+                score: r.combined_score,
+                metadata: r.metadata,
+                layer: r.layer.map(|l| l.to_string()),
+                keywords: r.keywords,
+            });
+        }
+    }
+
+    // Sort by score descending
+    all_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Truncate to total_limit
+    all_results.truncate(total_limit);
+
+    if json_output {
+        let output = serde_json::json!({
+            "query": query,
+            "mode": mode,
+            "namespaces_searched": namespaces.len(),
+            "total_results": all_results.len(),
+            "results": all_results
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        eprintln!(
+            "Found {} results across {} namespaces:\n",
+            all_results.len(),
+            namespaces.len()
+        );
+
+        for (idx, r) in all_results.iter().enumerate() {
+            eprintln!(
+                "{}. [{}] {} (score: {:.4})",
+                idx + 1,
+                r.namespace,
+                &r.id,
+                r.score
+            );
+            if let Some(ref layer) = r.layer {
+                eprintln!("   Layer: {}", layer);
+            }
+            if !r.keywords.is_empty() {
+                eprintln!("   Keywords: {}", r.keywords.join(", "));
+            }
+            // Truncate text for display
+            let preview = if r.text.len() > 200 {
+                format!("{}...", &r.text[..200])
+            } else {
+                r.text.clone()
+            };
+            eprintln!("   {}\n", preview.replace('\n', " "));
+        }
+    }
+
+    Ok(())
+}
+
 /// Namespace overview stats
 #[derive(Debug, Clone, serde::Serialize)]
 struct NamespaceStats {
@@ -1556,7 +1930,162 @@ async fn run_dive(
     Ok(())
 }
 
-/// Export a namespace to JSON file
+/// Run garbage collection
+async fn run_gc(config: rmcp_memex::GcConfig, db_path: String, json_output: bool) -> Result<()> {
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    let mode_str = if config.dry_run { "DRY RUN" } else { "EXECUTE" };
+    let ns_str = config.namespace.as_deref().unwrap_or("all namespaces");
+
+    if !json_output {
+        eprintln!("\n=== GARBAGE COLLECTION ({}) ===\n", mode_str);
+        eprintln!("Database: {}", db_path);
+        eprintln!("Scope: {}", ns_str);
+        eprintln!();
+
+        if config.remove_orphans {
+            eprintln!("- Checking for orphan embeddings...");
+        }
+        if config.remove_empty {
+            eprintln!("- Checking for empty namespaces...");
+        }
+        if let Some(ref dur) = config.older_than {
+            let days = dur.num_days();
+            eprintln!("- Checking for documents older than {} days...", days);
+        }
+        eprintln!();
+    }
+
+    // Run GC
+    let stats = storage.run_gc(&config).await?;
+
+    if json_output {
+        let output = serde_json::json!({
+            "mode": if config.dry_run { "dry_run" } else { "execute" },
+            "db_path": db_path,
+            "namespace": config.namespace,
+            "orphans": {
+                "found": stats.orphans_found,
+                "removed": stats.orphans_removed
+            },
+            "empty_namespaces": {
+                "found": stats.empty_namespaces_found,
+                "removed": stats.empty_namespaces_removed,
+                "names": stats.empty_namespace_names
+            },
+            "old_documents": {
+                "found": stats.old_docs_found,
+                "removed": stats.old_docs_removed,
+                "affected_namespaces": stats.affected_namespaces
+            },
+            "bytes_freed": stats.bytes_freed,
+            "has_issues": stats.has_issues(),
+            "has_deletions": stats.has_deletions()
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Human-readable output
+        eprintln!("=== RESULTS ===\n");
+
+        // Orphans
+        if config.remove_orphans {
+            if stats.orphans_found > 0 {
+                eprintln!("Orphan embeddings:");
+                eprintln!("  Found:   {}", stats.orphans_found);
+                if config.dry_run {
+                    eprintln!("  Action:  Would remove {} orphans", stats.orphans_found);
+                } else {
+                    eprintln!("  Removed: {}", stats.orphans_removed);
+                }
+            } else {
+                eprintln!("Orphan embeddings: None found");
+            }
+            eprintln!();
+        }
+
+        // Empty namespaces
+        if config.remove_empty {
+            if stats.empty_namespaces_found > 0 {
+                eprintln!("Empty namespaces:");
+                eprintln!("  Found: {}", stats.empty_namespaces_found);
+                for ns in &stats.empty_namespace_names {
+                    eprintln!("    - {}", ns);
+                }
+            } else {
+                eprintln!("Empty namespaces: None found");
+            }
+            eprintln!();
+        }
+
+        // Old documents
+        if config.older_than.is_some() {
+            if stats.old_docs_found > 0 {
+                eprintln!("Old documents:");
+                eprintln!("  Found:   {}", stats.old_docs_found);
+                if config.dry_run {
+                    eprintln!("  Action:  Would remove {} documents", stats.old_docs_found);
+                } else {
+                    eprintln!("  Removed: {}", stats.old_docs_removed);
+                }
+                if !stats.affected_namespaces.is_empty() {
+                    eprintln!("  Affected namespaces:");
+                    for ns in &stats.affected_namespaces {
+                        eprintln!("    - {}", ns);
+                    }
+                }
+            } else {
+                eprintln!("Old documents: None found (no documents with parseable timestamps)");
+            }
+            eprintln!();
+        }
+
+        // Summary
+        eprintln!("=== SUMMARY ===\n");
+        if !stats.has_issues() {
+            eprintln!("No issues found. Database is clean.");
+        } else if config.dry_run {
+            eprintln!("Issues found. Run with --execute to apply changes.");
+            eprintln!();
+            eprintln!("Example:");
+            let mut cmd = "rmcp-memex gc".to_string();
+            if config.remove_orphans {
+                cmd.push_str(" --remove-orphans");
+            }
+            if config.remove_empty {
+                cmd.push_str(" --remove-empty");
+            }
+            if let Some(ref dur) = config.older_than {
+                cmd.push_str(&format!(" --older-than {}d", dur.num_days()));
+            }
+            cmd.push_str(" --execute");
+            eprintln!("  {}", cmd);
+        } else if stats.has_deletions() {
+            eprintln!("Cleanup complete!");
+            let total_removed = stats.orphans_removed + stats.old_docs_removed;
+            eprintln!("  Total items removed: {}", total_removed);
+            if let Some(bytes) = stats.bytes_freed {
+                eprintln!("  Space freed: {} bytes", bytes);
+            }
+            eprintln!();
+            eprintln!("Tip: Run 'rmcp-memex optimize' to compact the database and reclaim space.");
+        }
+    }
+
+    Ok(())
+}
+
+/// JSONL export record structure
+#[derive(Debug, Serialize, Deserialize)]
+struct ExportRecord {
+    id: String,
+    text: String,
+    metadata: serde_json::Value,
+    content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embeddings: Option<Vec<f32>>,
+}
+
+/// Export a namespace to JSONL file for portable backup
 async fn run_export(
     namespace: String,
     output: Option<PathBuf>,
@@ -1577,48 +2106,187 @@ async fn run_export(
         return Ok(());
     }
 
-    // Build export structure
-    let export_data: Vec<serde_json::Value> = docs
-        .iter()
-        .map(|doc| {
-            let mut obj = serde_json::json!({
-                "id": doc.id,
-                "namespace": doc.namespace,
-                "text": doc.document,
-                "metadata": doc.metadata
-            });
+    eprintln!(
+        "Exporting {} documents from namespace '{}'...",
+        docs.len(),
+        namespace
+    );
 
-            if include_embeddings {
-                obj["embedding"] = serde_json::json!(doc.embedding);
-            }
+    // Build JSONL output - each document on a separate line
+    let mut lines: Vec<String> = Vec::with_capacity(docs.len());
 
-            obj
-        })
-        .collect();
+    for doc in &docs {
+        let record = ExportRecord {
+            id: doc.id.clone(),
+            text: doc.document.clone(),
+            metadata: doc.metadata.clone(),
+            content_hash: doc.content_hash.clone(),
+            embeddings: if include_embeddings {
+                Some(doc.embedding.clone())
+            } else {
+                None
+            },
+        };
 
-    let export_json = serde_json::json!({
-        "namespace": namespace,
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "document_count": export_data.len(),
-        "include_embeddings": include_embeddings,
-        "documents": export_data
-    });
+        let line = serde_json::to_string(&record)?;
+        lines.push(line);
+    }
 
-    let json_string = serde_json::to_string_pretty(&export_json)?;
+    let jsonl_content = lines.join("\n");
 
     match output {
         Some(path) => {
-            std::fs::write(&path, &json_string)?;
+            tokio::fs::write(&path, &jsonl_content).await?;
             eprintln!(
                 "Exported {} documents from '{}' to {:?}",
                 docs.len(),
                 namespace,
                 path
             );
+            if include_embeddings {
+                eprintln!("  (embeddings included - file may be large)");
+            }
         }
         None => {
-            println!("{}", json_string);
+            println!("{}", jsonl_content);
         }
+    }
+
+    Ok(())
+}
+
+/// Import documents from JSONL file into a namespace
+async fn run_import(
+    namespace: String,
+    input: PathBuf,
+    skip_existing: bool,
+    db_path: String,
+    embedding_config: &EmbeddingConfig,
+) -> Result<()> {
+    // Validate input file exists
+    if !input.exists() {
+        return Err(anyhow::anyhow!("Input file not found: {:?}", input));
+    }
+
+    // Read JSONL file
+    let content = tokio::fs::read_to_string(&input).await?;
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.is_empty() {
+        eprintln!("No records found in input file");
+        return Ok(());
+    }
+
+    eprintln!(
+        "Importing {} records into namespace '{}'...",
+        lines.len(),
+        namespace
+    );
+
+    // Initialize storage and embedding client
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+
+    let mut imported_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut error_count = 0usize;
+
+    // Collect records that need embedding
+    let mut records_to_embed: Vec<(ExportRecord, usize)> = Vec::new();
+    let mut records_with_embeddings: Vec<(ExportRecord, Vec<f32>)> = Vec::new();
+
+    // Parse all records first
+    for (line_num, line) in lines.iter().enumerate() {
+        let record: ExportRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  Line {}: parse error - {}", line_num + 1, e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        // Check for duplicates if skip_existing is enabled
+        if skip_existing
+            && let Some(ref hash) = record.content_hash
+            && storage.has_content_hash(&namespace, hash).await?
+        {
+            skipped_count += 1;
+            continue;
+        }
+
+        // Check if record has embeddings
+        if record.embeddings.is_some() {
+            let emb = record.embeddings.clone().unwrap();
+            records_with_embeddings.push((record, emb));
+        } else {
+            records_to_embed.push((record, line_num));
+        }
+    }
+
+    // Process records that already have embeddings
+    if !records_with_embeddings.is_empty() {
+        eprintln!(
+            "  Storing {} records with existing embeddings...",
+            records_with_embeddings.len()
+        );
+
+        let mut docs = Vec::new();
+        for (record, embedding) in records_with_embeddings {
+            let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
+                record.id,
+                namespace.clone(),
+                embedding,
+                record.metadata,
+                record.text,
+                record.content_hash.unwrap_or_default(),
+            );
+            docs.push(doc);
+        }
+
+        storage.add_to_store(docs.clone()).await?;
+        imported_count += docs.len();
+    }
+
+    // Process records that need embedding
+    if !records_to_embed.is_empty() {
+        eprintln!(
+            "  Re-embedding {} records without embeddings...",
+            records_to_embed.len()
+        );
+
+        // Batch embed texts
+        let texts: Vec<String> = records_to_embed
+            .iter()
+            .map(|(r, _)| r.text.clone())
+            .collect();
+        let embeddings = embedding_client.lock().await.embed_batch(&texts).await?;
+
+        let mut docs = Vec::new();
+        for ((record, _line_num), embedding) in records_to_embed.into_iter().zip(embeddings) {
+            let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
+                record.id,
+                namespace.clone(),
+                embedding,
+                record.metadata,
+                record.text,
+                record.content_hash.unwrap_or_default(),
+            );
+            docs.push(doc);
+        }
+
+        storage.add_to_store(docs.clone()).await?;
+        imported_count += docs.len();
+    }
+
+    eprintln!();
+    eprintln!("Import complete:");
+    eprintln!("  Imported: {} documents", imported_count);
+    if skipped_count > 0 {
+        eprintln!("  Skipped:  {} (already exist)", skipped_count);
+    }
+    if error_count > 0 {
+        eprintln!("  Errors:   {}", error_count);
     }
 
     Ok(())
@@ -2168,6 +2836,755 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     Ok(())
 }
 
+/// Strategy for keeping documents when deduplicating
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepStrategy {
+    /// Keep the document with the earliest ID (lexicographic)
+    Oldest,
+    /// Keep the document with the latest ID (lexicographic)
+    Newest,
+    /// Keep the document that appears first in vector search (highest relevance)
+    HighestScore,
+}
+
+impl KeepStrategy {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "newest" => Self::Newest,
+            "highest-score" => Self::HighestScore,
+            _ => Self::Oldest,
+        }
+    }
+}
+
+/// Result of deduplication operation
+#[derive(Debug, Clone, Serialize)]
+struct DedupResult {
+    /// Total documents scanned
+    total_docs: usize,
+    /// Documents with unique content (no duplicates)
+    unique_docs: usize,
+    /// Duplicate groups found (each group has 2+ docs with same hash)
+    duplicate_groups: usize,
+    /// Total duplicate documents that would be/were removed
+    duplicates_removed: usize,
+    /// Documents without content_hash (cannot be deduplicated)
+    docs_without_hash: usize,
+    /// Details of each duplicate group (for reporting)
+    groups: Vec<DedupGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DedupGroup {
+    content_hash: String,
+    kept_id: String,
+    kept_namespace: String,
+    removed_ids: Vec<(String, String)>, // (id, namespace)
+}
+
+/// Run deduplication on the database
+async fn run_dedup(
+    namespace: Option<String>,
+    dry_run: bool,
+    keep_strategy: KeepStrategy,
+    cross_namespace: bool,
+    json_output: bool,
+    db_path: String,
+) -> Result<()> {
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+
+    // Get all documents (optionally filtered by namespace)
+    let zero_embedding = vec![0.0_f32; 4096];
+    let all_docs = storage
+        .search_store(namespace.as_deref(), zero_embedding, 1_000_000)
+        .await?;
+
+    if all_docs.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "empty",
+                    "message": "No documents found",
+                    "namespace": namespace,
+                }))?
+            );
+        } else {
+            eprintln!("No documents found in database.");
+        }
+        return Ok(());
+    }
+
+    if !json_output {
+        eprintln!("Scanning {} documents for duplicates...", all_docs.len());
+        if dry_run {
+            eprintln!("(dry-run mode: no changes will be made)");
+        }
+    }
+
+    // Group documents by content_hash
+    // If cross_namespace is false, we group by (namespace, content_hash)
+    // If cross_namespace is true, we group by content_hash only
+    let mut hash_groups: std::collections::HashMap<String, Vec<_>> =
+        std::collections::HashMap::new();
+    let mut docs_without_hash = 0;
+
+    for doc in &all_docs {
+        match &doc.content_hash {
+            Some(hash) if !hash.is_empty() => {
+                let key = if cross_namespace {
+                    hash.clone()
+                } else {
+                    format!("{}:{}", doc.namespace, hash)
+                };
+                hash_groups.entry(key).or_default().push(doc);
+            }
+            _ => {
+                docs_without_hash += 1;
+            }
+        }
+    }
+
+    // Find groups with duplicates (more than 1 document per hash)
+    let mut result = DedupResult {
+        total_docs: all_docs.len(),
+        unique_docs: 0,
+        duplicate_groups: 0,
+        duplicates_removed: 0,
+        docs_without_hash,
+        groups: Vec::new(),
+    };
+
+    for (_key, mut docs) in hash_groups {
+        if docs.len() == 1 {
+            result.unique_docs += 1;
+            continue;
+        }
+
+        // Sort documents based on keep strategy
+        match keep_strategy {
+            KeepStrategy::Oldest => {
+                docs.sort_by(|a, b| a.id.cmp(&b.id));
+            }
+            KeepStrategy::Newest => {
+                docs.sort_by(|a, b| b.id.cmp(&a.id));
+            }
+            KeepStrategy::HighestScore => {
+                // Already in search order (highest score first), no sort needed
+            }
+        }
+
+        // First document is kept, rest are duplicates
+        let kept = &docs[0];
+        let to_remove: Vec<_> = docs[1..].to_vec();
+
+        let group = DedupGroup {
+            content_hash: kept.content_hash.clone().unwrap_or_default(),
+            kept_id: kept.id.clone(),
+            kept_namespace: kept.namespace.clone(),
+            removed_ids: to_remove
+                .iter()
+                .map(|d| (d.id.clone(), d.namespace.clone()))
+                .collect(),
+        };
+
+        result.duplicate_groups += 1;
+        result.duplicates_removed += to_remove.len();
+        result.unique_docs += 1; // The kept one is unique
+
+        // Actually delete if not dry-run
+        if !dry_run {
+            for doc in &to_remove {
+                storage.delete_document(&doc.namespace, &doc.id).await?;
+            }
+        }
+
+        result.groups.push(group);
+    }
+
+    // Output results
+    if json_output {
+        let output = serde_json::json!({
+            "dry_run": dry_run,
+            "namespace": namespace,
+            "cross_namespace": cross_namespace,
+            "keep_strategy": format!("{:?}", keep_strategy).to_lowercase(),
+            "result": result,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        eprintln!();
+        eprintln!(
+            "Deduplication {}:",
+            if dry_run { "report" } else { "complete" }
+        );
+        eprintln!("  Total documents:     {}", result.total_docs);
+        eprintln!("  Unique documents:    {}", result.unique_docs);
+        eprintln!("  Duplicate groups:    {}", result.duplicate_groups);
+        eprintln!(
+            "  Duplicates {}:  {}",
+            if dry_run { "found" } else { "removed" },
+            result.duplicates_removed
+        );
+        if result.docs_without_hash > 0 {
+            eprintln!(
+                "  Without hash:        {} (cannot deduplicate)",
+                result.docs_without_hash
+            );
+        }
+
+        // Show some duplicate groups if any
+        if !result.groups.is_empty() {
+            eprintln!();
+            let show_count = result.groups.len().min(5);
+            eprintln!(
+                "Sample duplicate groups ({} of {}):",
+                show_count,
+                result.groups.len()
+            );
+            for group in result.groups.iter().take(show_count) {
+                eprintln!();
+                eprintln!(
+                    "  Hash: {}...",
+                    &group.content_hash[..group.content_hash.len().min(16)]
+                );
+                eprintln!("  Kept: {} (ns: {})", group.kept_id, group.kept_namespace);
+                for (id, ns) in &group.removed_ids {
+                    eprintln!(
+                        "  {} {} (ns: {})",
+                        if dry_run { "Would remove:" } else { "Removed:" },
+                        id,
+                        ns
+                    );
+                }
+            }
+            if result.groups.len() > 5 {
+                eprintln!();
+                eprintln!("  ... and {} more groups", result.groups.len() - 5);
+            }
+        }
+
+        if dry_run && result.duplicates_removed > 0 {
+            eprintln!();
+            eprintln!("To actually remove duplicates, run with: --dry-run false");
+        }
+    }
+
+    Ok(())
+}
+
+/// Migration result for reporting
+#[derive(Debug, Clone, Serialize)]
+struct MigrationResult {
+    from_namespace: String,
+    to_namespace: String,
+    docs_migrated: usize,
+    docs_merged: usize,
+    source_deleted: bool,
+    dry_run: bool,
+}
+
+/// Migrate documents from one namespace to another
+async fn run_migrate_namespace(
+    from: String,
+    to: String,
+    db_path: String,
+    merge: bool,
+    delete_source: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let db_path = shellexpand::tilde(&db_path).to_string();
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    // Edge case: same source and target
+    if from == to {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "no-op",
+                    "message": "Source and target namespaces are the same",
+                    "namespace": from
+                }))?
+            );
+        } else {
+            eprintln!(
+                "Warning: Source and target namespaces are the same ('{}').",
+                from
+            );
+            eprintln!("No migration needed.");
+        }
+        return Ok(());
+    }
+
+    // Check if source namespace exists
+    let source_exists = storage.namespace_exists(&from).await?;
+    if !source_exists {
+        let msg = format!("Source namespace '{}' does not exist or is empty", from);
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "message": msg
+                }))?
+            );
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    // Check if target namespace exists
+    let target_exists = storage.namespace_exists(&to).await?;
+    if target_exists && !merge {
+        let msg = format!(
+            "Target namespace '{}' already exists. Use --merge to merge documents.",
+            to
+        );
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "message": msg,
+                    "hint": "Use --merge flag to merge into existing namespace"
+                }))?
+            );
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    // Get all documents from source namespace
+    let source_docs = storage.get_all_in_namespace(&from).await?;
+    let source_count = source_docs.len();
+
+    if source_count == 0 {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "no-op",
+                    "message": "Source namespace is empty",
+                    "namespace": from
+                }))?
+            );
+        } else {
+            eprintln!("Source namespace '{}' is empty. Nothing to migrate.", from);
+        }
+        return Ok(());
+    }
+
+    // Get target document count for merge reporting
+    let target_count_before = if target_exists {
+        storage.count_namespace(&to).await?
+    } else {
+        0
+    };
+
+    if dry_run {
+        // Report what would happen
+        let result = MigrationResult {
+            from_namespace: from.clone(),
+            to_namespace: to.clone(),
+            docs_migrated: source_count,
+            docs_merged: if target_exists {
+                target_count_before
+            } else {
+                0
+            },
+            source_deleted: delete_source,
+            dry_run: true,
+        };
+
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "dry-run",
+                    "result": result,
+                    "message": "No changes made"
+                }))?
+            );
+        } else {
+            eprintln!("\n-> Dry Run: Namespace Migration\n");
+            eprintln!("  From:           '{}'", from);
+            eprintln!("  To:             '{}'", to);
+            eprintln!("  Docs to move:   {}", source_count);
+            if target_exists {
+                eprintln!("  Existing docs:  {} (will be merged)", target_count_before);
+            }
+            eprintln!(
+                "  Delete source:  {}",
+                if delete_source { "yes" } else { "no" }
+            );
+            eprintln!("\nNo changes made (dry run).");
+        }
+        return Ok(());
+    }
+
+    // Perform the migration
+    // Create new documents with updated namespace
+    let migrated_docs: Vec<rmcp_memex::ChromaDocument> = source_docs
+        .into_iter()
+        .map(|mut doc| {
+            doc.namespace = to.clone();
+            doc
+        })
+        .collect();
+
+    // Insert into target namespace
+    storage.add_to_store(migrated_docs).await?;
+
+    // Delete source namespace if requested
+    let source_deleted = if delete_source {
+        storage.purge_namespace(&from).await?;
+        true
+    } else {
+        false
+    };
+
+    // Report results
+    let result = MigrationResult {
+        from_namespace: from.clone(),
+        to_namespace: to.clone(),
+        docs_migrated: source_count,
+        docs_merged: if target_exists {
+            target_count_before
+        } else {
+            0
+        },
+        source_deleted,
+        dry_run: false,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "success",
+                "result": result
+            }))?
+        );
+    } else {
+        eprintln!("\n-> Namespace Migration Complete\n");
+        eprintln!("  From:           '{}'", from);
+        eprintln!("  To:             '{}'", to);
+        eprintln!("  Docs migrated:  {}", source_count);
+        if target_exists {
+            eprintln!("  Merged with:    {} existing docs", target_count_before);
+            eprintln!(
+                "  Total in '{}': {}",
+                to,
+                source_count + target_count_before
+            );
+        }
+        if source_deleted {
+            eprintln!("  Source '{}': deleted", from);
+        } else {
+            eprintln!(
+                "  Source '{}': preserved (use --delete-source to remove)",
+                from
+            );
+        }
+        eprintln!("\n  DB path: {}", db_path);
+    }
+
+    Ok(())
+}
+
+/// Statistics for merge operation
+#[derive(Debug, Clone, Default, Serialize)]
+struct MergeStats {
+    /// Total documents found in sources
+    total_docs: usize,
+    /// Documents copied to target
+    docs_copied: usize,
+    /// Documents skipped (duplicates)
+    docs_skipped: usize,
+    /// Namespaces merged
+    namespaces: HashSet<String>,
+    /// Source databases processed
+    sources_processed: usize,
+    /// Errors encountered (non-fatal)
+    errors: usize,
+}
+
+/// Merge multiple LanceDB databases into one
+async fn run_merge(
+    source_paths: Vec<PathBuf>,
+    target_path: PathBuf,
+    dedup: bool,
+    namespace_prefix: Option<String>,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    let mut stats = MergeStats::default();
+
+    // Validate source paths exist
+    let mut validated_sources: Vec<String> = Vec::new();
+    for source in &source_paths {
+        let expanded = shellexpand::tilde(source.to_str().unwrap_or("")).to_string();
+        let path = Path::new(&expanded);
+        if !path.exists() {
+            if !json_output {
+                eprintln!("Warning: Source database not found: {}", expanded);
+            }
+            stats.errors += 1;
+            continue;
+        }
+        validated_sources.push(expanded);
+    }
+
+    if validated_sources.is_empty() {
+        return Err(anyhow::anyhow!("No valid source databases found"));
+    }
+
+    // Prepare target path
+    let target_expanded = shellexpand::tilde(target_path.to_str().unwrap_or("")).to_string();
+
+    if !json_output {
+        eprintln!("\n=== RMCP-MEMEX MERGE ===\n");
+        eprintln!("Sources: {} database(s)", validated_sources.len());
+        for src in &validated_sources {
+            eprintln!("  - {}", src);
+        }
+        eprintln!("Target:  {}", target_expanded);
+        if let Some(ref prefix) = namespace_prefix {
+            eprintln!("Prefix:  {}", prefix);
+        }
+        eprintln!("Dedup:   {}", if dedup { "enabled" } else { "disabled" });
+        if dry_run {
+            eprintln!("\n[DRY RUN - no changes will be made]\n");
+        }
+        eprintln!();
+    }
+
+    // Open target storage (will create if not exists)
+    let target_storage = if !dry_run {
+        // Ensure parent directory exists for target
+        if let Some(parent) = Path::new(&target_expanded).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Some(StorageManager::new_lance_only(&target_expanded).await?)
+    } else {
+        None
+    };
+
+    // Track content hashes for deduplication (across all sources)
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+
+    // If dedup is enabled and target exists, pre-populate seen_hashes from target
+    if dedup
+        && !dry_run
+        && let Some(ref target) = target_storage
+    {
+        // Get all existing documents from target to extract their hashes
+        let zero_embedding = vec![0.0_f32; 4096];
+        if let Ok(existing_docs) = target.search_store(None, zero_embedding, 100000).await {
+            for doc in existing_docs {
+                if let Some(hash) = doc.content_hash {
+                    seen_hashes.insert(hash);
+                }
+            }
+            if !json_output && !seen_hashes.is_empty() {
+                eprintln!(
+                    "Found {} existing documents in target for dedup\n",
+                    seen_hashes.len()
+                );
+            }
+        }
+    }
+
+    // Process each source database
+    for source_path in &validated_sources {
+        if !json_output {
+            eprintln!("Processing: {}", source_path);
+        }
+
+        // Open source database read-only
+        let source_storage = match StorageManager::new_lance_only(source_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                if !json_output {
+                    eprintln!("  Error opening source: {}", e);
+                }
+                stats.errors += 1;
+                continue;
+            }
+        };
+
+        // Get all documents from source (using zero embedding for full scan)
+        let zero_embedding = vec![0.0_f32; 4096];
+        let source_docs = match source_storage
+            .search_store(None, zero_embedding, 100000)
+            .await
+        {
+            Ok(docs) => docs,
+            Err(e) => {
+                if !json_output {
+                    eprintln!("  Error reading source: {}", e);
+                }
+                stats.errors += 1;
+                continue;
+            }
+        };
+
+        if source_docs.is_empty() {
+            if !json_output {
+                eprintln!("  (empty database)\n");
+            }
+            stats.sources_processed += 1;
+            continue;
+        }
+
+        let source_doc_count = source_docs.len();
+        stats.total_docs += source_doc_count;
+
+        // Group by namespace for reporting
+        let mut by_namespace: std::collections::HashMap<String, Vec<_>> =
+            std::collections::HashMap::new();
+        for doc in source_docs {
+            by_namespace
+                .entry(doc.namespace.clone())
+                .or_default()
+                .push(doc);
+        }
+
+        if !json_output {
+            eprintln!(
+                "  Found {} documents in {} namespace(s)",
+                source_doc_count,
+                by_namespace.len()
+            );
+        }
+
+        // Process each namespace
+        for (ns_name, docs) in by_namespace {
+            // Apply namespace prefix if specified
+            let target_namespace = if let Some(ref prefix) = namespace_prefix {
+                format!("{}{}", prefix, ns_name)
+            } else {
+                ns_name.clone()
+            };
+
+            stats.namespaces.insert(target_namespace.clone());
+
+            let mut ns_copied = 0;
+            let mut ns_skipped = 0;
+
+            // Prepare batch for insertion
+            let mut batch: Vec<rmcp_memex::ChromaDocument> = Vec::new();
+
+            for doc in docs {
+                // Check for deduplication
+                if dedup && let Some(ref hash) = doc.content_hash {
+                    if seen_hashes.contains(hash) {
+                        ns_skipped += 1;
+                        stats.docs_skipped += 1;
+                        continue;
+                    }
+                    seen_hashes.insert(hash.clone());
+                }
+
+                // Create document with new namespace
+                let new_doc = rmcp_memex::ChromaDocument {
+                    id: doc.id,
+                    namespace: target_namespace.clone(),
+                    embedding: doc.embedding,
+                    metadata: doc.metadata,
+                    document: doc.document,
+                    layer: doc.layer,
+                    parent_id: doc.parent_id,
+                    children_ids: doc.children_ids,
+                    keywords: doc.keywords,
+                    content_hash: doc.content_hash,
+                };
+
+                batch.push(new_doc);
+                ns_copied += 1;
+                stats.docs_copied += 1;
+            }
+
+            // Write batch to target (unless dry run)
+            if !dry_run
+                && !batch.is_empty()
+                && let Some(ref target) = target_storage
+                && let Err(e) = target.add_to_store(batch).await
+            {
+                if !json_output {
+                    eprintln!("    Error writing to target: {}", e);
+                }
+                stats.errors += 1;
+            }
+
+            if !json_output {
+                let prefix_info = if namespace_prefix.is_some() {
+                    format!(" -> {}", target_namespace)
+                } else {
+                    String::new()
+                };
+                if ns_skipped > 0 {
+                    eprintln!(
+                        "    [{}{}] {} copied, {} skipped (duplicate)",
+                        ns_name, prefix_info, ns_copied, ns_skipped
+                    );
+                } else {
+                    eprintln!("    [{}{}] {} copied", ns_name, prefix_info, ns_copied);
+                }
+            }
+        }
+
+        stats.sources_processed += 1;
+        if !json_output {
+            eprintln!();
+        }
+    }
+
+    // Output final summary
+    if json_output {
+        let output = serde_json::json!({
+            "status": if dry_run { "dry_run" } else { "completed" },
+            "sources_processed": stats.sources_processed,
+            "total_docs": stats.total_docs,
+            "docs_copied": stats.docs_copied,
+            "docs_skipped": stats.docs_skipped,
+            "namespaces": stats.namespaces.iter().collect::<Vec<_>>(),
+            "namespace_count": stats.namespaces.len(),
+            "errors": stats.errors,
+            "target": target_expanded,
+            "dedup_enabled": dedup,
+            "namespace_prefix": namespace_prefix,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        eprintln!(
+            "=== MERGE {} ===\n",
+            if dry_run { "PREVIEW" } else { "COMPLETE" }
+        );
+        eprintln!("  Sources processed: {}", stats.sources_processed);
+        eprintln!("  Total documents:   {}", stats.total_docs);
+        eprintln!("  Documents copied:  {}", stats.docs_copied);
+        if dedup && stats.docs_skipped > 0 {
+            eprintln!("  Skipped (dedup):   {}", stats.docs_skipped);
+        }
+        eprintln!("  Namespaces:        {}", stats.namespaces.len());
+        if stats.errors > 0 {
+            eprintln!("  Errors:            {}", stats.errors);
+        }
+        eprintln!("  Target database:   {}", target_expanded);
+
+        if dry_run {
+            eprintln!("\n[DRY RUN - run without --dry-run to apply changes]");
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -2436,14 +3853,15 @@ async fn main() -> Result<()> {
             namespace,
             output,
             include_embeddings,
+            db_path: cmd_db_path,
         }) => {
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
             if let Some(ref path) = config_path {
                 eprintln!("Using config: {}", path);
             }
 
-            let db_path = cli
-                .db_path
+            let db_path = cmd_db_path
+                .or(cli.db_path)
                 .or(file_cfg.db_path)
                 .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
@@ -2625,6 +4043,150 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&stats)?);
 
             Ok(())
+        }
+        Some(Commands::Gc {
+            remove_orphans,
+            remove_empty,
+            older_than,
+            execute,
+            namespace,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            // Validate that at least one operation is requested
+            if !remove_orphans && !remove_empty && older_than.is_none() {
+                return Err(anyhow::anyhow!(
+                    "No GC operation specified. Use --remove-orphans, --remove-empty, or --older-than <duration>"
+                ));
+            }
+
+            // Parse older_than duration if provided
+            let older_than_duration = if let Some(dur_str) = older_than {
+                Some(rmcp_memex::parse_duration_string(&dur_str)?)
+            } else {
+                None
+            };
+
+            // Build GC config
+            let gc_config = rmcp_memex::GcConfig {
+                remove_orphans,
+                remove_empty,
+                older_than: older_than_duration,
+                dry_run: !execute,
+                namespace,
+            };
+
+            run_gc(gc_config, db_path, json).await
+        }
+        Some(Commands::CrossSearch {
+            query,
+            limit,
+            total_limit,
+            mode,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_cross_search(
+                query,
+                limit,
+                total_limit,
+                mode,
+                json,
+                db_path,
+                &embedding_config,
+            )
+            .await
+        }
+        Some(Commands::Merge {
+            source,
+            target,
+            dedup,
+            namespace_prefix,
+            dry_run,
+            json,
+        }) => run_merge(source, target, dedup, namespace_prefix, dry_run, json).await,
+        Some(Commands::Dedup {
+            namespace,
+            dry_run,
+            keep,
+            cross_namespace,
+            json,
+        }) => {
+            let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_dedup(
+                namespace,
+                dry_run,
+                KeepStrategy::from_str(&keep),
+                cross_namespace,
+                json,
+                db_path,
+            )
+            .await
+        }
+        Some(Commands::MigrateNamespace {
+            from,
+            to,
+            merge,
+            delete_source,
+            dry_run,
+            json,
+        }) => {
+            let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+
+            run_migrate_namespace(from, to, db_path, merge, delete_source, dry_run, json).await
+        }
+        Some(Commands::Import {
+            namespace,
+            input,
+            skip_existing,
+            db_path: cmd_db_path,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cmd_db_path
+                .or(cli.db_path)
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_import(namespace, input, skip_existing, db_path, &embedding_config).await
         }
         Some(Commands::Serve) | None => {
             // Run MCP server (and optionally HTTP/SSE server)

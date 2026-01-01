@@ -892,6 +892,39 @@ impl StorageManager {
         let count = table.count_rows(Some(filter)).await?;
         Ok(count)
     }
+
+    /// Get all documents from a namespace (for migration/export)
+    ///
+    /// Note: This uses a full table scan with namespace filter.
+    /// For very large namespaces, consider batching.
+    pub async fn get_all_in_namespace(&self, namespace: &str) -> Result<Vec<ChromaDocument>> {
+        let table = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]), // Table doesn't exist
+        };
+
+        let filter = self.namespace_filter(namespace);
+        let mut stream = table.query().only_if(filter.as_str()).execute().await?;
+
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            let mut docs = self.batch_to_docs(&batch)?;
+            results.append(&mut docs);
+        }
+
+        debug!(
+            "Retrieved {} documents from namespace '{}'",
+            results.len(),
+            namespace
+        );
+        Ok(results)
+    }
+
+    /// Check if a namespace exists (has any documents)
+    pub async fn namespace_exists(&self, namespace: &str) -> Result<bool> {
+        let count = self.count_namespace(namespace).await?;
+        Ok(count > 0)
+    }
 }
 
 /// Statistics about the LanceDB table
@@ -901,4 +934,310 @@ pub struct TableStats {
     pub version_count: usize,
     pub table_name: String,
     pub db_path: String,
+}
+
+// =============================================================================
+// GARBAGE COLLECTION
+// =============================================================================
+
+/// Statistics from garbage collection operations
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GcStats {
+    /// Number of orphan embeddings found (embeddings without valid parent references)
+    pub orphans_found: usize,
+    /// Number of orphan embeddings removed
+    pub orphans_removed: usize,
+    /// Number of empty namespaces found
+    pub empty_namespaces_found: usize,
+    /// Number of empty namespaces removed (documents deleted)
+    pub empty_namespaces_removed: usize,
+    /// Number of old documents found (older than threshold)
+    pub old_docs_found: usize,
+    /// Number of old documents removed
+    pub old_docs_removed: usize,
+    /// Estimated space freed in bytes (if calculable)
+    pub bytes_freed: Option<u64>,
+    /// List of namespaces that were empty
+    pub empty_namespace_names: Vec<String>,
+    /// List of namespaces affected by old doc cleanup
+    pub affected_namespaces: Vec<String>,
+}
+
+impl GcStats {
+    /// Check if any issues were found
+    pub fn has_issues(&self) -> bool {
+        self.orphans_found > 0 || self.empty_namespaces_found > 0 || self.old_docs_found > 0
+    }
+
+    /// Check if any deletions occurred
+    pub fn has_deletions(&self) -> bool {
+        self.orphans_removed > 0 || self.empty_namespaces_removed > 0 || self.old_docs_removed > 0
+    }
+}
+
+/// Configuration for garbage collection
+#[derive(Debug, Clone)]
+pub struct GcConfig {
+    /// Remove orphan embeddings (embeddings with no parent document)
+    pub remove_orphans: bool,
+    /// Remove empty namespaces (namespaces with 0 documents)
+    pub remove_empty: bool,
+    /// Remove documents older than this duration
+    pub older_than: Option<chrono::Duration>,
+    /// Dry run mode - only report what would be removed
+    pub dry_run: bool,
+    /// Limit to specific namespace (None = all namespaces)
+    pub namespace: Option<String>,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            remove_orphans: false,
+            remove_empty: false,
+            older_than: None,
+            dry_run: true,
+            namespace: None,
+        }
+    }
+}
+
+/// Parse a duration string like "30d", "6m", "1y"
+pub fn parse_duration_string(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return Err(anyhow!("Empty duration string"));
+    }
+
+    // Extract numeric part and unit
+    let (num_str, unit) = if s.ends_with('d') {
+        (&s[..s.len() - 1], 'd')
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 'm')
+    } else if s.ends_with('y') {
+        (&s[..s.len() - 1], 'y')
+    } else {
+        return Err(anyhow!(
+            "Invalid duration format '{}'. Use format like '30d', '6m', or '1y'",
+            s
+        ));
+    };
+
+    let num: i64 = num_str.parse().map_err(|_| {
+        anyhow!(
+            "Invalid number in duration '{}'. Use format like '30d', '6m', or '1y'",
+            s
+        )
+    })?;
+
+    if num <= 0 {
+        return Err(anyhow!("Duration must be positive, got '{}'", s));
+    }
+
+    match unit {
+        'd' => Ok(chrono::Duration::days(num)),
+        'm' => Ok(chrono::Duration::days(num * 30)), // Approximate month
+        'y' => Ok(chrono::Duration::days(num * 365)), // Approximate year
+        _ => unreachable!(),
+    }
+}
+
+impl StorageManager {
+    // =========================================================================
+    // GARBAGE COLLECTION OPERATIONS
+    // =========================================================================
+
+    /// Run garbage collection based on configuration
+    pub async fn run_gc(&self, config: &GcConfig) -> Result<GcStats> {
+        let mut stats = GcStats::default();
+
+        // Get all documents for analysis
+        let zero_embedding = vec![0.0_f32; 4096];
+        let all_docs = self
+            .search_store(config.namespace.as_deref(), zero_embedding, 1_000_000)
+            .await?;
+
+        if all_docs.is_empty() {
+            return Ok(stats);
+        }
+
+        // Group documents by namespace
+        let mut by_namespace: std::collections::HashMap<String, Vec<&ChromaDocument>> =
+            std::collections::HashMap::new();
+        for doc in &all_docs {
+            by_namespace
+                .entry(doc.namespace.clone())
+                .or_default()
+                .push(doc);
+        }
+
+        // 1. Find orphan embeddings (documents with parent_id that doesn't exist)
+        if config.remove_orphans {
+            let orphan_stats = self
+                .find_and_remove_orphans(&all_docs, config.dry_run)
+                .await?;
+            stats.orphans_found = orphan_stats.0;
+            stats.orphans_removed = orphan_stats.1;
+        }
+
+        // 2. Find and optionally remove empty namespaces
+        if config.remove_empty {
+            let empty_stats = self
+                .find_and_remove_empty_namespaces(&by_namespace, config.dry_run)
+                .await?;
+            stats.empty_namespaces_found = empty_stats.0;
+            stats.empty_namespaces_removed = empty_stats.1;
+            stats.empty_namespace_names = empty_stats.2;
+        }
+
+        // 3. Find and optionally remove old documents
+        if let Some(ref duration) = config.older_than {
+            let old_stats = self
+                .find_and_remove_old_docs(&all_docs, duration, config.dry_run)
+                .await?;
+            stats.old_docs_found = old_stats.0;
+            stats.old_docs_removed = old_stats.1;
+            stats.affected_namespaces = old_stats.2;
+        }
+
+        Ok(stats)
+    }
+
+    /// Find orphan embeddings - documents with parent_id pointing to non-existent documents
+    async fn find_and_remove_orphans(
+        &self,
+        docs: &[ChromaDocument],
+        dry_run: bool,
+    ) -> Result<(usize, usize)> {
+        // Build a set of all document IDs
+        let all_ids: std::collections::HashSet<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+
+        // Find documents with parent_id that doesn't exist in the ID set
+        let mut orphans: Vec<(&str, &str)> = Vec::new(); // (namespace, id)
+        for doc in docs {
+            if let Some(ref parent_id) = doc.parent_id
+                && !all_ids.contains(parent_id.as_str())
+            {
+                orphans.push((&doc.namespace, &doc.id));
+            }
+        }
+
+        let found = orphans.len();
+        let mut removed = 0;
+
+        if !dry_run && !orphans.is_empty() {
+            for (namespace, id) in &orphans {
+                if self.delete_document(namespace, id).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        Ok((found, removed))
+    }
+
+    /// Find empty namespaces - this checks if namespaces have 0 documents
+    /// Note: In LanceDB, namespaces are implicit (just a column value), so "removing"
+    /// an empty namespace means there are no documents to delete
+    async fn find_and_remove_empty_namespaces(
+        &self,
+        by_namespace: &std::collections::HashMap<String, Vec<&ChromaDocument>>,
+        _dry_run: bool,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        // Find namespaces with 0 documents
+        let empty_namespaces: Vec<String> = by_namespace
+            .iter()
+            .filter(|(_, docs)| docs.is_empty())
+            .map(|(ns, _)| ns.clone())
+            .collect();
+
+        let found = empty_namespaces.len();
+        // Empty namespaces don't need deletion - they have no documents
+        // Just report them
+        let removed = 0;
+
+        Ok((found, removed, empty_namespaces))
+    }
+
+    /// Find and optionally remove documents older than the specified duration
+    async fn find_and_remove_old_docs(
+        &self,
+        docs: &[ChromaDocument],
+        older_than: &chrono::Duration,
+        dry_run: bool,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        let cutoff = chrono::Utc::now() - *older_than;
+
+        let mut old_docs: Vec<(&str, &str)> = Vec::new(); // (namespace, id)
+        let mut affected_namespaces: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for doc in docs {
+            // Check for timestamp in metadata
+            if let Some(obj) = doc.metadata.as_object() {
+                let mut doc_timestamp: Option<String> = None;
+
+                // Look for common timestamp field names
+                for key in &["timestamp", "created_at", "indexed_at", "date", "time"] {
+                    if let Some(value) = obj.get(*key)
+                        && let Some(ts) = value.as_str()
+                    {
+                        doc_timestamp = Some(ts.to_string());
+                        break;
+                    }
+                }
+
+                // Check if document is older than cutoff
+                if let Some(ts) = doc_timestamp {
+                    // Parse the timestamp - try RFC3339 first, then other formats
+                    let is_old = if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                        parsed < cutoff
+                    } else if let Ok(parsed) =
+                        chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
+                    {
+                        parsed < cutoff.naive_utc()
+                    } else if let Ok(parsed) = chrono::NaiveDate::parse_from_str(&ts, "%Y-%m-%d") {
+                        parsed < cutoff.date_naive()
+                    } else {
+                        // Can't parse timestamp, skip this document
+                        false
+                    };
+
+                    if is_old {
+                        old_docs.push((&doc.namespace, &doc.id));
+                        affected_namespaces.insert(doc.namespace.clone());
+                    }
+                }
+            }
+        }
+
+        let found = old_docs.len();
+        let mut removed = 0;
+
+        if !dry_run && !old_docs.is_empty() {
+            for (namespace, id) in &old_docs {
+                if self.delete_document(namespace, id).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        Ok((found, removed, affected_namespaces.into_iter().collect()))
+    }
+
+    /// List all unique namespaces in the database
+    pub async fn list_namespaces(&self) -> Result<Vec<(String, usize)>> {
+        let zero_embedding = vec![0.0_f32; 4096];
+        let all_docs = self.search_store(None, zero_embedding, 1_000_000).await?;
+
+        let mut namespace_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for doc in &all_docs {
+            *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+        }
+
+        let mut namespaces: Vec<(String, usize)> = namespace_counts.into_iter().collect();
+        namespaces.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(namespaces)
+    }
 }

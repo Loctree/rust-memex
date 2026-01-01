@@ -149,6 +149,57 @@ pub struct SseSearchParams {
     pub limit: usize,
 }
 
+/// Cross-search request - search across all namespaces
+#[derive(Debug, Deserialize)]
+pub struct CrossSearchRequest {
+    pub query: String,
+    /// Limit per namespace (default: 5)
+    #[serde(default = "default_cross_limit")]
+    pub limit: usize,
+    /// Total limit across all namespaces (default: 20)
+    #[serde(default = "default_total_limit")]
+    pub total_limit: usize,
+    /// Search mode: "vector", "keyword"/"bm25", "hybrid" (default: hybrid)
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_cross_limit() -> usize {
+    5
+}
+
+fn default_total_limit() -> usize {
+    20
+}
+
+fn default_mode() -> String {
+    "hybrid".to_string()
+}
+
+/// Cross-search query params for GET endpoint
+#[derive(Debug, Deserialize)]
+pub struct CrossSearchParams {
+    #[serde(rename = "q")]
+    pub query: String,
+    #[serde(default = "default_cross_limit")]
+    pub limit: usize,
+    #[serde(default = "default_total_limit")]
+    pub total_limit: usize,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+/// Cross-search response
+#[derive(Debug, Serialize)]
+pub struct CrossSearchResponse {
+    pub results: Vec<SearchResultJson>,
+    pub query: String,
+    pub mode: String,
+    pub namespaces_searched: usize,
+    pub total_results: usize,
+    pub elapsed_ms: u64,
+}
+
 /// Health check response
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -168,6 +219,8 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/health", get(health_handler))
         .route("/search", post(search_handler))
         .route("/sse/search", get(sse_search_handler))
+        .route("/cross-search", get(cross_search_handler))
+        .route("/sse/cross-search", get(sse_cross_search_handler))
         .route("/upsert", post(upsert_handler))
         .route("/index", post(index_handler))
         .route("/expand/{ns}/{id}", get(expand_handler))
@@ -283,6 +336,205 @@ async fn sse_search_handler(
                     .data(serde_json::json!({"error": e.to_string()}).to_string()));
             }
         }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// Cross-search endpoint (GET /cross-search?q=...&limit=...&total_limit=...&mode=...)
+/// Searches across ALL namespaces, merges results by score
+async fn cross_search_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<CrossSearchParams>,
+) -> Result<Json<CrossSearchResponse>, (StatusCode, String)> {
+    use std::collections::HashSet;
+
+    let start = std::time::Instant::now();
+
+    // Get all namespaces by searching with zero embedding
+    let zero_embedding = vec![0.0_f32; 4096]; // Max dimension
+    let all_docs = state
+        .rag
+        .storage()
+        .search_store(None, zero_embedding, 10000)
+        .await
+        .map_err(|e| {
+            error!("Cross-search namespace lookup error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    let mut namespace_set: HashSet<String> = HashSet::new();
+    for doc in &all_docs {
+        namespace_set.insert(doc.namespace.clone());
+    }
+
+    let namespaces: Vec<String> = namespace_set.into_iter().collect();
+    let namespaces_count = namespaces.len();
+
+    if namespaces.is_empty() {
+        return Ok(Json(CrossSearchResponse {
+            results: vec![],
+            query: params.query,
+            mode: params.mode,
+            namespaces_searched: 0,
+            total_results: 0,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }));
+    }
+
+    // Search each namespace
+    let mut all_results: Vec<(SearchResultJson, f32)> = Vec::new();
+
+    for ns in &namespaces {
+        match state
+            .rag
+            .memory_search(ns, &params.query, params.limit)
+            .await
+        {
+            Ok(results) => {
+                for r in results {
+                    let score = r.score;
+                    all_results.push((r.into(), score));
+                }
+            }
+            Err(e) => {
+                // Log but continue - don't fail entire search for one namespace
+                error!("Cross-search error in namespace '{}': {}", ns, e);
+            }
+        }
+    }
+
+    // Sort by score descending
+    all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Truncate to total_limit
+    all_results.truncate(params.total_limit);
+
+    let results: Vec<SearchResultJson> = all_results.into_iter().map(|(r, _)| r).collect();
+    let total_results = results.len();
+
+    Ok(Json(CrossSearchResponse {
+        results,
+        query: params.query,
+        mode: params.mode,
+        namespaces_searched: namespaces_count,
+        total_results,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    }))
+}
+
+/// SSE streaming cross-search endpoint (GET /sse/cross-search?q=...&limit=...&total_limit=...)
+/// Streams results as they come from each namespace
+async fn sse_cross_search_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<CrossSearchParams>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    use std::collections::HashSet;
+
+    let stream = async_stream::stream! {
+        // Send start event
+        yield Ok(Event::default()
+            .event("start")
+            .data(serde_json::json!({
+                "query": params.query,
+                "limit_per_ns": params.limit,
+                "total_limit": params.total_limit,
+                "mode": params.mode
+            }).to_string()));
+
+        // Get all namespaces
+        let zero_embedding = vec![0.0_f32; 4096];
+        let all_docs = match state.rag.storage().search_store(None, zero_embedding, 10000).await {
+            Ok(docs) => docs,
+            Err(e) => {
+                yield Ok(Event::default()
+                    .event("error")
+                    .data(serde_json::json!({"error": e.to_string()}).to_string()));
+                return;
+            }
+        };
+
+        let mut namespace_set: HashSet<String> = HashSet::new();
+        for doc in &all_docs {
+            namespace_set.insert(doc.namespace.clone());
+        }
+
+        let namespaces: Vec<String> = namespace_set.into_iter().collect();
+
+        // Send namespace info
+        yield Ok(Event::default()
+            .event("namespaces")
+            .data(serde_json::json!({
+                "count": namespaces.len(),
+                "namespaces": namespaces
+            }).to_string()));
+
+        // Collect all results with scores for final ranking
+        let mut all_results: Vec<(SearchResultJson, f32, String)> = Vec::new();
+
+        // Search each namespace and stream intermediate results
+        for ns in &namespaces {
+            yield Ok(Event::default()
+                .event("searching")
+                .data(serde_json::json!({"namespace": ns}).to_string()));
+
+            match state.rag.memory_search(ns, &params.query, params.limit).await {
+                Ok(results) => {
+                    let ns_count = results.len();
+                    for r in results {
+                        let score = r.score;
+                        let result: SearchResultJson = r.into();
+                        all_results.push((result, score, ns.clone()));
+                    }
+
+                    yield Ok(Event::default()
+                        .event("namespace_done")
+                        .data(serde_json::json!({
+                            "namespace": ns,
+                            "results_found": ns_count
+                        }).to_string()));
+                }
+                Err(e) => {
+                    yield Ok(Event::default()
+                        .event("namespace_error")
+                        .data(serde_json::json!({
+                            "namespace": ns,
+                            "error": e.to_string()
+                        }).to_string()));
+                }
+            }
+
+            // Small delay between namespaces
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Sort all results by score descending
+        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Truncate and stream final ranked results
+        all_results.truncate(params.total_limit);
+
+        for (i, (result, _score, _ns)) in all_results.iter().enumerate() {
+            if let Ok(json) = serde_json::to_string(&result) {
+                yield Ok(Event::default()
+                    .event("result")
+                    .id(i.to_string())
+                    .data(json));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        yield Ok(Event::default()
+            .event("done")
+            .data(serde_json::json!({
+                "status": "complete",
+                "total_results": all_results.len(),
+                "namespaces_searched": namespaces.len()
+            }).to_string()));
     };
 
     Sse::new(stream).keep_alive(

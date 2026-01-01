@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [0.3.4] - 2025-12-31
 
 ### Added
+- **Database Management Commands** - Full CRUD for namespaces and documents
+  - `rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged` - Merge multiple LanceDB databases with optional deduplication
+  - `rmcp-memex dedup -n memories` - Find and remove duplicate documents by content_hash
+  - `rmcp-memex migrate-namespace --from old --to new` - Move/rename namespaces with optional merge
+  - `rmcp-memex import -n memories -i backup.jsonl` - Import documents from JSONL with optional re-embedding
+  - `rmcp-memex export -n memories -o backup.jsonl` - Export namespace to portable JSONL format
+  - `rmcp-memex gc --older-than 30d` - Garbage collection for orphans, empty namespaces, old docs
+  - `rmcp-memex cross-search -q "query"` - Search across all namespaces at once
 - **HTTP/SSE Server** - Multi-agent access without LanceDB lock conflicts
   - `--http-port 6660` flag to start HTTP server alongside MCP stdio
   - `--http-only` flag for daemon mode (HTTP only, no MCP stdio)

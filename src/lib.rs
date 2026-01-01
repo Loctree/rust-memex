@@ -63,7 +63,9 @@ pub use search::{
     StemLanguage,
 };
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
-pub use storage::{ChromaDocument, StorageManager, TableStats};
+pub use storage::{
+    ChromaDocument, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+};
 
 // High-level engine API
 pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
