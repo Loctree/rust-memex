@@ -18,8 +18,13 @@
 //! - GET  /parent/:ns/:id   - Get parent slice (drill up)
 //! - DELETE /ns/:namespace  - Purge namespace
 //!
+//! MCP-over-SSE endpoints (for Claude Code compatibility):
+//! - GET  /mcp/             - SSE stream for MCP messages (sends endpoint event)
+//! - POST /mcp/messages/    - JSON-RPC POST endpoint with session_id
+//!
 //! Created by M&K (c)2025 The LibraxisAI Team
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,15 +40,79 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
+
+/// MCP session for SSE connections
+pub struct McpSession {
+    /// Session ID
+    pub id: String,
+    /// Channel to send responses back to SSE stream
+    pub tx: broadcast::Sender<serde_json::Value>,
+    /// Created timestamp
+    pub created: std::time::Instant,
+}
+
+/// MCP session manager
+pub struct McpSessionManager {
+    sessions: RwLock<HashMap<String, Arc<McpSession>>>,
+}
+
+impl McpSessionManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Create new session and return session ID
+    pub async fn create_session(&self) -> (String, broadcast::Receiver<serde_json::Value>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = broadcast::channel(64);
+        let session = Arc::new(McpSession {
+            id: id.clone(),
+            tx,
+            created: std::time::Instant::now(),
+        });
+        self.sessions.write().await.insert(id.clone(), session);
+        (id, rx)
+    }
+
+    /// Get session by ID
+    pub async fn get_session(&self, id: &str) -> Option<Arc<McpSession>> {
+        self.sessions.read().await.get(id).cloned()
+    }
+
+    /// Remove session
+    pub async fn remove_session(&self, id: &str) {
+        self.sessions.write().await.remove(id);
+    }
+
+    /// Cleanup old sessions (older than 1 hour)
+    pub async fn cleanup_old_sessions(&self) {
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, s| s.created.elapsed() < Duration::from_secs(3600));
+    }
+}
+
+impl Default for McpSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared state for HTTP handlers - uses RAGPipeline like MCPServer
 #[derive(Clone)]
 pub struct HttpState {
     pub rag: Arc<RAGPipeline>,
+    /// MCP session manager for SSE transport
+    pub mcp_sessions: Arc<McpSessionManager>,
+    /// Base URL for MCP messages endpoint (set at startup)
+    pub mcp_base_url: Arc<RwLock<String>>,
 }
 
 /// Search request body
@@ -228,6 +297,12 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/get/{ns}/{id}", get(get_handler))
         .route("/delete/{ns}/{id}", post(delete_handler))
         .route("/ns/{namespace}", delete(purge_namespace_handler))
+        // MCP-over-SSE endpoints for Claude Code compatibility
+        .route("/mcp/", get(mcp_sse_handler))
+        .route("/mcp/messages/", post(mcp_messages_handler))
+        // Also support /sse/ path for FastMCP compatibility
+        .route("/sse/", get(mcp_sse_handler))
+        .route("/messages/", post(mcp_messages_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -717,14 +792,370 @@ async fn purge_namespace_handler(
     }
 }
 
+// ============================================================================
+// MCP-over-SSE Transport Handlers
+// ============================================================================
+
+/// Query params for MCP messages endpoint
+#[derive(Debug, Deserialize)]
+pub struct McpMessagesParams {
+    pub session_id: Option<String>,
+}
+
+/// MCP SSE endpoint - GET /sse/ or /mcp/
+/// Creates a new session and sends the endpoint URL for messages
+async fn mcp_sse_handler(
+    State(state): State<HttpState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    // Create a new session
+    let (session_id, mut rx) = state.mcp_sessions.create_session().await;
+    let base_url = state.mcp_base_url.read().await.clone();
+
+    info!("MCP SSE: New session {}", session_id);
+
+    let stream = async_stream::stream! {
+        // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)
+        let endpoint_url = format!("{}/messages/?session_id={}", base_url, session_id);
+        yield Ok(Event::default()
+            .event("endpoint")
+            .data(endpoint_url));
+
+        // Keep connection alive and forward responses from the session
+        loop {
+            tokio::select! {
+                // Receive responses from session channel
+                result = rx.recv() => {
+                    match result {
+                        Ok(response) => {
+                            if let Ok(json_str) = serde_json::to_string(&response) {
+                                yield Ok(Event::default()
+                                    .event("message")
+                                    .data(json_str));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            debug!("MCP SSE: Session {} channel closed", session_id);
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("MCP SSE: Session {} lagged {} messages", session_id, n);
+                        }
+                    }
+                }
+                // Keep-alive ping every 30 seconds
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // SSE keepalive is handled by axum's KeepAlive
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// MCP Messages endpoint - POST /messages/?session_id=xxx
+/// Receives JSON-RPC requests and sends responses via SSE
+async fn mcp_messages_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<McpMessagesParams>,
+    body: String,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = params.session_id.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "session_id is required".to_string())
+    })?;
+
+    // Get the session
+    let session = state.mcp_sessions.get_session(&session_id).await.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, format!("Session {} not found", session_id))
+    })?;
+
+    // Parse the JSON-RPC request
+    let request: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
+    })?;
+
+    debug!("MCP: session={} method={}", session_id, request["method"]);
+
+    // Handle the request (inline MCP protocol handling)
+    let response = handle_mcp_request(&state.rag, request).await;
+
+    // Send response via SSE channel
+    if let Err(e) = session.tx.send(response.clone()) {
+        warn!("MCP: Failed to send response to session {}: {}", session_id, e);
+    }
+
+    // Also return response directly (some clients expect this)
+    Ok(Json(response))
+}
+
+/// Handle MCP JSON-RPC request
+/// Implements core MCP protocol methods using RAGPipeline
+async fn handle_mcp_request(rag: &Arc<RAGPipeline>, request: serde_json::Value) -> serde_json::Value {
+    let method = request["method"].as_str().unwrap_or("");
+    let id = request["id"].clone();
+
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {
+                "name": "rmcp-memex",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "tools": {}
+            }
+        }),
+
+        "notifications/initialized" => {
+            // Client acknowledged initialization - no response needed
+            return json!({});
+        }
+
+        "tools/list" => json!({
+            "tools": [
+                {
+                    "name": "health",
+                    "description": "Health/status of rmcp-memex server",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "name": "rag_index_text",
+                    "description": "Index raw text for RAG/memory",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "id": {"type": "string"},
+                            "namespace": {"type": "string"},
+                            "metadata": {"type": "object"}
+                        },
+                        "required": ["text"]
+                    }
+                },
+                {
+                    "name": "rag_search",
+                    "description": "Search documents using RAG",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "k": {"type": "integer", "default": 10},
+                            "namespace": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "memory_upsert",
+                    "description": "Upsert a text chunk into vector memory",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": {"type": "string"},
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "metadata": {"type": "object"}
+                        },
+                        "required": ["namespace", "id", "text"]
+                    }
+                },
+                {
+                    "name": "memory_search",
+                    "description": "Semantic search within a namespace",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": {"type": "string"},
+                            "query": {"type": "string"},
+                            "k": {"type": "integer", "default": 5}
+                        },
+                        "required": ["namespace", "query"]
+                    }
+                },
+                {
+                    "name": "memory_get",
+                    "description": "Get a stored chunk by namespace + id",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": {"type": "string"},
+                            "id": {"type": "string"}
+                        },
+                        "required": ["namespace", "id"]
+                    }
+                },
+                {
+                    "name": "memory_delete",
+                    "description": "Delete a chunk by namespace + id",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": {"type": "string"},
+                            "id": {"type": "string"}
+                        },
+                        "required": ["namespace", "id"]
+                    }
+                }
+            ]
+        }),
+
+        "tools/call" => {
+            let tool_name = request["params"]["name"].as_str().unwrap_or("");
+            let args = &request["params"]["arguments"];
+
+            match tool_name {
+                "health" => {
+                    let status = json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "db_path": rag.storage().lance_path(),
+                        "backend": "mlx",
+                        "transport": "mcp-over-sse"
+                    });
+                    json!({
+                        "content": [{"type": "text", "text": serde_json::to_string(&status).unwrap_or_default()}]
+                    })
+                }
+                "rag_index_text" => {
+                    let text = args["text"].as_str().unwrap_or("").to_string();
+                    let namespace = args["namespace"].as_str();
+                    let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+                    let id = args.get("id")
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                    match rag.index_text(namespace, id.clone(), text, metadata).await {
+                        Ok(returned_id) => json!({
+                            "content": [{"type": "text", "text": format!("Indexed text with id {}", returned_id)}]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                "rag_search" => {
+                    let query = args["query"].as_str().unwrap_or("");
+                    let k = args["k"].as_u64().unwrap_or(10) as usize;
+                    let namespace = args["namespace"].as_str();
+
+                    match rag.search_inner(namespace, query, k).await {
+                        Ok(results) => json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string(&results).unwrap_or_default()
+                            }]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                "memory_upsert" => {
+                    let namespace = args["namespace"].as_str().unwrap_or("default");
+                    let id_str = args["id"].as_str().unwrap_or("").to_string();
+                    let text = args["text"].as_str().unwrap_or("").to_string();
+                    let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
+
+                    match rag.memory_upsert(namespace, id_str.clone(), text, metadata).await {
+                        Ok(_) => json!({
+                            "content": [{"type": "text", "text": format!("Upserted {}", id_str)}]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                "memory_search" => {
+                    let namespace = args["namespace"].as_str().unwrap_or("default");
+                    let query = args["query"].as_str().unwrap_or("");
+                    let k = args["k"].as_u64().unwrap_or(5) as usize;
+
+                    match rag.memory_search(namespace, query, k).await {
+                        Ok(results) => json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string(&results).unwrap_or_default()
+                            }]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                "memory_get" => {
+                    let namespace = args["namespace"].as_str().unwrap_or("default");
+                    let id_str = args["id"].as_str().unwrap_or("");
+                    match rag.memory_get(namespace, id_str).await {
+                        Ok(Some(doc)) => json!({
+                            "content": [{"type": "text", "text": serde_json::to_string(&doc).unwrap_or_default()}]
+                        }),
+                        Ok(None) => json!({
+                            "content": [{"type": "text", "text": "Not found"}]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                "memory_delete" => {
+                    let namespace = args["namespace"].as_str().unwrap_or("default");
+                    let id_str = args["id"].as_str().unwrap_or("");
+                    match rag.memory_delete(namespace, id_str).await {
+                        Ok(deleted) => json!({
+                            "content": [{"type": "text", "text": format!("Deleted {} rows", deleted)}]
+                        }),
+                        Err(e) => json!({
+                            "error": {"message": e.to_string()}
+                        }),
+                    }
+                }
+                _ => {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32601, "message": format!("Unknown tool: {}", tool_name)},
+                        "id": id
+                    });
+                }
+            }
+        }
+
+        _ => {
+            return json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": format!("Unknown method: {}", method)},
+                "id": id
+            });
+        }
+    };
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
 /// Start the HTTP server with shared RAGPipeline
 pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()> {
-    let state = HttpState { rag };
+    let base_url = format!("http://localhost:{}", port);
+    let state = HttpState {
+        rag,
+        mcp_sessions: Arc::new(McpSessionManager::new()),
+        mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
+    };
     let app = create_router(state);
 
     let addr = format!("0.0.0.0:{}", port);
-    info!("🚀 HTTP/SSE server starting on http://{}", addr);
-    info!("   Endpoints: /search, /sse/search, /upsert, /expand, /parent");
+    info!("HTTP/SSE server starting on http://{}", addr);
+    info!("  REST endpoints: /search, /sse/search, /upsert, /expand, /parent");
+    info!("  MCP-SSE endpoints: /sse/, /messages/");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

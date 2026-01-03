@@ -4200,7 +4200,12 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            let config = cli.into_server_config()?;
+            let mut config = cli.into_server_config()?;
+
+            // HTTP-only mode uses read-only BM25 (no lock contention for multi-agent access)
+            if http_only {
+                config.hybrid.bm25.read_only = true;
+            }
 
             // Send logs to stderr to keep stdout clean for JSON-RPC.
             let subscriber = FmtSubscriber::builder()

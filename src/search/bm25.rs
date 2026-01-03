@@ -64,6 +64,10 @@ pub struct BM25Config {
     /// Language for stemming
     #[serde(default)]
     pub language: StemLanguage,
+    /// Read-only mode - no IndexWriter, no lock contention
+    /// Use for multi-agent read access (HTTP server, multiple Claude instances)
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 fn default_bm25_path() -> String {
@@ -85,6 +89,7 @@ impl Default for BM25Config {
             writer_heap_size: default_heap_size(),
             enable_stemming: true,
             language: StemLanguage::English,
+            read_only: false,
         }
     }
 }
@@ -99,8 +104,21 @@ impl BM25Config {
         }
     }
 
+    /// Create read-only config (no lock contention, for multi-agent access)
+    pub fn read_only() -> Self {
+        Self {
+            read_only: true,
+            ..Self::default()
+        }
+    }
+
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.index_path = path.into();
+        self
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 }
@@ -109,10 +127,12 @@ impl BM25Config {
 pub struct BM25Index {
     index: Index,
     reader: IndexReader,
-    writer: Arc<Mutex<IndexWriter>>,
+    /// Writer is None in read-only mode (no lock contention)
+    writer: Option<Arc<Mutex<IndexWriter>>>,
     content_field: Field,
     id_field: Field,
     namespace_field: Field,
+    read_only: bool,
 }
 
 impl BM25Index {
@@ -175,24 +195,46 @@ impl BM25Index {
         index.tokenizers().register("custom_tokenizer", tokenizer);
 
         let reader = index.reader()?;
-        let writer = index.writer(config.writer_heap_size)?;
+
+        // Only create writer if not in read-only mode
+        // This avoids lock contention for multi-agent read access
+        let writer = if config.read_only {
+            tracing::info!("BM25 index opened in READ-ONLY mode (no lock)");
+            None
+        } else {
+            tracing::debug!("BM25 index opened with writer (exclusive lock)");
+            Some(Arc::new(Mutex::new(index.writer(config.writer_heap_size)?)))
+        };
 
         Ok(Self {
             index,
             reader,
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
             content_field,
             id_field,
             namespace_field,
+            read_only: config.read_only,
         })
+    }
+
+    /// Check if index is in read-only mode
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Add documents to the BM25 index
     ///
     /// # Arguments
     /// * `docs` - List of (id, namespace, content) tuples
+    ///
+    /// # Errors
+    /// Returns error if index is in read-only mode
     pub async fn add_documents(&self, docs: &[(String, String, String)]) -> Result<()> {
-        let mut writer = self.writer.lock().await;
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            anyhow!("Cannot add documents: BM25 index is in read-only mode")
+        })?;
+
+        let mut writer = writer.lock().await;
 
         for (id, namespace, content) in docs {
             let mut doc = TantivyDocument::new();
@@ -273,8 +315,15 @@ impl BM25Index {
     }
 
     /// Delete documents by ID
+    ///
+    /// # Errors
+    /// Returns error if index is in read-only mode
     pub async fn delete_documents(&self, ids: &[String]) -> Result<usize> {
-        let mut writer = self.writer.lock().await;
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            anyhow!("Cannot delete documents: BM25 index is in read-only mode")
+        })?;
+
+        let mut writer = writer.lock().await;
         let mut deleted = 0;
 
         for id in ids {
@@ -291,8 +340,15 @@ impl BM25Index {
     }
 
     /// Delete all documents in a namespace
+    ///
+    /// # Errors
+    /// Returns error if index is in read-only mode
     pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        let mut writer = self.writer.lock().await;
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            anyhow!("Cannot purge namespace: BM25 index is in read-only mode")
+        })?;
+
+        let mut writer = writer.lock().await;
 
         let term = tantivy::Term::from_field_text(self.namespace_field, namespace);
         writer.delete_term(term);
