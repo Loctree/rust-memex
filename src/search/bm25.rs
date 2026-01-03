@@ -230,9 +230,10 @@ impl BM25Index {
     /// # Errors
     /// Returns error if index is in read-only mode
     pub async fn add_documents(&self, docs: &[(String, String, String)]) -> Result<()> {
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            anyhow!("Cannot add documents: BM25 index is in read-only mode")
-        })?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| anyhow!("Cannot add documents: BM25 index is in read-only mode"))?;
 
         let mut writer = writer.lock().await;
 
@@ -319,9 +320,10 @@ impl BM25Index {
     /// # Errors
     /// Returns error if index is in read-only mode
     pub async fn delete_documents(&self, ids: &[String]) -> Result<usize> {
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            anyhow!("Cannot delete documents: BM25 index is in read-only mode")
-        })?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| anyhow!("Cannot delete documents: BM25 index is in read-only mode"))?;
 
         let mut writer = writer.lock().await;
         let mut deleted = 0;
@@ -344,9 +346,10 @@ impl BM25Index {
     /// # Errors
     /// Returns error if index is in read-only mode
     pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            anyhow!("Cannot purge namespace: BM25 index is in read-only mode")
-        })?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| anyhow!("Cannot purge namespace: BM25 index is in read-only mode"))?;
 
         let mut writer = writer.lock().await;
 

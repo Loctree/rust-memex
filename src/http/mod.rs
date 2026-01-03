@@ -41,7 +41,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -318,9 +318,14 @@ async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 /// Refresh endpoint - clears LanceDB cache to see new data from other processes
-async fn refresh_handler(State(state): State<HttpState>) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn refresh_handler(
+    State(state): State<HttpState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     state.rag.refresh().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Refresh failed: {}", e))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Refresh failed: {}", e),
+        )
     })?;
 
     Ok(Json(serde_json::json!({
@@ -879,18 +884,27 @@ async fn mcp_messages_handler(
     body: String,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let session_id = params.session_id.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "session_id is required".to_string())
+        (
+            StatusCode::BAD_REQUEST,
+            "session_id is required".to_string(),
+        )
     })?;
 
     // Get the session
-    let session = state.mcp_sessions.get_session(&session_id).await.ok_or_else(|| {
-        (StatusCode::NOT_FOUND, format!("Session {} not found", session_id))
-    })?;
+    let session = state
+        .mcp_sessions
+        .get_session(&session_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Session {} not found", session_id),
+            )
+        })?;
 
     // Parse the JSON-RPC request
-    let request: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-    })?;
+    let request: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
 
     debug!("MCP: session={} method={}", session_id, request["method"]);
 
@@ -899,8 +913,14 @@ async fn mcp_messages_handler(
 
     // Send response via SSE channel only (MCP-over-SSE protocol)
     if let Err(e) = session.tx.send(response) {
-        warn!("MCP: Failed to send response to session {}: {}", session_id, e);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to send response".to_string()));
+        warn!(
+            "MCP: Failed to send response to session {}: {}",
+            session_id, e
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to send response".to_string(),
+        ));
     }
 
     // Return 202 Accepted - actual response goes via SSE stream
@@ -909,7 +929,10 @@ async fn mcp_messages_handler(
 
 /// Handle MCP JSON-RPC request
 /// Implements core MCP protocol methods using RAGPipeline
-async fn handle_mcp_request(rag: &Arc<RAGPipeline>, request: serde_json::Value) -> serde_json::Value {
+async fn handle_mcp_request(
+    rag: &Arc<RAGPipeline>,
+    request: serde_json::Value,
+) -> serde_json::Value {
     let method = request["method"].as_str().unwrap_or("");
     let id = request["id"].clone();
 
@@ -1042,7 +1065,8 @@ async fn handle_mcp_request(rag: &Arc<RAGPipeline>, request: serde_json::Value) 
                     let text = args["text"].as_str().unwrap_or("").to_string();
                     let namespace = args["namespace"].as_str();
                     let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
-                    let id = args.get("id")
+                    let id = args
+                        .get("id")
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -1078,7 +1102,10 @@ async fn handle_mcp_request(rag: &Arc<RAGPipeline>, request: serde_json::Value) 
                     let text = args["text"].as_str().unwrap_or("").to_string();
                     let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
 
-                    match rag.memory_upsert(namespace, id_str.clone(), text, metadata).await {
+                    match rag
+                        .memory_upsert(namespace, id_str.clone(), text, metadata)
+                        .await
+                    {
                         Ok(_) => json!({
                             "content": [{"type": "text", "text": format!("Upserted {}", id_str)}]
                         }),
