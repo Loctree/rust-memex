@@ -11,7 +11,7 @@ use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
+    BM25Config, EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
     IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
     QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig,
     SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, run_wizard,
@@ -1193,9 +1193,13 @@ async fn run_search(
 
     // Use hybrid search if mode is not pure vector
     if search_mode != SearchMode::Vector {
-        // Create hybrid config with specified mode
+        // Create hybrid config with specified mode (read-only for CLI to avoid lock conflicts)
         let hybrid_config = HybridConfig {
             mode: search_mode,
+            bm25: BM25Config {
+                read_only: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let hybrid_searcher = HybridSearcher::new(storage, hybrid_config).await?;
@@ -1514,9 +1518,13 @@ async fn run_cross_search(
         _ => SearchMode::Hybrid,
     };
 
-    // Create hybrid config with the specified mode
+    // Create hybrid config with the specified mode (read-only for CLI)
     let hybrid_config = HybridConfig {
         mode: search_mode,
+        bm25: BM25Config {
+            read_only: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
