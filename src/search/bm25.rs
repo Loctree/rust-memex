@@ -3,12 +3,16 @@
 //! Provides exact keyword matching to complement vector similarity search.
 //! This helps distinguish between semantically similar but distinct terms
 //! like "smutny" (sad) and "melancholijny" (melancholic).
+//!
+//! Lock strategy: On-demand IndexWriter acquisition/release per write batch.
+//! This allows multiple processes to write sequentially without permanent lock holding.
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::{
-    Index, IndexReader, IndexWriter, TantivyDocument,
+    Index, IndexReader, TantivyDocument,
     collector::TopDocs,
     query::QueryParser,
     schema::{
@@ -64,8 +68,8 @@ pub struct BM25Config {
     /// Language for stemming
     #[serde(default)]
     pub language: StemLanguage,
-    /// Read-only mode - no IndexWriter, no lock contention
-    /// Use for multi-agent read access (HTTP server, multiple Claude instances)
+    /// Read-only mode - disables write operations entirely
+    /// Use for dedicated read-only instances
     #[serde(default)]
     pub read_only: bool,
 }
@@ -104,7 +108,7 @@ impl BM25Config {
         }
     }
 
-    /// Create read-only config (no lock contention, for multi-agent access)
+    /// Create read-only config (disables write operations)
     pub fn read_only() -> Self {
         Self {
             read_only: true,
@@ -124,15 +128,24 @@ impl BM25Config {
 }
 
 /// BM25 keyword search index using Tantivy
+///
+/// Uses on-demand IndexWriter acquisition: lock acquired only during writes,
+/// released immediately after commit. This allows multiple processes to write
+/// sequentially without permanent lock holding.
 pub struct BM25Index {
     index: Index,
     reader: IndexReader,
-    /// Writer is None in read-only mode (no lock contention)
-    writer: Option<Arc<Mutex<IndexWriter>>>,
     content_field: Field,
     id_field: Field,
     namespace_field: Field,
+    /// Heap size for writer (used when acquiring on-demand)
+    writer_heap_size: usize,
+    /// Read-only mode flag
     read_only: bool,
+    /// Mutex to serialize write operations within this process
+    write_lock: Arc<Mutex<()>>,
+    /// Index path for error messages
+    index_path: PathBuf,
 }
 
 impl BM25Index {
@@ -165,9 +178,9 @@ impl BM25Index {
 
         // Open or create index
         let index = if path.join("meta.json").exists() {
-            Index::open_in_dir(path)?
+            Index::open_in_dir(&path)?
         } else {
-            Index::create_in_dir(path, schema.clone())?
+            Index::create_in_dir(&path, schema.clone())?
         };
 
         // Register custom tokenizer with optional stemming
@@ -196,24 +209,22 @@ impl BM25Index {
 
         let reader = index.reader()?;
 
-        // Only create writer if not in read-only mode
-        // This avoids lock contention for multi-agent read access
-        let writer = if config.read_only {
-            tracing::info!("BM25 index opened in READ-ONLY mode (no lock)");
-            None
+        if config.read_only {
+            tracing::info!("BM25 index opened in READ-ONLY mode");
         } else {
-            tracing::debug!("BM25 index opened with writer (exclusive lock)");
-            Some(Arc::new(Mutex::new(index.writer(config.writer_heap_size)?)))
-        };
+            tracing::debug!("BM25 index opened (on-demand lock acquisition for writes)");
+        }
 
         Ok(Self {
             index,
             reader,
-            writer,
             content_field,
             id_field,
             namespace_field,
+            writer_heap_size: config.writer_heap_size,
             read_only: config.read_only,
+            write_lock: Arc::new(Mutex::new(())),
+            index_path: path,
         })
     }
 
@@ -222,33 +233,106 @@ impl BM25Index {
         self.read_only
     }
 
+    /// Acquire IndexWriter, perform write operation, release lock
+    ///
+    /// This is the core pattern: acquire lock -> write -> commit -> drop (release)
+    /// Includes retry with exponential backoff for lock contention.
+    async fn with_writer<F, T>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(&mut tantivy::IndexWriter) -> Result<T>,
+    {
+        if self.read_only {
+            return Err(anyhow!("Cannot write: BM25 index is in read-only mode"));
+        }
+
+        // Serialize writes within this process
+        let _guard = self.write_lock.lock().await;
+
+        // Retry with exponential backoff for cross-process lock contention
+        const MAX_RETRIES: u32 = 5;
+        const INITIAL_BACKOFF_MS: u64 = 50;
+        const MAX_BACKOFF_MS: u64 = 2000;
+
+        let mut attempt = 0;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+        let mut writer = loop {
+            match self.index.writer(self.writer_heap_size) {
+                Ok(w) => break w,
+                Err(e) => {
+                    let is_lock_busy = e.to_string().contains("LockBusy");
+
+                    if is_lock_busy && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(
+                            "BM25 lock busy, retry {}/{} in {}ms. Path: {:?}",
+                            attempt,
+                            MAX_RETRIES,
+                            backoff_ms,
+                            self.index_path
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                    } else if is_lock_busy {
+                        return Err(anyhow!(
+                            "BM25 index locked after {} retries. Path: {:?}. \
+                             Multiple processes writing simultaneously - try again.",
+                            MAX_RETRIES,
+                            self.index_path
+                        ));
+                    } else {
+                        return Err(anyhow!("Failed to acquire BM25 writer: {}", e));
+                    }
+                }
+            }
+        };
+
+        // Perform the write operation
+        let result = operation(&mut writer)?;
+
+        // Commit changes
+        writer.commit()?;
+
+        // Writer dropped here -> Tantivy lock released
+        drop(writer);
+
+        // Reload reader to see new data
+        self.reader.reload()?;
+
+        Ok(result)
+    }
+
     /// Add documents to the BM25 index
+    ///
+    /// Lock is acquired only for the duration of this operation.
     ///
     /// # Arguments
     /// * `docs` - List of (id, namespace, content) tuples
     ///
     /// # Errors
-    /// Returns error if index is in read-only mode
+    /// Returns error if index is in read-only mode or another process holds the lock
     pub async fn add_documents(&self, docs: &[(String, String, String)]) -> Result<()> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| anyhow!("Cannot add documents: BM25 index is in read-only mode"))?;
+        let content_field = self.content_field;
+        let id_field = self.id_field;
+        let namespace_field = self.namespace_field;
+        let doc_count = docs.len();
 
-        let mut writer = writer.lock().await;
+        // Clone docs for the closure (needed because closure must be 'static for FnOnce)
+        let docs = docs.to_vec();
 
-        for (id, namespace, content) in docs {
-            let mut doc = TantivyDocument::new();
-            doc.add_text(self.content_field, content);
-            doc.add_text(self.id_field, id);
-            doc.add_text(self.namespace_field, namespace);
-            writer.add_document(doc)?;
-        }
+        self.with_writer(move |writer| {
+            for (id, namespace, content) in &docs {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(content_field, content);
+                doc.add_text(id_field, id);
+                doc.add_text(namespace_field, namespace);
+                writer.add_document(doc)?;
+            }
+            Ok(())
+        })
+        .await?;
 
-        writer.commit()?;
-        self.reader.reload()?;
-
-        tracing::debug!("Added {} documents to BM25 index", docs.len());
+        tracing::debug!("Added {} documents to BM25 index", doc_count);
         Ok(())
     }
 
@@ -317,49 +401,45 @@ impl BM25Index {
 
     /// Delete documents by ID
     ///
+    /// Lock is acquired only for the duration of this operation.
+    ///
     /// # Errors
-    /// Returns error if index is in read-only mode
+    /// Returns error if index is in read-only mode or another process holds the lock
     pub async fn delete_documents(&self, ids: &[String]) -> Result<usize> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| anyhow!("Cannot delete documents: BM25 index is in read-only mode"))?;
+        let id_field = self.id_field;
+        let ids = ids.to_vec();
+        let count = ids.len();
 
-        let mut writer = writer.lock().await;
-        let mut deleted = 0;
-
-        for id in ids {
-            // Delete by term query on id field
-            let term = tantivy::Term::from_field_text(self.id_field, id);
-            writer.delete_term(term);
-            deleted += 1;
-        }
-
-        writer.commit()?;
-        self.reader.reload()?;
-
-        Ok(deleted)
+        self.with_writer(move |writer| {
+            for id in &ids {
+                let term = tantivy::Term::from_field_text(id_field, id);
+                writer.delete_term(term);
+            }
+            Ok(count)
+        })
+        .await
     }
 
     /// Delete all documents in a namespace
     ///
+    /// Lock is acquired only for the duration of this operation.
+    ///
     /// # Errors
-    /// Returns error if index is in read-only mode
+    /// Returns error if index is in read-only mode or another process holds the lock
     pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| anyhow!("Cannot purge namespace: BM25 index is in read-only mode"))?;
+        let namespace_field = self.namespace_field;
+        let namespace_owned = namespace.to_string();
+        let namespace_log = namespace.to_string();
 
-        let mut writer = writer.lock().await;
+        self.with_writer(move |writer| {
+            let term = tantivy::Term::from_field_text(namespace_field, &namespace_owned);
+            writer.delete_term(term);
+            Ok(1) // Tantivy doesn't return exact count for term deletes
+        })
+        .await?;
 
-        let term = tantivy::Term::from_field_text(self.namespace_field, namespace);
-        writer.delete_term(term);
-        writer.commit()?;
-        self.reader.reload()?;
-
-        tracing::info!("Purged namespace '{}' from BM25 index", namespace);
-        Ok(1) // Tantivy doesn't return exact count for term deletes
+        tracing::info!("Purged namespace '{}' from BM25 index", namespace_log);
+        Ok(1)
     }
 
     /// Escape special query characters
@@ -456,6 +536,35 @@ mod tests {
         let results = index.search("hello", Some("ns1"), 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "doc1");
+    }
+
+    #[tokio::test]
+    async fn test_bm25_lock_release() {
+        // Test that lock is released after write
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        let config = BM25Config::default().with_path(path);
+        let index1 = BM25Index::new(&config).unwrap();
+
+        // First write
+        index1
+            .add_documents(&[("doc1".to_string(), "ns".to_string(), "test".to_string())])
+            .await
+            .unwrap();
+
+        // Second instance should be able to write (lock released)
+        let config2 = BM25Config::default().with_path(path);
+        let index2 = BM25Index::new(&config2).unwrap();
+
+        index2
+            .add_documents(&[("doc2".to_string(), "ns".to_string(), "test2".to_string())])
+            .await
+            .unwrap();
+
+        // Both docs should be searchable
+        let results = index2.search("test", None, 10).unwrap();
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
