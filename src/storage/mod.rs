@@ -211,6 +211,15 @@ impl StorageManager {
         &self.lance_path
     }
 
+    /// Refresh the table connection to see new data written by other processes.
+    /// This clears the cached table reference, forcing it to be re-opened on next query.
+    pub async fn refresh(&self) -> Result<()> {
+        let mut guard = self.table.lock().await;
+        *guard = None;
+        tracing::info!("LanceDB table cache cleared - will refresh on next query");
+        Ok(())
+    }
+
     pub async fn ensure_collection(&self) -> Result<()> {
         // Attempt to open; if missing, create empty table lazily on first add
         let mut guard = self.table.lock().await;

@@ -286,6 +286,7 @@ pub fn create_router(state: HttpState) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        .route("/refresh", post(refresh_handler))
         .route("/search", post(search_handler))
         .route("/sse/search", get(sse_search_handler))
         .route("/cross-search", get(cross_search_handler))
@@ -314,6 +315,18 @@ async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
         db_path: state.rag.storage().lance_path().to_string(),
         embedding_provider: state.rag.mlx_connected_to(),
     })
+}
+
+/// Refresh endpoint - clears LanceDB cache to see new data from other processes
+async fn refresh_handler(State(state): State<HttpState>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state.rag.refresh().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Refresh failed: {}", e))
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "refreshed",
+        "message": "LanceDB cache cleared - next query will see fresh data"
+    })))
 }
 
 /// Search endpoint (POST /search)
@@ -858,12 +871,13 @@ async fn mcp_sse_handler(
 }
 
 /// MCP Messages endpoint - POST /messages/?session_id=xxx
-/// Receives JSON-RPC requests and sends responses via SSE
+/// Receives JSON-RPC requests and sends responses via SSE stream
+/// Returns 202 Accepted - actual response delivered via SSE
 async fn mcp_messages_handler(
     State(state): State<HttpState>,
     Query(params): Query<McpMessagesParams>,
     body: String,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let session_id = params.session_id.ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "session_id is required".to_string())
     })?;
@@ -883,13 +897,14 @@ async fn mcp_messages_handler(
     // Handle the request (inline MCP protocol handling)
     let response = handle_mcp_request(&state.rag, request).await;
 
-    // Send response via SSE channel
-    if let Err(e) = session.tx.send(response.clone()) {
+    // Send response via SSE channel only (MCP-over-SSE protocol)
+    if let Err(e) = session.tx.send(response) {
         warn!("MCP: Failed to send response to session {}: {}", session_id, e);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to send response".to_string()));
     }
 
-    // Also return response directly (some clients expect this)
-    Ok(Json(response))
+    // Return 202 Accepted - actual response goes via SSE stream
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Handle MCP JSON-RPC request

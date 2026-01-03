@@ -739,6 +739,11 @@ impl RAGPipeline {
         self.storage.clone()
     }
 
+    /// Refresh storage to see new data written by other processes
+    pub async fn refresh(&self) -> Result<()> {
+        self.storage.refresh().await
+    }
+
     /// Get which MLX server we're connected to (for health/status reporting)
     pub fn mlx_connected_to(&self) -> String {
         // This is safe because mlx_bridge is required and always initialized
@@ -1433,7 +1438,10 @@ impl RAGPipeline {
         text: String,
         metadata: serde_json::Value,
     ) -> Result<()> {
-        self.index_text(Some(namespace), id, text, metadata).await?;
+        // Use Flat mode to preserve the user-provided ID (no onion slicing)
+        // This ensures memory_get(id) will find the exact record
+        self.index_text_with_mode(Some(namespace), id, text, metadata, SliceMode::Flat)
+            .await?;
         Ok(())
     }
 
