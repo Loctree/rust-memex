@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.6] - 2026-01-03
+
+### Added
+- **MCP-over-SSE Transport** - Native MCP protocol over HTTP/SSE for Claude Code compatibility
+  - `GET /sse/` - SSE stream with `endpoint` event for session initialization
+  - `POST /messages/?session_id=xxx` - JSON-RPC message endpoint
+  - Full MCP protocol support: `initialize`, `tools/list`, `tools/call`
+  - Session management with automatic cleanup
+- **BM25 Read-Only Mode** - No lock contention for multi-agent read access
+  - `BM25Config.read_only = true` - Opens index without IndexWriter (no lock)
+  - HTTP-only mode (`--http-only`) now automatically uses read-only BM25
+  - Multiple Claude instances can read simultaneously
+  - Write operations return error in read-only mode (by design)
+
+### Changed
+- `--http-only` mode now sets `hybrid.bm25.read_only = true` automatically
+- MCP-over-SSE endpoints available at both `/mcp/` and `/sse/` paths
+
+## [0.3.5] - 2026-01-02
+
+### Added
+- Full CRUD and management commands to CLI
+
 ## [0.3.4] - 2025-12-31
 
 ### Added

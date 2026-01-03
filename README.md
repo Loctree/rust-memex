@@ -534,6 +534,25 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | `/delete/{ns}/{id}` | POST | Delete document |
 | `/ns/{namespace}` | DELETE | Purge entire namespace |
 
+### MCP-over-SSE Endpoints (Claude Code compatibility)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/sse/` | GET | SSE stream - sends `endpoint` event with messages URL |
+| `/messages/` | POST | JSON-RPC messages with `?session_id=xxx` |
+
+Configure in `~/.claude.json`:
+```json
+{
+  "mcpServers": {
+    "rmcp-memex": {
+      "type": "sse",
+      "url": "http://localhost:6660/sse/"
+    }
+  }
+}
+```
+
 ### Usage Examples
 
 ```bash
