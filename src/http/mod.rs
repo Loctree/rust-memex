@@ -911,8 +911,10 @@ async fn mcp_messages_handler(
     // Handle the request (inline MCP protocol handling)
     let response = handle_mcp_request(&state.rag, request).await;
 
-    // Send response via SSE channel only (MCP-over-SSE protocol)
-    if let Err(e) = session.tx.send(response) {
+    // Only send response for requests (not notifications)
+    if let Some(response) = response
+        && let Err(e) = session.tx.send(response)
+    {
         warn!(
             "MCP: Failed to send response to session {}: {}",
             session_id, e
@@ -923,18 +925,41 @@ async fn mcp_messages_handler(
         ));
     }
 
-    // Return 202 Accepted - actual response goes via SSE stream
+    // Return 202 Accepted - actual response (if any) goes via SSE stream
     Ok(StatusCode::ACCEPTED)
 }
 
 /// Handle MCP JSON-RPC request
 /// Implements core MCP protocol methods using RAGPipeline
+/// Returns None for notifications (no response needed), Some for requests
 async fn handle_mcp_request(
     rag: &Arc<RAGPipeline>,
     request: serde_json::Value,
-) -> serde_json::Value {
+) -> Option<serde_json::Value> {
     let method = request["method"].as_str().unwrap_or("");
-    let id = request["id"].clone();
+    let id = request.get("id").cloned();
+
+    // Notifications start with "notifications/" - no response per JSON-RPC spec
+    if method.starts_with("notifications/") {
+        debug!("MCP: notification '{}' - no response", method);
+        return None;
+    }
+
+    // Requests must have an id (string or number)
+    let id = match id {
+        Some(v) if v.is_string() || v.is_number() => v,
+        _ => {
+            warn!("MCP: request '{}' missing valid id", method);
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": serde_json::Value::Null,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: missing or invalid 'id' field"
+                }
+            }));
+        }
+    };
 
     let result = match method {
         "initialize" => json!({
@@ -947,11 +972,6 @@ async fn handle_mcp_request(
                 "tools": {}
             }
         }),
-
-        "notifications/initialized" => {
-            // Client acknowledged initialization - no response needed
-            return json!({});
-        }
 
         "tools/list" => json!({
             "tools": [
@@ -1159,29 +1179,29 @@ async fn handle_mcp_request(
                     }
                 }
                 _ => {
-                    return json!({
+                    return Some(json!({
                         "jsonrpc": "2.0",
                         "error": {"code": -32601, "message": format!("Unknown tool: {}", tool_name)},
                         "id": id
-                    });
+                    }));
                 }
             }
         }
 
         _ => {
-            return json!({
+            return Some(json!({
                 "jsonrpc": "2.0",
                 "error": {"code": -32601, "message": format!("Unknown method: {}", method)},
                 "id": id
-            });
+            }));
         }
     };
 
-    json!({
+    Some(json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": result
-    })
+    }))
 }
 
 /// Start the HTTP server with shared RAGPipeline

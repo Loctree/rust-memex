@@ -1,10 +1,44 @@
 use anyhow::{Result, anyhow};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Build a JSON-RPC 2.0 error response.
+/// Per JSON-RPC 2.0 spec, omits `id` field when it's null (for notifications).
+fn jsonrpc_error(id: &Value, code: i32, message: &str) -> Value {
+    if id.is_null() {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {"code": code, "message": message}
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {"code": code, "message": message},
+            "id": id
+        })
+    }
+}
+
+/// Build a JSON-RPC 2.0 success response.
+/// Per JSON-RPC 2.0 spec, omits `id` field when it's null (for notifications).
+fn jsonrpc_success(id: &Value, result: Value) -> Value {
+    if id.is_null() {
+        json!({
+            "jsonrpc": "2.0",
+            "result": result
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })
+    }
+}
 
 use crate::{
     ServerConfig,
@@ -131,11 +165,11 @@ impl MCPServer {
             }
 
             // Check size limit
+            // Note: JSON-RPC 2.0 spec says error responses without a request id should omit the id field entirely
             if trimmed.len() > self.max_request_bytes {
                 let err = json!({
                     "jsonrpc": "2.0",
-                    "error": {"code": -32600, "message": format!("Request too large: {} bytes (max {})", trimmed.len(), self.max_request_bytes)},
-                    "id": serde_json::Value::Null
+                    "error": {"code": -32600, "message": format!("Request too large: {} bytes (max {})", trimmed.len(), self.max_request_bytes)}
                 });
                 let payload = serde_json::to_string(&err)?;
                 stdout.write_all(payload.as_bytes()).await?;
@@ -149,8 +183,7 @@ impl MCPServer {
                 Err(e) => {
                     let err = json!({
                         "jsonrpc": "2.0",
-                        "error": {"code": -32700, "message": format!("Parse error: {}", e)},
-                        "id": serde_json::Value::Null
+                        "error": {"code": -32700, "message": format!("Parse error: {}", e)}
                     });
                     let payload = serde_json::to_string(&err)?;
                     stdout.write_all(payload.as_bytes()).await?;
@@ -922,19 +955,11 @@ impl MCPServer {
             }
 
             _ => {
-                return json!({
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32601, "message": "Unknown method"},
-                    "id": id
-                });
+                return jsonrpc_error(&id, -32601, "Unknown method");
             }
         };
 
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result
-        })
+        jsonrpc_success(&id, result)
     }
 }
 
