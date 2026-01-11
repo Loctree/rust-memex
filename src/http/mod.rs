@@ -840,7 +840,10 @@ async fn mcp_sse_handler(
         state.mcp_base_url.read().await.clone()
     };
 
-    info!("MCP SSE: New session {} (base_url: {})", session_id, base_url);
+    info!(
+        "MCP SSE: New session {} (base_url: {})",
+        session_id, base_url
+    );
 
     let stream = async_stream::stream! {
         // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)

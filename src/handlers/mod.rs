@@ -194,6 +194,12 @@ impl MCPServer {
             };
 
             let response = self.handle_request(request).await;
+
+            // Don't send response for notifications (JSON-RPC spec: notifications get no reply)
+            if response.get("_notification").is_some() {
+                continue;
+            }
+
             let payload = serde_json::to_string(&response)?;
             stdout.write_all(payload.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
@@ -952,6 +958,13 @@ impl MCPServer {
                         });
                     }
                 }
+            }
+
+            // MCP notifications (no response expected per JSON-RPC spec)
+            method if method.starts_with("notifications/") => {
+                // Notifications don't get responses - return empty object
+                // The caller should check for this and not send anything
+                return json!({"_notification": true});
             }
 
             _ => {

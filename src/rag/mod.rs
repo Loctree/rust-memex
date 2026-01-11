@@ -470,10 +470,7 @@ fn extract_conversation_documents(
                         .get("role")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
-                    let text = msg_obj
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     let timestamp = msg_obj
                         .get("timestamp")
                         .and_then(|v| v.as_str())
@@ -531,9 +528,7 @@ fn extract_conversation_documents(
 
         // Check if it looks like a conversation (messages with sender/role)
         let looks_like_conversation = messages.iter().any(|m| {
-            m.get("sender").is_some()
-                || m.get("role").is_some()
-                || m.get("author").is_some()
+            m.get("sender").is_some() || m.get("role").is_some() || m.get("author").is_some()
         });
 
         if looks_like_conversation {
@@ -638,10 +633,7 @@ fn extract_conversation_documents(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         let conv_short = &conv_id[..conv_id.len().min(8)];
-        let title = obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let title = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
         let mut docs = Vec::new();
         for (idx, msg) in messages.iter().enumerate() {
@@ -662,10 +654,7 @@ fn extract_conversation_documents(
                 other => other,
             };
 
-            let text = msg_obj
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
             let timestamp = msg_obj
                 .get("created_at")
@@ -718,15 +707,19 @@ fn extract_conversation_documents(
         let mut entries: Vec<_> = mapping.iter().collect();
         // Try to sort by create_time if available
         entries.sort_by(|a, b| {
-            let time_a = a.1.get("message")
-                .and_then(|m| m.get("create_time"))
-                .and_then(|t| t.as_f64())
-                .unwrap_or(0.0);
-            let time_b = b.1.get("message")
-                .and_then(|m| m.get("create_time"))
-                .and_then(|t| t.as_f64())
-                .unwrap_or(0.0);
-            time_a.partial_cmp(&time_b).unwrap_or(std::cmp::Ordering::Equal)
+            let time_a =
+                a.1.get("message")
+                    .and_then(|m| m.get("create_time"))
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(0.0);
+            let time_b =
+                b.1.get("message")
+                    .and_then(|m| m.get("create_time"))
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(0.0);
+            time_a
+                .partial_cmp(&time_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         for (idx, (_node_id, node)) in entries.iter().enumerate() {
