@@ -357,9 +357,9 @@ impl HybridSearcher {
         Ok(final_results)
     }
 
-    /// Deduplicate results by content_hash from metadata.
-    /// When multiple chunks share the same content_hash, keeps only the
-    /// highest-scoring one. Results must be sorted by score (desc) before calling.
+    /// Deduplicate results by content_hash (chunk-level) from metadata.
+    /// content_hash = per-chunk hash (unique per chunk content).
+    /// file_hash = per-file hash (provenance, NOT used for dedup).
     fn dedup_by_content_hash(results: &mut Vec<HybridSearchResult>) {
         let mut seen: HashSet<String> = HashSet::new();
         let before = results.len();

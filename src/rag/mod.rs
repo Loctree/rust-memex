@@ -1589,12 +1589,17 @@ impl RAGPipeline {
                     map.insert("keywords".to_string(), json!(slice.keywords));
                 }
 
+                // Dual hash: file_hash for provenance, content_hash for per-slice dedup
+                let slice_hash = compute_content_hash(&slice.content);
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("file_hash".to_string(), json!(content_hash));
+                }
                 let doc = ChromaDocument::from_onion_slice_with_hash(
                     slice,
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
-                    content_hash.to_string(),
+                    slice_hash,
                 );
                 batch_docs.push(doc);
             }
@@ -1641,12 +1646,17 @@ impl RAGPipeline {
                     map.insert("keywords".to_string(), json!(slice.keywords));
                 }
 
+                // Dual hash: file_hash for provenance, content_hash for per-slice dedup
+                let slice_hash = compute_content_hash(&slice.content);
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("file_hash".to_string(), json!(content_hash));
+                }
                 let doc = ChromaDocument::from_onion_slice_with_hash(
                     slice,
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
-                    content_hash.to_string(),
+                    slice_hash,
                 );
                 batch_docs.push(doc);
             }
@@ -1784,13 +1794,18 @@ impl RAGPipeline {
                     map.insert("total_chunks".to_string(), json!(total_chunks));
                 }
 
+                // Dual hash: file_hash for provenance, content_hash for per-chunk dedup
+                let chunk_hash = compute_content_hash(chunk);
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("file_hash".to_string(), json!(content_hash));
+                }
                 let doc = ChromaDocument::new_flat_with_hash(
                     format!("{}_{}", path.to_str().unwrap_or("unknown"), global_idx),
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
                     chunk.clone(),
-                    content_hash.to_string(),
+                    chunk_hash,
                 );
                 batch_docs.push(doc);
                 global_idx += 1;
