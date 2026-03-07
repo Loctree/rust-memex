@@ -67,6 +67,10 @@ pub struct HybridConfig {
     /// BM25 index configuration
     #[serde(default)]
     pub bm25: BM25Config,
+
+    /// Maximum results per source file (0 = unlimited)
+    #[serde(default = "default_max_per_source")]
+    pub max_per_source: usize,
 }
 
 fn default_vector_weight() -> f32 {
@@ -79,6 +83,10 @@ fn default_rrf_k() -> f32 {
     60.0
 }
 
+fn default_max_per_source() -> usize {
+    3
+}
+
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +96,7 @@ impl Default for HybridConfig {
             use_rrf: false,
             rrf_k: 60.0,
             bm25: BM25Config::default(),
+            max_per_source: default_max_per_source(),
         }
     }
 }
@@ -221,6 +230,7 @@ impl HybridSearcher {
             })
             .collect();
         Self::dedup_by_content_hash(&mut results);
+        Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         Ok(results)
     }
 
@@ -264,6 +274,7 @@ impl HybridSearcher {
         }
 
         Self::dedup_by_content_hash(&mut results);
+        Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         Ok(results)
     }
 
@@ -346,6 +357,7 @@ impl HybridSearcher {
         }
 
         Self::dedup_by_content_hash(&mut final_results);
+        Self::enforce_source_diversity(&mut final_results, self.config.max_per_source);
 
         tracing::debug!(
             "Hybrid search: {} vector + {} BM25 -> {} fused (deduped) results",
@@ -374,6 +386,35 @@ impl HybridSearcher {
             tracing::debug!(
                 "Dedup: removed {} duplicate chunks by content_hash",
                 removed
+            );
+        }
+    }
+
+    /// Enforce source-file diversity: max N results per unique source path.
+    /// Prevents a single large file from dominating all results.
+    fn enforce_source_diversity(results: &mut Vec<HybridSearchResult>, max_per_source: usize) {
+        if max_per_source == 0 {
+            return; // 0 = unlimited
+        }
+        let mut source_counts: HashMap<String, usize> = HashMap::new();
+        let before = results.len();
+        results.retain(|r| {
+            let path = r
+                .metadata
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let count = source_counts.entry(path).or_insert(0);
+            *count += 1;
+            *count <= max_per_source
+        });
+        let removed = before - results.len();
+        if removed > 0 {
+            tracing::debug!(
+                "Diversity: capped {} results (max {} per source)",
+                removed,
+                max_per_source
             );
         }
     }
