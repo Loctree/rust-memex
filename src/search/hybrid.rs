@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::bm25::{BM25Config, BM25Index};
@@ -201,7 +201,7 @@ impl HybridSearcher {
             .search_store_with_layer(namespace, query_embedding, limit, layer_filter)
             .await?;
 
-        Ok(candidates
+        let mut results: Vec<HybridSearchResult> = candidates
             .into_iter()
             .map(|doc| {
                 let layer = doc.slice_layer(); // Call before moving fields
@@ -219,7 +219,9 @@ impl HybridSearcher {
                     keywords: doc.keywords,
                 }
             })
-            .collect())
+            .collect();
+        Self::dedup_by_content_hash(&mut results);
+        Ok(results)
     }
 
     /// Keyword-only search using BM25
@@ -261,6 +263,7 @@ impl HybridSearcher {
             }
         }
 
+        Self::dedup_by_content_hash(&mut results);
         Ok(results)
     }
 
@@ -342,14 +345,37 @@ impl HybridSearcher {
             }
         }
 
+        Self::dedup_by_content_hash(&mut final_results);
+
         tracing::debug!(
-            "Hybrid search: {} vector + {} BM25 -> {} fused results",
+            "Hybrid search: {} vector + {} BM25 -> {} fused (deduped) results",
             vector_results.len(),
             bm25_results.len(),
             final_results.len()
         );
 
         Ok(final_results)
+    }
+
+    /// Deduplicate results by content_hash from metadata.
+    /// When multiple chunks share the same content_hash, keeps only the
+    /// highest-scoring one. Results must be sorted by score (desc) before calling.
+    fn dedup_by_content_hash(results: &mut Vec<HybridSearchResult>) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let before = results.len();
+        results.retain(|r| {
+            match r.metadata.get("content_hash").and_then(|v| v.as_str()) {
+                Some(hash) => seen.insert(hash.to_string()),
+                None => true, // keep results without content_hash
+            }
+        });
+        let removed = before - results.len();
+        if removed > 0 {
+            tracing::debug!(
+                "Dedup: removed {} duplicate chunks by content_hash",
+                removed
+            );
+        }
     }
 
     /// Weighted linear combination of scores
