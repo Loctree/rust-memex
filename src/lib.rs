@@ -1,12 +1,23 @@
 pub mod common;
 pub mod embeddings;
+pub mod engine;
 pub mod handlers;
+pub mod http;
+pub mod path_utils;
 pub mod preprocessing;
+pub mod query;
 pub mod rag;
+pub mod search;
 pub mod security;
 pub mod storage;
 #[cfg(test)]
 mod tests;
+pub mod tools;
+
+// CLI-only modules (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub mod progress;
+#[cfg(feature = "cli")]
 pub mod tui;
 
 use anyhow::Result;
@@ -14,24 +25,75 @@ use tracing::Level;
 
 // Re-export core types for library consumers
 pub use embeddings::{
-    EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, ProviderConfig, RerankerConfig,
+    DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, MlxMergeOptions,
+    ProviderConfig, RerankerConfig, TokenConfig, cross_dimension_search_adapt, estimate_tokens,
+    safe_chunk_size, truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
-pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
+pub use preprocessing::{
+    IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
+    TextIntegrityMetrics,
+};
+pub use query::{
+    LoctreeSuggestion, QueryIntent, QueryRouter, RecommendedSearchMode, RoutingDecision,
+    SearchModeRecommendation, TemporalHints, detect_intent,
+};
 pub use rag::{
-    IndexResult, OnionSlice, OnionSliceConfig, RAGPipeline, SearchOptions, SearchResult,
-    SliceLayer, SliceMode, compute_content_hash, create_onion_slices,
+    Chunk as PipelineChunk,
+    ContextPrefixConfig,
+    EmbeddedChunk,
+    EnrichedChunk,
+    FileContent,
+    IndexResult,
+    OnionSlice,
+    OnionSliceConfig,
+    PipelineConfig,
+    PipelineResult,
+    PipelineStats,
+    RAGPipeline,
+    SearchOptions,
+    SearchResult,
+    SliceLayer,
+    SliceMode,
+    compute_content_hash,
+    create_enriched_chunks,
+    create_onion_slices,
+    // Async pipeline exports
+    run_pipeline,
+};
+pub use search::{
+    BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
+    StemLanguage,
 };
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
-pub use storage::{ChromaDocument, StorageManager};
-pub use tui::{HostDetection, HostKind, WizardConfig, detect_hosts, run_wizard};
+pub use storage::{
+    ChromaDocument, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+};
+
+// High-level engine API
+pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
+
+// Agent tools API (MCP-compatible)
+pub use tools::{
+    ToolDefinition, ToolResult, memory_delete, memory_delete_by_filter, memory_get, memory_search,
+    memory_store, memory_store_batch, tool_definitions,
+};
+
+// CLI-only re-exports (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub use progress::IndexProgressTracker;
+#[cfg(feature = "cli")]
+pub use tui::{
+    CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker, HostDetection, HostKind,
+    WizardConfig, detect_hosts, run_wizard,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Enabled features (namespaced strings). Currently informational/reserved.
     pub features: Vec<String>,
 
-    /// Cache size in MB for sled/moka
+    /// Cache size in MB for moka in-memory cache
     pub cache_mb: usize,
 
     /// Path for embedded vector store (LanceDB)
@@ -53,6 +115,9 @@ pub struct ServerConfig {
 
     /// Embedding provider configuration (universal, config-driven)
     pub embeddings: EmbeddingConfig,
+
+    /// Hybrid search configuration (vector + BM25)
+    pub hybrid: HybridConfig,
 }
 
 impl Default for ServerConfig {
@@ -70,6 +135,7 @@ impl Default for ServerConfig {
             allowed_paths: vec![],
             security: NamespaceSecurityConfig::default(),
             embeddings: EmbeddingConfig::default(),
+            hybrid: HybridConfig::default(),
         }
     }
 }

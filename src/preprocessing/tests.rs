@@ -7,9 +7,39 @@ fn test_default_config() {
     let config = PreprocessingConfig::default();
     assert!(config.remove_tool_artifacts);
     assert!(config.remove_cli_output);
-    assert!(config.remove_metadata);
+    // CRITICAL: remove_metadata defaults to false to preserve timestamps!
+    assert!(!config.remove_metadata);
     assert_eq!(config.min_content_length, 50);
     assert_eq!(config.dedupe_threshold, 0.95);
+}
+
+#[test]
+fn test_timestamps_preserved_by_default() {
+    // P0 FIX VERIFICATION: Timestamps MUST be preserved by default!
+    let preprocessor = Preprocessor::with_defaults();
+
+    let input = "Meeting at 2024-11-13T10:30:00Z with UUID 550e8400-e29b-41d4-a716-446655440000.";
+    let result = preprocessor.extract_semantic_content(input);
+
+    // Timestamps should be preserved (NOT replaced with [TIMESTAMP])
+    assert!(
+        result.contains("2024-11-13T10:30:00Z"),
+        "Timestamp should be preserved by default"
+    );
+    assert!(
+        !result.contains("[TIMESTAMP]"),
+        "Timestamps should NOT be sanitized by default"
+    );
+
+    // UUIDs should also be preserved
+    assert!(
+        result.contains("550e8400-e29b-41d4-a716-446655440000"),
+        "UUID should be preserved by default"
+    );
+    assert!(
+        !result.contains("[UUID]"),
+        "UUIDs should NOT be sanitized by default"
+    );
 }
 
 #[test]
@@ -108,7 +138,11 @@ That's what we have."#;
 
 #[test]
 fn test_remove_uuid() {
-    let preprocessor = Preprocessor::with_defaults();
+    // Must explicitly enable remove_metadata to test UUID sanitization
+    let preprocessor = Preprocessor::new(PreprocessingConfig {
+        remove_metadata: true,
+        ..Default::default()
+    });
 
     let input = "Session 550e8400-e29b-41d4-a716-446655440000 started. Working on the task.";
     let result = preprocessor.extract_semantic_content(input);
@@ -121,7 +155,11 @@ fn test_remove_uuid() {
 
 #[test]
 fn test_remove_timestamps() {
-    let preprocessor = Preprocessor::with_defaults();
+    // Must explicitly enable remove_metadata to test timestamp sanitization
+    let preprocessor = Preprocessor::new(PreprocessingConfig {
+        remove_metadata: true,
+        ..Default::default()
+    });
 
     let input = "Created at 2024-12-24T10:30:00Z. Last modified 2024-12-24T11:00:00+01:00.";
     let result = preprocessor.extract_semantic_content(input);
@@ -134,7 +172,11 @@ fn test_remove_timestamps() {
 
 #[test]
 fn test_remove_session_id() {
-    let preprocessor = Preprocessor::with_defaults();
+    // Must explicitly enable remove_metadata to test session ID sanitization
+    let preprocessor = Preprocessor::new(PreprocessingConfig {
+        remove_metadata: true,
+        ..Default::default()
+    });
 
     let input = r#"Request with session_id: abc123xyz. Also sessionId="def456"."#;
     let result = preprocessor.extract_semantic_content(input);
@@ -326,10 +368,16 @@ fn test_config_serialization() {
     // Should serialize to TOML
     let toml_str = toml::to_string(&config).unwrap();
     assert!(toml_str.contains("remove_tool_artifacts = true"));
+    // Verify remove_metadata defaults to false
+    assert!(toml_str.contains("remove_metadata = false"));
 
     // Should deserialize back
     let parsed: PreprocessingConfig = toml::from_str(&toml_str).unwrap();
     assert_eq!(parsed.min_content_length, config.min_content_length);
+    assert!(
+        !parsed.remove_metadata,
+        "remove_metadata should default to false"
+    );
 }
 
 #[test]

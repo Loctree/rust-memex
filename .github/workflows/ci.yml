@@ -24,6 +24,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       - name: Install protoc (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -37,7 +39,14 @@ jobs:
       - name: Rust clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Rust tests
-        run: cargo test
+        # Ubuntu runners have limited memory - doctests link the entire library
+        # each time and can crash the linker. Run lib+bin+tests only on Linux.
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo test --lib --bins --tests
+          else
+            cargo test
+          fi
 
   coverage:
     runs-on: ubuntu-latest
@@ -54,6 +63,8 @@ jobs:
           restore-keys: |
             ubuntu-cargo-coverage-
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
       - name: Install protoc
         run: |
           sudo apt-get update

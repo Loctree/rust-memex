@@ -1,13 +1,56 @@
 use anyhow::{Result, anyhow};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// Build a JSON-RPC 2.0 error response.
+/// Per JSON-RPC 2.0 spec, omits `id` field when it's null (for notifications).
+fn jsonrpc_error(id: &Value, code: i32, message: &str) -> Value {
+    if id.is_null() {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {"code": code, "message": message}
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {"code": code, "message": message},
+            "id": id
+        })
+    }
+}
+
+/// Build a JSON-RPC 2.0 success response.
+/// Per JSON-RPC 2.0 spec, omits `id` field when it's null (for notifications).
+fn jsonrpc_success(id: &Value, result: Value) -> Value {
+    if id.is_null() {
+        json!({
+            "jsonrpc": "2.0",
+            "result": result
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })
+    }
+}
+
+fn is_notification_request(request: &Value) -> bool {
+    request.get("id").is_none()
+}
+
 use crate::{
-    ServerConfig, embeddings::EmbeddingClient, rag::RAGPipeline, security::NamespaceAccessManager,
+    ServerConfig,
+    embeddings::EmbeddingClient,
+    query::{QueryRouter, SearchModeRecommendation},
+    rag::{RAGPipeline, SliceLayer},
+    search::{HybridSearcher, SearchMode},
+    security::NamespaceAccessManager,
     storage::StorageManager,
 };
 
@@ -23,22 +66,16 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
         return Err(anyhow!("Path cannot be empty"));
     }
 
-    // Expand ~ to home directory
-    let expanded = shellexpand::tilde(path_str).to_string();
-    // This IS the path validation/sanitization function - not a vulnerability
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let path = Path::new(&expanded);
-
-    // Check for obvious path traversal patterns before canonicalization
-    let path_string = path_str.to_string();
-    if path_string.contains("..") {
-        return Err(anyhow!("Path traversal detected: '..' not allowed"));
+    // Check for path traversal on raw input BEFORE any expansion
+    if path_str.contains("..") || path_str.contains('\0') || path_str.contains('\n') {
+        return Err(anyhow!(
+            "Path traversal detected: invalid sequences in '{}'",
+            path_str
+        ));
     }
 
-    // Canonicalize to resolve symlinks and get absolute path
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| anyhow!("Cannot resolve path '{}': {}", path_str, e))?;
+    // Expand ~ and canonicalize through path_utils (centralized validation)
+    let canonical = crate::path_utils::sanitize_existing_path(path_str)?;
 
     // Determine allowed base paths
     let is_safe = if allowed_paths.is_empty() {
@@ -61,7 +98,6 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
         allowed_paths.iter().any(|allowed| {
             // Expand ~ in allowed path
             let expanded_allowed = shellexpand::tilde(allowed).to_string();
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
             let allowed_path = Path::new(&expanded_allowed);
 
             // Try to canonicalize the allowed path, fall back to expanded path if it doesn't exist
@@ -91,12 +127,21 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
 pub struct MCPServer {
     rag: Arc<RAGPipeline>,
+    /// Hybrid searcher for BM25 + vector fusion search
+    hybrid_searcher: Option<Arc<HybridSearcher>>,
+    /// Embedding client for generating query vectors
+    embedding_client: Arc<Mutex<EmbeddingClient>>,
     max_request_bytes: usize,
     allowed_paths: Vec<String>,
     access_manager: Arc<NamespaceAccessManager>,
 }
 
 impl MCPServer {
+    /// Get the RAGPipeline for sharing with HTTP server
+    pub fn rag(&self) -> Arc<RAGPipeline> {
+        self.rag.clone()
+    }
+
     pub async fn run_stdio(self) -> Result<()> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -117,11 +162,11 @@ impl MCPServer {
             }
 
             // Check size limit
+            // Note: JSON-RPC 2.0 spec says error responses without a request id should omit the id field entirely
             if trimmed.len() > self.max_request_bytes {
                 let err = json!({
                     "jsonrpc": "2.0",
-                    "error": {"code": -32600, "message": format!("Request too large: {} bytes (max {})", trimmed.len(), self.max_request_bytes)},
-                    "id": serde_json::Value::Null
+                    "error": {"code": -32600, "message": format!("Request too large: {} bytes (max {})", trimmed.len(), self.max_request_bytes)}
                 });
                 let payload = serde_json::to_string(&err)?;
                 stdout.write_all(payload.as_bytes()).await?;
@@ -135,8 +180,7 @@ impl MCPServer {
                 Err(e) => {
                     let err = json!({
                         "jsonrpc": "2.0",
-                        "error": {"code": -32700, "message": format!("Parse error: {}", e)},
-                        "id": serde_json::Value::Null
+                        "error": {"code": -32700, "message": format!("Parse error: {}", e)}
                     });
                     let payload = serde_json::to_string(&err)?;
                     stdout.write_all(payload.as_bytes()).await?;
@@ -146,7 +190,14 @@ impl MCPServer {
                 }
             };
 
+            let is_notification = is_notification_request(&request);
             let response = self.handle_request(request).await;
+
+            // Don't send response for notifications (JSON-RPC spec: notifications get no reply)
+            if is_notification {
+                continue;
+            }
+
             let payload = serde_json::to_string(&response)?;
             stdout.write_all(payload.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
@@ -222,7 +273,9 @@ impl MCPServer {
                             "properties": {
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 10},
-                                "namespace": {"type": "string"}
+                                "namespace": {"type": "string"},
+                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                                "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
                             },
                             "required": ["query"]
                         }
@@ -264,6 +317,8 @@ impl MCPServer {
                                 "namespace": {"type": "string"},
                                 "query": {"type": "string"},
                                 "k": {"type": "integer", "default": 5},
+                                "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                                "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
                                 "token": {"type": "string", "description": "Access token for protected namespaces"}
                             },
                             "required": ["namespace", "query"]
@@ -333,6 +388,20 @@ impl MCPServer {
                             "type": "object",
                             "properties": {},
                             "required": []
+                        }
+                    },
+                    {
+                        "name": "dive",
+                        "description": "Deep exploration with all onion layers. Shows ALL layers (outer/middle/inner/core), both BM25 and vector scores, full metadata, and related chunks.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": {"type": "string", "description": "Namespace to search in"},
+                                "query": {"type": "string", "description": "Search query text"},
+                                "limit": {"type": "integer", "default": 5, "description": "Maximum results per layer"},
+                                "verbose": {"type": "boolean", "default": false, "description": "Show full text and metadata"}
+                            },
+                            "required": ["namespace", "query"]
                         }
                     }
                 ]
@@ -405,7 +474,88 @@ impl MCPServer {
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(10) as usize;
                         let namespace = args["namespace"].as_str();
+                        let auto_route = args["auto_route"].as_bool().unwrap_or(false);
 
+                        // Determine search mode - QueryRouter if auto_route enabled
+                        let mode = if auto_route {
+                            let router = QueryRouter::new();
+                            let decision = router.route(query);
+                            match decision.recommended_mode.mode {
+                                SearchModeRecommendation::Vector => SearchMode::Vector,
+                                SearchModeRecommendation::Bm25 => SearchMode::Keyword,
+                                SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
+                            }
+                        } else {
+                            match args["mode"].as_str() {
+                                Some("vector") => SearchMode::Vector,
+                                Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                                _ => SearchMode::Hybrid, // default to hybrid
+                            }
+                        };
+
+                        // Use hybrid search if available and mode is not pure vector
+                        if mode != SearchMode::Vector
+                            && let Some(ref hybrid) = self.hybrid_searcher
+                        {
+                            // Generate query embedding
+                            let query_embedding = match self
+                                .embedding_client
+                                .lock()
+                                .await
+                                .embed(query)
+                                .await
+                            {
+                                Ok(emb) => emb,
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Embedding failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            };
+
+                            match hybrid
+                                .search(query, query_embedding, namespace, k, None)
+                                .await
+                            {
+                                Ok(results) => {
+                                    // Convert HybridSearchResult to JSON with scores
+                                    let results_json: Vec<serde_json::Value> = results.iter().map(|r| json!({
+                                        "id": r.id,
+                                        "namespace": r.namespace,
+                                        "document": r.document,
+                                        "combined_score": r.combined_score,
+                                        "vector_score": r.vector_score,
+                                        "bm25_score": r.bm25_score,
+                                        "metadata": r.metadata,
+                                        "layer": r.layer.as_ref().map(|l| format!("{:?}", l)),
+                                        "keywords": r.keywords
+                                    })).collect();
+
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "result": {
+                                            "content": [{
+                                                "type": "text",
+                                                "text": serde_json::to_string(&results_json).unwrap_or_default()
+                                            }]
+                                        },
+                                        "id": id
+                                    });
+                                }
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Hybrid search failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            }
+                        }
+                        // Fall through to vector search if hybrid not available
+
+                        // Fallback to vector-only search
                         match self.rag.search_inner(namespace, query, k).await {
                             Ok(results) => json!({
                                 "content": [{
@@ -489,6 +639,88 @@ impl MCPServer {
 
                         let query = args["query"].as_str().unwrap_or("");
                         let k = args["k"].as_u64().unwrap_or(5) as usize;
+                        let auto_route = args["auto_route"].as_bool().unwrap_or(false);
+
+                        // Determine search mode - QueryRouter if auto_route enabled
+                        let mode = if auto_route {
+                            let router = QueryRouter::new();
+                            let decision = router.route(query);
+                            match decision.recommended_mode.mode {
+                                SearchModeRecommendation::Vector => SearchMode::Vector,
+                                SearchModeRecommendation::Bm25 => SearchMode::Keyword,
+                                SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
+                            }
+                        } else {
+                            match args["mode"].as_str() {
+                                Some("vector") => SearchMode::Vector,
+                                Some("bm25") | Some("keyword") => SearchMode::Keyword,
+                                _ => SearchMode::Hybrid, // default to hybrid
+                            }
+                        };
+
+                        // Use hybrid search if available and mode is not pure vector
+                        if mode != SearchMode::Vector
+                            && let Some(ref hybrid) = self.hybrid_searcher
+                        {
+                            let query_embedding = match self
+                                .embedding_client
+                                .lock()
+                                .await
+                                .embed(query)
+                                .await
+                            {
+                                Ok(emb) => emb,
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Embedding failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            };
+
+                            match hybrid
+                                .search(query, query_embedding, Some(namespace), k, None)
+                                .await
+                            {
+                                Ok(results) => {
+                                    let results_json: Vec<serde_json::Value> = results
+                                        .iter()
+                                        .map(|r| {
+                                            json!({
+                                                "id": r.id,
+                                                "namespace": r.namespace,
+                                                "text": r.document,
+                                                "score": r.combined_score,
+                                                "vector_score": r.vector_score,
+                                                "bm25_score": r.bm25_score,
+                                                "metadata": r.metadata
+                                            })
+                                        })
+                                        .collect();
+
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "result": {
+                                            "content": [{
+                                                "type": "text",
+                                                "text": serde_json::to_string(&results_json).unwrap_or_default()
+                                            }]
+                                        },
+                                        "id": id
+                                    });
+                                }
+                                Err(e) => {
+                                    return json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32603, "message": format!("Hybrid search failed: {}", e)},
+                                        "id": id
+                                    });
+                                }
+                            }
+                        }
+
+                        // Fallback to vector-only search
                         match self.rag.memory_search(namespace, query, k).await {
                             Ok(results) => json!({
                                 "content": [{
@@ -633,6 +865,89 @@ impl MCPServer {
                             }]
                         })
                     }
+                    "dive" => {
+                        let namespace = args["namespace"].as_str().unwrap_or("");
+                        let query = args["query"].as_str().unwrap_or("");
+                        let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+                        let verbose = args["verbose"].as_bool().unwrap_or(false);
+
+                        if namespace.is_empty() || query.is_empty() {
+                            return json!({
+                                "jsonrpc": "2.0",
+                                "error": {"code": -32602, "message": "namespace and query are required"},
+                                "id": id
+                            });
+                        }
+
+                        // Search each layer
+                        let layers = [
+                            (Some(SliceLayer::Outer), "outer"),
+                            (Some(SliceLayer::Middle), "middle"),
+                            (Some(SliceLayer::Inner), "inner"),
+                            (Some(SliceLayer::Core), "core"),
+                        ];
+
+                        let mut all_results: Vec<serde_json::Value> = Vec::new();
+
+                        for (layer_filter, layer_name) in &layers {
+                            match self
+                                .rag
+                                .memory_search_with_layer(namespace, query, limit, *layer_filter)
+                                .await
+                            {
+                                Ok(results) => {
+                                    let layer_results: Vec<serde_json::Value> = results
+                                        .iter()
+                                        .map(|r| {
+                                            let mut obj = json!({
+                                                "id": r.id,
+                                                "score": r.score,
+                                                "keywords": r.keywords,
+                                                "layer": r.layer.map(|l| l.name()),
+                                                "can_expand": r.can_expand(),
+                                                "parent_id": r.parent_id,
+                                            });
+                                            if verbose {
+                                                obj["text"] = json!(r.text);
+                                                obj["metadata"] = r.metadata.clone();
+                                                obj["children_ids"] = json!(r.children_ids);
+                                            } else {
+                                                // Truncated preview
+                                                let preview: String =
+                                                    r.text.chars().take(200).collect();
+                                                obj["preview"] = json!(preview);
+                                            }
+                                            obj
+                                        })
+                                        .collect();
+
+                                    all_results.push(json!({
+                                        "layer": layer_name,
+                                        "count": results.len(),
+                                        "results": layer_results
+                                    }));
+                                }
+                                Err(e) => {
+                                    all_results.push(json!({
+                                        "layer": layer_name,
+                                        "error": e.to_string()
+                                    }));
+                                }
+                            }
+                        }
+
+                        let output = json!({
+                            "query": query,
+                            "namespace": namespace,
+                            "limit_per_layer": limit,
+                            "verbose": verbose,
+                            "layers": all_results
+                        });
+
+                        json!({
+                            "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_default()}]
+                        })
+                    }
                     _ => {
                         return json!({
                             "jsonrpc": "2.0",
@@ -643,20 +958,17 @@ impl MCPServer {
                 }
             }
 
+            // MCP notifications (no response expected per JSON-RPC spec)
+            method if method.starts_with("notifications/") => {
+                json!(null)
+            }
+
             _ => {
-                return json!({
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32601, "message": "Unknown method"},
-                    "id": id
-                });
+                return jsonrpc_error(&id, -32601, "Unknown method");
             }
         };
 
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result
-        })
+        jsonrpc_success(&id, result)
     }
 }
 
@@ -670,10 +982,19 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
     let embedding_client = Arc::new(Mutex::new(embedding_client));
 
     let db_path = shellexpand::tilde(&config.db_path).to_string();
-    let storage = Arc::new(StorageManager::new(config.cache_mb, &db_path).await?);
-    // NOTE: Removed ensure_collection() - table opens lazily on first use
-    // This speeds up MCP server startup significantly
-    let rag = Arc::new(RAGPipeline::new(embedding_client, storage).await?);
+    let storage = Arc::new(StorageManager::new(&db_path).await?);
+    let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage.clone()).await?);
+
+    // Initialize hybrid searcher if mode is not vector-only
+    let hybrid_searcher = if config.hybrid.mode != crate::search::SearchMode::Vector {
+        tracing::info!("Hybrid search: mode={:?}", config.hybrid.mode);
+        Some(Arc::new(
+            HybridSearcher::new(storage, config.hybrid.clone()).await?,
+        ))
+    } else {
+        tracing::info!("Hybrid search: disabled (vector-only mode)");
+        None
+    };
 
     // Initialize namespace access manager
     let access_manager = NamespaceAccessManager::new(config.security.clone());
@@ -682,8 +1003,33 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
 
     Ok(MCPServer {
         rag,
+        hybrid_searcher,
+        embedding_client,
         max_request_bytes: config.max_request_bytes,
         allowed_paths: config.allowed_paths,
         access_manager,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_notification_request;
+    use serde_json::json;
+
+    #[test]
+    fn detects_notification_when_id_is_missing() {
+        assert!(is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+    }
+
+    #[test]
+    fn request_with_id_is_not_notification() {
+        assert!(!is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })));
+    }
 }
