@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "=== mcp_memex setup ==="
+echo "=== rmcp-memex setup ==="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -13,9 +13,9 @@ cargo build --release
 if [[ "${1:-}" == "--bundle-macos" ]]; then
   echo "Creating macOS app bundle..."
   "$SCRIPT_DIR/build-macos.sh"
-  BIN_PATH="$HOME/.mcp-servers/MCPServer.app/Contents/MacOS/mcp_memex"
+  BIN_PATH="$HOME/.mcp-servers/MCPServer.app/Contents/MacOS/rmcp-memex"
 else
-  BIN_PATH="$REPO_ROOT/target/release/mcp_memex"
+  BIN_PATH="$REPO_ROOT/target/release/rmcp-memex"
 fi
 
 echo ""
@@ -26,7 +26,7 @@ echo "Example MCP host config:"
 cat <<JSON
 {
   "mcpServers": {
-    "mcp_memex": {
+    "rmcp-memex": {
       "command": "$BIN_PATH",
       "args": ["--log-level", "info"]
     }

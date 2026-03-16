@@ -132,16 +132,17 @@ download_and_install() {
 
     # Find the binary (might be in subdirectory)
     local binary
-    binary=$(find "$temp_dir/extract" -name "rmcp_memex" -type f | head -1)
+    binary=$(find "$temp_dir/extract" -name "rmcp-memex" -type f | head -1)
 
     if [ -z "$binary" ]; then
         error "Binary not found in archive"
     fi
 
-    cp "$binary" "$install_dir/rmcp_memex"
-    chmod +x "$install_dir/rmcp_memex"
+    cp "$binary" "$install_dir/rmcp-memex"
+    chmod +x "$install_dir/rmcp-memex"
+    ln -sf "$install_dir/rmcp-memex" "$install_dir/rmcp_memex"
 
-    success "Installed rmcp_memex to $install_dir/rmcp_memex"
+    success "Installed rmcp-memex to $install_dir/rmcp-memex"
 }
 
 # Check if command is available
@@ -193,13 +194,13 @@ main() {
     download_and_install "$target" "$version" "$INSTALL_DIR"
 
     # Verify installation
-    if [ -x "$INSTALL_DIR/rmcp_memex" ]; then
+    if [ -x "$INSTALL_DIR/rmcp-memex" ]; then
         success "Installation successful!"
         echo ""
 
         # Get version info
         local installed_version
-        installed_version=$("$INSTALL_DIR/rmcp_memex" --version 2>/dev/null || echo "unknown")
+        installed_version=$("$INSTALL_DIR/rmcp-memex" --version 2>/dev/null || echo "unknown")
         info "Installed version: $installed_version"
     else
         error "Installation verification failed"
@@ -221,15 +222,15 @@ main() {
     info "Next steps:"
     echo ""
     echo "  1. Run the configuration wizard:"
-    echo "     rmcp_memex wizard"
+    echo "     rmcp-memex wizard"
     echo ""
     echo "  2. Or start the MCP server directly:"
-    echo "     rmcp_memex serve"
+    echo "     rmcp-memex serve"
     echo ""
     echo "  3. Add to your MCP host config (e.g., Claude Desktop):"
     echo ""
-    echo "     {\"mcpServers\": {\"rmcp_memex\": {"
-    echo "       \"command\": \"$INSTALL_DIR/rmcp_memex\","
+    echo "     {\"mcpServers\": {\"rmcp-memex\": {"
+    echo "       \"command\": \"$INSTALL_DIR/rmcp-memex\","
     echo "       \"args\": [\"serve\"]"
     echo "     }}}"
     echo ""
@@ -240,7 +241,7 @@ main() {
         read -p "Would you like to run the configuration wizard now? [y/N] " -n 1 -r
         echo ""
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            exec "$INSTALL_DIR/rmcp_memex" wizard
+            exec "$INSTALL_DIR/rmcp-memex" wizard
         fi
     fi
 }

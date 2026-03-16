@@ -117,6 +117,10 @@ pub struct HybridSearchResult {
     pub keywords: Vec<String>,
 }
 
+type HybridResultKey = (String, String);
+type HybridScoreTuple = (f32, Option<f32>, Option<f32>);
+type HybridFusionMap = HashMap<HybridResultKey, HybridScoreTuple>;
+
 /// Hybrid searcher combining vector and BM25 search
 pub struct HybridSearcher {
     storage: Arc<StorageManager>,
@@ -250,12 +254,8 @@ impl HybridSearcher {
 
         // Fetch full documents from storage
         let mut results = Vec::with_capacity(bm25_results.len());
-        for (id, score) in bm25_results {
-            if let Some(doc) = self
-                .storage
-                .get_document(namespace.unwrap_or("rag"), &id)
-                .await?
-            {
+        for (id, hit_namespace, score) in bm25_results {
+            if let Some(doc) = self.storage.get_document(&hit_namespace, &id).await? {
                 let layer = doc.slice_layer(); // Call before moving fields
                 results.push(HybridSearchResult {
                     id: doc.id,
@@ -316,9 +316,12 @@ impl HybridSearcher {
 
         // Fetch full documents for final results
         let mut final_results = Vec::with_capacity(results.len());
-        for (id, (combined_score, vector_score, bm25_score)) in results {
+        for ((result_namespace, id), (combined_score, vector_score, bm25_score)) in results {
             // Find in vector results first
-            if let Some(doc) = vector_results.iter().find(|d| d.id == id) {
+            if let Some(doc) = vector_results
+                .iter()
+                .find(|d| d.id == id && d.namespace == result_namespace)
+            {
                 let layer = doc.slice_layer(); // Call before cloning metadata
                 final_results.push(HybridSearchResult {
                     id: doc.id.clone(),
@@ -333,11 +336,7 @@ impl HybridSearcher {
                     children_ids: doc.children_ids.clone(),
                     keywords: doc.keywords.clone(),
                 });
-            } else if let Some(doc) = self
-                .storage
-                .get_document(namespace.unwrap_or("rag"), &id)
-                .await?
-            {
+            } else if let Some(doc) = self.storage.get_document(&result_namespace, &id).await? {
                 // BM25-only result, fetch from storage
                 let layer = doc.slice_layer(); // Call before moving fields
                 final_results.push(HybridSearchResult {
@@ -423,9 +422,9 @@ impl HybridSearcher {
     fn weighted_linear_fusion(
         &self,
         vector_results: &[ChromaDocument],
-        bm25_results: &[(String, f32)],
-    ) -> HashMap<String, (f32, Option<f32>, Option<f32>)> {
-        let mut combined: HashMap<String, (f32, Option<f32>, Option<f32>)> = HashMap::new();
+        bm25_results: &[(String, String, f32)],
+    ) -> HybridFusionMap {
+        let mut combined: HybridFusionMap = HashMap::new();
 
         // Use rank-based normalization for vector results
         for (idx, doc) in vector_results.iter().enumerate() {
@@ -433,13 +432,19 @@ impl HybridSearcher {
             let normalized = 1.0 - (idx as f32 / vector_results.len().max(1) as f32);
             let weighted = normalized * self.config.vector_weight;
 
-            combined.insert(doc.id.clone(), (weighted, Some(normalized), None));
+            combined.insert(
+                (doc.namespace.clone(), doc.id.clone()),
+                (weighted, Some(normalized), None),
+            );
         }
 
         // Normalize and add BM25 scores
-        let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
+        let bm25_max = bm25_results
+            .iter()
+            .map(|(_, _, score)| *score)
+            .fold(0.0_f32, f32::max);
 
-        for (id, score) in bm25_results {
+        for (id, namespace, score) in bm25_results {
             let normalized = if bm25_max > 0.0 {
                 score / bm25_max
             } else {
@@ -448,7 +453,7 @@ impl HybridSearcher {
             let weighted = normalized * self.config.bm25_weight;
 
             combined
-                .entry(id.clone())
+                .entry((namespace.clone(), id.clone()))
                 .and_modify(|(total, _, bm25)| {
                     *total += weighted;
                     *bm25 = Some(normalized);
@@ -464,9 +469,9 @@ impl HybridSearcher {
     fn reciprocal_rank_fusion(
         &self,
         vector_results: &[ChromaDocument],
-        bm25_results: &[(String, f32)],
-    ) -> HashMap<String, (f32, Option<f32>, Option<f32>)> {
-        let mut combined: HashMap<String, (f32, Option<f32>, Option<f32>)> = HashMap::new();
+        bm25_results: &[(String, String, f32)],
+    ) -> HybridFusionMap {
+        let mut combined: HybridFusionMap = HashMap::new();
         let k = self.config.rrf_k;
 
         // Add vector results with RRF scoring
@@ -474,16 +479,19 @@ impl HybridSearcher {
             let rrf_score = 1.0 / (k + rank as f32 + 1.0);
             let weighted = rrf_score * self.config.vector_weight;
 
-            combined.insert(doc.id.clone(), (weighted, Some(rrf_score), None));
+            combined.insert(
+                (doc.namespace.clone(), doc.id.clone()),
+                (weighted, Some(rrf_score), None),
+            );
         }
 
         // Add BM25 results with RRF scoring
-        for (rank, (id, _)) in bm25_results.iter().enumerate() {
+        for (rank, (id, namespace, _)) in bm25_results.iter().enumerate() {
             let rrf_score = 1.0 / (k + rank as f32 + 1.0);
             let weighted = rrf_score * self.config.bm25_weight;
 
             combined
-                .entry(id.clone())
+                .entry((namespace.clone(), id.clone()))
                 .and_modify(|(total, _, bm25)| {
                     *total += weighted;
                     *bm25 = Some(rrf_score);
@@ -524,6 +532,8 @@ impl HybridSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn test_search_mode_parsing() {
@@ -544,5 +554,119 @@ mod tests {
         assert_eq!(config.vector_weight, 0.6);
         assert_eq!(config.bm25_weight, 0.4);
         assert!(!config.use_rrf);
+    }
+
+    #[tokio::test]
+    async fn test_keyword_search_uses_bm25_hit_namespace() {
+        let storage_dir = TempDir::new().unwrap();
+        let bm25_dir = TempDir::new().unwrap();
+        let storage = Arc::new(
+            StorageManager::new_lance_only(storage_dir.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+
+        storage.ensure_collection().await.unwrap();
+
+        let config = HybridConfig {
+            mode: SearchMode::Keyword,
+            bm25: BM25Config::default().with_path(bm25_dir.path().to_str().unwrap()),
+            max_per_source: 0,
+            ..Default::default()
+        };
+        let searcher = HybridSearcher::new(storage, config).await.unwrap();
+
+        let embedding = vec![0.1f32; 4096];
+        let docs = vec![
+            ChromaDocument::new_flat(
+                "shared-id".to_string(),
+                "namespace-a".to_string(),
+                embedding.clone(),
+                json!({"path": "a.txt"}),
+                "alpha shared term".to_string(),
+            ),
+            ChromaDocument::new_flat(
+                "shared-id".to_string(),
+                "namespace-b".to_string(),
+                embedding,
+                json!({"path": "b.txt"}),
+                "beta shared term".to_string(),
+            ),
+        ];
+
+        searcher.index_documents(&docs).await.unwrap();
+
+        let results = searcher
+            .search("shared", vec![], None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.namespace == "namespace-a")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result.namespace == "namespace-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_search_keeps_duplicate_ids_across_namespaces() {
+        let storage_dir = TempDir::new().unwrap();
+        let bm25_dir = TempDir::new().unwrap();
+        let storage = Arc::new(
+            StorageManager::new_lance_only(storage_dir.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+
+        storage.ensure_collection().await.unwrap();
+
+        let config = HybridConfig {
+            mode: SearchMode::Hybrid,
+            bm25: BM25Config::default().with_path(bm25_dir.path().to_str().unwrap()),
+            max_per_source: 0,
+            ..Default::default()
+        };
+        let searcher = HybridSearcher::new(storage, config).await.unwrap();
+
+        let embedding = vec![0.25f32; 4096];
+        let docs = vec![
+            ChromaDocument::new_flat(
+                "shared-id".to_string(),
+                "namespace-a".to_string(),
+                embedding.clone(),
+                json!({"path": "a.txt"}),
+                "alpha shared term".to_string(),
+            ),
+            ChromaDocument::new_flat(
+                "shared-id".to_string(),
+                "namespace-b".to_string(),
+                embedding.clone(),
+                json!({"path": "b.txt"}),
+                "beta shared term".to_string(),
+            ),
+        ];
+
+        searcher.index_documents(&docs).await.unwrap();
+
+        let results = searcher
+            .search("shared", embedding, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.namespace == "namespace-a")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result.namespace == "namespace-b")
+        );
     }
 }

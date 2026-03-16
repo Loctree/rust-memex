@@ -84,7 +84,6 @@ glob = "0.3"
 
 # Text processing
 regex = "1.11"
-lazy_static = "1.5"
 
 # Cryptographic hashing for deduplication
 sha2 = "0.10"

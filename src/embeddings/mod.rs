@@ -1458,7 +1458,7 @@ impl DimensionAdapter {
 
     /// Contract larger embeddings to target dimension.
     ///
-    /// Uses PCA-like projection for dimensions that are powers of 2,
+    /// Uses averaging of consecutive elements for dimensions that are powers of 2,
     /// otherwise falls back to truncation.
     pub fn contract(&self, embedding: Vec<f32>) -> Vec<f32> {
         if embedding.len() <= self.target_dim {

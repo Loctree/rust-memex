@@ -24,6 +24,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Represents the detected intent of a user query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -129,79 +130,92 @@ pub enum SearchModeRecommendation {
 }
 
 // Keyword sets for intent detection
-lazy_static::lazy_static! {
-    static ref TEMPORAL_KEYWORDS: HashSet<&'static str> = {
-        let mut s = HashSet::new();
-        s.insert("when");
-        s.insert("date");
-        s.insert("time");
-        s.insert("before");
-        s.insert("after");
-        s.insert("since");
-        s.insert("until");
-        s.insert("ago");
-        s.insert("yesterday");
-        s.insert("today");
-        s.insert("tomorrow");
-        s.insert("last");
-        s.insert("next");
-        s.insert("month");
-        s.insert("week");
-        s.insert("year");
-        s.insert("kiedy");  // Polish: when
-        s.insert("data");   // Polish: date
-        s.insert("czas");   // Polish: time
-        s.insert("przed");  // Polish: before
-        s.insert("po");     // Polish: after
-        s.insert("wczoraj"); // Polish: yesterday
-        s.insert("dzisiaj"); // Polish: today
-        s
-    };
+fn temporal_keywords() -> &'static HashSet<&'static str> {
+    static TEMPORAL_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    TEMPORAL_KEYWORDS.get_or_init(|| {
+        [
+            "when",
+            "date",
+            "time",
+            "before",
+            "after",
+            "since",
+            "until",
+            "ago",
+            "yesterday",
+            "today",
+            "tomorrow",
+            "last",
+            "next",
+            "month",
+            "week",
+            "year",
+            "kiedy",
+            "data",
+            "czas",
+            "przed",
+            "po",
+            "wczoraj",
+            "dzisiaj",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
 
-    static ref STRUCTURAL_KEYWORDS: HashSet<&'static str> = {
-        let mut s = HashSet::new();
-        s.insert("import");
-        s.insert("imports");
-        s.insert("depend");
-        s.insert("depends");
-        s.insert("dependency");
-        s.insert("dependencies");
-        s.insert("call");
-        s.insert("calls");
-        s.insert("reference");
-        s.insert("references");
-        s.insert("use");
-        s.insert("uses");
-        s.insert("module");
-        s.insert("file");
-        s.insert("function");
-        s.insert("class");
-        s.insert("struct");
-        s.insert("interface");
-        s.insert("where");
-        s.insert("defined");
-        s.insert("definition");
-        s.insert("who");
-        s
-    };
+fn structural_keywords() -> &'static HashSet<&'static str> {
+    static STRUCTURAL_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    STRUCTURAL_KEYWORDS.get_or_init(|| {
+        [
+            "import",
+            "imports",
+            "depend",
+            "depends",
+            "dependency",
+            "dependencies",
+            "call",
+            "calls",
+            "reference",
+            "references",
+            "use",
+            "uses",
+            "module",
+            "file",
+            "function",
+            "class",
+            "struct",
+            "interface",
+            "where",
+            "defined",
+            "definition",
+            "who",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
 
-    static ref SEMANTIC_KEYWORDS: HashSet<&'static str> = {
-        let mut s = HashSet::new();
-        s.insert("similar");
-        s.insert("like");
-        s.insert("related");
-        s.insert("about");
-        s.insert("explain");
-        s.insert("understand");
-        s.insert("meaning");
-        s.insert("concept");
-        s.insert("idea");
-        s.insert("topic");
-        s.insert("theme");
-        s.insert("podobny");  // Polish: similar
-        s.insert("zwiazany"); // Polish: related
-        s
-    };
+fn semantic_keywords() -> &'static HashSet<&'static str> {
+    static SEMANTIC_KEYWORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SEMANTIC_KEYWORDS.get_or_init(|| {
+        [
+            "similar",
+            "like",
+            "related",
+            "about",
+            "explain",
+            "understand",
+            "meaning",
+            "concept",
+            "idea",
+            "topic",
+            "theme",
+            "podobny",
+            "zwiazany",
+        ]
+        .into_iter()
+        .collect()
+    })
 }
 
 /// Detect the primary intent of a query.
@@ -238,15 +252,15 @@ pub fn detect_intent(query: &str) -> QueryIntent {
     // Count keyword matches for each category
     let temporal_count = words
         .iter()
-        .filter(|w| TEMPORAL_KEYWORDS.contains(*w))
+        .filter(|w| temporal_keywords().contains(*w))
         .count();
     let structural_count = words
         .iter()
-        .filter(|w| STRUCTURAL_KEYWORDS.contains(*w))
+        .filter(|w| structural_keywords().contains(*w))
         .count();
     let semantic_count = words
         .iter()
-        .filter(|w| SEMANTIC_KEYWORDS.contains(*w))
+        .filter(|w| semantic_keywords().contains(*w))
         .count();
 
     // Check for date patterns (YYYY-MM-DD, MM/DD/YYYY, etc.)
@@ -315,17 +329,17 @@ impl QueryRouter {
         // Calculate scores for each intent
         let temporal_score = words
             .iter()
-            .filter(|w| TEMPORAL_KEYWORDS.contains(*w))
+            .filter(|w| temporal_keywords().contains(*w))
             .count() as f32
             / word_count;
         let structural_score = words
             .iter()
-            .filter(|w| STRUCTURAL_KEYWORDS.contains(*w))
+            .filter(|w| structural_keywords().contains(*w))
             .count() as f32
             / word_count;
         let semantic_score = words
             .iter()
-            .filter(|w| SEMANTIC_KEYWORDS.contains(*w))
+            .filter(|w| semantic_keywords().contains(*w))
             .count() as f32
             / word_count;
 

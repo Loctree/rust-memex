@@ -16,7 +16,7 @@ use tantivy::{
     collector::TopDocs,
     query::QueryParser,
     schema::{
-        Field, IndexRecordOption, STORED, Schema, TEXT, TextFieldIndexing, TextOptions, Value,
+        Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
     tokenizer::{Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer},
 };
@@ -171,8 +171,8 @@ impl BM25Index {
             .set_stored();
 
         let content_field = schema_builder.add_text_field("content", text_options);
-        let id_field = schema_builder.add_text_field("id", STORED);
-        let namespace_field = schema_builder.add_text_field("namespace", TEXT | STORED);
+        let id_field = schema_builder.add_text_field("id", STRING | STORED);
+        let namespace_field = schema_builder.add_text_field("namespace", STRING | STORED);
 
         let schema = schema_builder.build();
 
@@ -344,13 +344,13 @@ impl BM25Index {
     /// * `limit` - Maximum number of results
     ///
     /// # Returns
-    /// Vector of (document_id, score) tuples, sorted by score descending
+    /// Vector of (document_id, namespace, score) tuples, sorted by score descending
     pub fn search(
         &self,
         query: &str,
         namespace: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, f32)>> {
+    ) -> Result<Vec<(String, String, f32)>> {
         let searcher = self.reader.searcher();
 
         // Build query - search in content field
@@ -370,24 +370,24 @@ impl BM25Index {
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
-            // Get document ID using Value trait
+            // Get document ID and namespace using stored fields.
             let id = doc
                 .get_first(self.id_field)
                 .and_then(|v| Value::as_str(&v).map(|s| s.to_string()))
                 .ok_or_else(|| anyhow!("Document missing ID field"))?;
+            let doc_namespace = doc
+                .get_first(self.namespace_field)
+                .and_then(|v| Value::as_str(&v).map(|s| s.to_string()))
+                .ok_or_else(|| anyhow!("Document missing namespace field"))?;
 
             // Filter by namespace if specified
-            if let Some(ns) = namespace {
-                let doc_ns = doc
-                    .get_first(self.namespace_field)
-                    .and_then(|v| Value::as_str(&v))
-                    .unwrap_or("");
-                if doc_ns != ns {
-                    continue;
-                }
+            if let Some(ns) = namespace
+                && doc_namespace != ns
+            {
+                continue;
             }
 
-            results.push((id, score));
+            results.push((id, doc_namespace, score));
 
             if results.len() >= limit {
                 break;
@@ -505,7 +505,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         // doc1 and doc2 should match, doc3 should not
-        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = results.iter().map(|(id, _, _)| id.as_str()).collect();
         assert!(ids.contains(&"doc1"));
         assert!(ids.contains(&"doc2"));
     }
@@ -536,6 +536,77 @@ mod tests {
         let results = index.search("hello", Some("ns1"), 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "doc1");
+        assert_eq!(results[0].1, "ns1");
+    }
+
+    #[tokio::test]
+    async fn test_bm25_delete_documents_removes_exact_id_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BM25Config::default().with_path(temp_dir.path().to_str().unwrap());
+
+        let index = BM25Index::new(&config).unwrap();
+
+        let docs = vec![
+            (
+                "doc1".to_string(),
+                "team:alpha".to_string(),
+                "shared search term".to_string(),
+            ),
+            (
+                "doc2".to_string(),
+                "team:alpha".to_string(),
+                "shared search term".to_string(),
+            ),
+        ];
+
+        index.add_documents(&docs).await.unwrap();
+        assert_eq!(index.search("shared", None, 10).unwrap().len(), 2);
+
+        let deleted = index.delete_documents(&["doc1".to_string()]).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let results = index.search("shared", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "doc2");
+    }
+
+    #[tokio::test]
+    async fn test_bm25_purge_namespace_matches_exact_string() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = BM25Config::default().with_path(temp_dir.path().to_str().unwrap());
+
+        let index = BM25Index::new(&config).unwrap();
+
+        let docs = vec![
+            (
+                "doc1".to_string(),
+                "team:alpha".to_string(),
+                "shared search term".to_string(),
+            ),
+            (
+                "doc2".to_string(),
+                "team:beta".to_string(),
+                "shared search term".to_string(),
+            ),
+        ];
+
+        index.add_documents(&docs).await.unwrap();
+        assert_eq!(index.search("shared", None, 10).unwrap().len(), 2);
+
+        let deleted = index.purge_namespace("team:alpha").await.unwrap();
+        assert_eq!(deleted, 1);
+
+        assert!(
+            index
+                .search("shared", Some("team:alpha"), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let remaining = index.search("shared", None, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "doc2");
+        assert_eq!(remaining[0].1, "team:beta");
     }
 
     #[tokio::test]

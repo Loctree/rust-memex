@@ -365,20 +365,23 @@ fn create_flat_chunks(
 
 /// Simple chunking with overlap
 fn split_into_chunks(text: &str, target_size: usize, overlap: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
+    let mut char_offsets: Vec<usize> = text.char_indices().map(|(byte_idx, _)| byte_idx).collect();
+    let len = char_offsets.len();
 
     if len <= target_size {
         return vec![text.to_string()];
     }
+
+    char_offsets.push(text.len());
 
     let mut chunks = Vec::new();
     let mut start = 0;
 
     while start < len {
         let end = (start + target_size).min(len);
-        let chunk: String = chars[start..end].iter().collect();
-        chunks.push(chunk);
+        let start_byte = char_offsets[start];
+        let end_byte = char_offsets[end];
+        chunks.push(text[start_byte..end_byte].to_string());
 
         if end >= len {
             break;

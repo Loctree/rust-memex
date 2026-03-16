@@ -4806,7 +4806,6 @@ dependencies = [
  "glob",
  "indicatif",
  "lancedb",
- "lazy_static",
  "pdf-extract",
  "protoc-bin-vendored",
  "ratatui",

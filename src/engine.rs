@@ -962,7 +962,7 @@ impl MemexEngine {
 
         // Get BM25 results
         let bm25_results = bm25.search(query, Some(&self.namespace), limit * 2)?;
-        let bm25_max_score = bm25_results.first().map(|(_, s)| *s).unwrap_or(1.0);
+        let bm25_max_score = bm25_results.first().map(|(_, _, s)| *s).unwrap_or(1.0);
 
         // Get vector results
         let vector_results = self.search(query, limit * 2).await?;
@@ -972,7 +972,7 @@ impl MemexEngine {
         let mut scores: HashMap<String, (f32, Option<SearchResult>)> = HashMap::new();
 
         // Add BM25 scores (normalized)
-        for (id, score) in bm25_results {
+        for (id, _namespace, score) in bm25_results {
             let normalized = score / bm25_max_score.max(0.001);
             scores.insert(id, (normalized * bm25_weight, None));
         }

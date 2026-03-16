@@ -3,10 +3,10 @@
 //! Problem: ~36-40% of conversation exports are NOISE (tool outputs, metadata, CLI commands).
 //! This module filters noise BEFORE embedding to save vector space and improve search quality.
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use tracing::info;
 
 #[cfg(test)]
@@ -72,107 +72,98 @@ impl Default for PreprocessingConfig {
     }
 }
 
-lazy_static! {
-    // MCP Tool Artifacts patterns - XML-like tags used by Claude/MCP
-    // Using string concatenation to avoid XML tag interpretation
-    static ref FUNCTION_CALLS_BLOCK: Regex = Regex::new(
-        &format!(r"(?s)<{}>{}</{}>" , "function_calls", r".*?", "function_calls")
-    ).unwrap();
+struct PreprocessingRegexes {
+    function_calls_block: Regex,
+    antml_invoke_block: Regex,
+    antml_parameter_block: Regex,
+    function_results_block: Regex,
+    result_block: Regex,
+    tool_output_tags: Regex,
+    git_status_output: Regex,
+    git_diff_output: Regex,
+    cargo_output: Regex,
+    npm_output: Regex,
+    file_listing: Regex,
+    tree_output: Regex,
+    uuid_pattern: Regex,
+    timestamp_iso: Regex,
+    unix_timestamp: Regex,
+    session_id_pattern: Regex,
+    file_path_metadata: Regex,
+    empty_content_json: Regex,
+    empty_text_json: Regex,
+    placeholder_message: Regex,
+    multiple_newlines: Regex,
+    multiple_spaces: Regex,
+}
 
-    static ref ANTML_INVOKE_BLOCK: Regex = Regex::new(
-        &format!(r"(?s)<{}:{}[^>]*>.*?</{}:{}>" , "antml", "invoke", "antml", "invoke")
-    ).unwrap();
-
-    static ref ANTML_PARAMETER_BLOCK: Regex = Regex::new(
-        &format!(r"(?s)<{}:{}[^>]*>.*?</{}:{}>" , "antml", "parameter", "antml", "parameter")
-    ).unwrap();
-
-    static ref FUNCTION_RESULTS_BLOCK: Regex = Regex::new(
-        &format!(r"(?s)<{}>{}</{}>" , "function_results", r".*?", "function_results")
-    ).unwrap();
-
-    static ref RESULT_BLOCK: Regex = Regex::new(
-        &format!(r"(?s)<{}>{}</{}>" , "result", r".*?", "result")
-    ).unwrap();
-
-    // Generic XML-like tool output tags
-    static ref TOOL_OUTPUT_TAGS: Regex = Regex::new(
-        r"(?s)<(output|name|value)>.*?</(output|name|value)>"
-    ).unwrap();
-
-    // CLI Output patterns
-    static ref GIT_STATUS_OUTPUT: Regex = Regex::new(
-        r"(?m)^\s*(On branch|Your branch|Changes (?:not staged|to be committed)|Untracked files|nothing to commit|modified:|new file:|deleted:).*$"
-    ).unwrap();
-
-    // Git diff patterns - only match actual diff context, not markdown lists
-    static ref GIT_DIFF_OUTPUT: Regex = Regex::new(
-        r"(?m)^(diff --git|index [0-9a-f]+\.\.[0-9a-f]+|--- a/|--- /|\+\+\+ a/|\+\+\+ b/|@@\s*-\d+.*@@|Binary files).*$"
-    ).unwrap();
-
-    static ref CARGO_OUTPUT: Regex = Regex::new(
-        r"(?m)^(\s*(Compiling|Finished|Running|warning:|error\[E|-->|note:|help:)).*$"
-    ).unwrap();
-
-    static ref NPM_OUTPUT: Regex = Regex::new(
-        r"(?m)^(npm (WARN|ERR!|notice)|added \d+ packages|up to date|audited \d+ packages).*$"
-    ).unwrap();
-
-    static ref FILE_LISTING: Regex = Regex::new(
-        r"(?m)^(total \d+|[drwx-]{10}\s+\d+|[-lrwx]{10}\s+\d+).*$"
-    ).unwrap();
-
-    static ref TREE_OUTPUT: Regex = Regex::new(
-        r"(?m)^[│├└─\s]+[\w.-]+/?$"
-    ).unwrap();
-
-    // System Metadata patterns
-    static ref UUID_PATTERN: Regex = Regex::new(
-        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-    ).unwrap();
-
-    static ref TIMESTAMP_ISO: Regex = Regex::new(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?"
-    ).unwrap();
-
-    static ref UNIX_TIMESTAMP: Regex = Regex::new(
-        r"\b1[6-7]\d{8}\b"
-    ).unwrap();
-
-    static ref SESSION_ID_PATTERN: Regex = Regex::new(
-        r#"(session_id|sessionId|session-id|conv_id|conversation_id)["']?\s*[:=]\s*["']?[\w-]+"#
-    ).unwrap();
-
-    static ref FILE_PATH_METADATA: Regex = Regex::new(
-        r#""(path|file_path|filepath)"\s*:\s*"[^"]+""#
-    ).unwrap();
-
-    // Empty/Boilerplate patterns
-    static ref EMPTY_CONTENT_JSON: Regex = Regex::new(
-        r#""content"\s*:\s*\[\s*\]"#
-    ).unwrap();
-
-    static ref EMPTY_TEXT_JSON: Regex = Regex::new(
-        r#""text"\s*:\s*"""#
-    ).unwrap();
-
-    static ref PLACEHOLDER_MESSAGE: Regex = Regex::new(
-        r"(?i)(placeholder|lorem ipsum|TODO:|FIXME:|XXX:)"
-    ).unwrap();
-
-    // Duplicate Header patterns (system prompts, instructions)
-    static ref SYSTEM_PROMPT_HEADER: Regex = Regex::new(
-        r"(?i)(you are an? (AI|assistant|helpful)|as an AI|I am Claude|I'm Claude)"
-    ).unwrap();
-
-    // Match instruction blocks until double newline (no look-ahead - unsupported in regex crate)
-    static ref INSTRUCTION_BLOCK: Regex = Regex::new(
-        r"(?is)(instructions?:|guidelines?:|rules?:)[^\n]*(?:\n[^\n]+)*"
-    ).unwrap();
-
-    // Whitespace normalization
-    static ref MULTIPLE_NEWLINES: Regex = Regex::new(r"\n{3,}").unwrap();
-    static ref MULTIPLE_SPACES: Regex = Regex::new(r" {2,}").unwrap();
+fn preprocessing_regexes() -> &'static PreprocessingRegexes {
+    static REGEXES: OnceLock<PreprocessingRegexes> = OnceLock::new();
+    REGEXES.get_or_init(|| PreprocessingRegexes {
+        function_calls_block: Regex::new(&format!(
+            r"(?s)<{}>{}</{}>",
+            "function_calls", r".*?", "function_calls"
+        ))
+        .unwrap(),
+        antml_invoke_block: Regex::new(&format!(
+            r"(?s)<{}:{}[^>]*>.*?</{}:{}>",
+            "antml", "invoke", "antml", "invoke"
+        ))
+        .unwrap(),
+        antml_parameter_block: Regex::new(&format!(
+            r"(?s)<{}:{}[^>]*>.*?</{}:{}>",
+            "antml", "parameter", "antml", "parameter"
+        ))
+        .unwrap(),
+        function_results_block: Regex::new(&format!(
+            r"(?s)<{}>{}</{}>",
+            "function_results", r".*?", "function_results"
+        ))
+        .unwrap(),
+        result_block: Regex::new(&format!(r"(?s)<{}>{}</{}>", "result", r".*?", "result"))
+            .unwrap(),
+        tool_output_tags: Regex::new(r"(?s)<(output|name|value)>.*?</(output|name|value)>")
+            .unwrap(),
+        git_status_output: Regex::new(
+            r"(?m)^\s*(On branch|Your branch|Changes (?:not staged|to be committed)|Untracked files|nothing to commit|modified:|new file:|deleted:).*$",
+        )
+        .unwrap(),
+        git_diff_output: Regex::new(
+            r"(?m)^(diff --git|index [0-9a-f]+\.\.[0-9a-f]+|--- a/|--- /|\+\+\+ a/|\+\+\+ b/|@@\s*-\d+.*@@|Binary files).*$",
+        )
+        .unwrap(),
+        cargo_output: Regex::new(
+            r"(?m)^(\s*(Compiling|Finished|Running|warning:|error\[E|-->|note:|help:)).*$",
+        )
+        .unwrap(),
+        npm_output: Regex::new(
+            r"(?m)^(npm (WARN|ERR!|notice)|added \d+ packages|up to date|audited \d+ packages).*$",
+        )
+        .unwrap(),
+        file_listing: Regex::new(r"(?m)^(total \d+|[drwx-]{10}\s+\d+|[-lrwx]{10}\s+\d+).*$")
+            .unwrap(),
+        tree_output: Regex::new(r"(?m)^[│├└─\s]+[\w.-]+/?$").unwrap(),
+        uuid_pattern: Regex::new(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        )
+        .unwrap(),
+        timestamp_iso: Regex::new(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
+        )
+        .unwrap(),
+        unix_timestamp: Regex::new(r"\b1[6-7]\d{8}\b").unwrap(),
+        session_id_pattern: Regex::new(
+            r#"(session_id|sessionId|session-id|conv_id|conversation_id)["']?\s*[:=]\s*["']?[\w-]+"#,
+        )
+        .unwrap(),
+        file_path_metadata: Regex::new(r#""(path|file_path|filepath)"\s*:\s*"[^"]+""#).unwrap(),
+        empty_content_json: Regex::new(r#""content"\s*:\s*\[\s*\]"#).unwrap(),
+        empty_text_json: Regex::new(r#""text"\s*:\s*"""#).unwrap(),
+        placeholder_message: Regex::new(r"(?i)(placeholder|lorem ipsum|TODO:|FIXME:|XXX:)")
+            .unwrap(),
+        multiple_newlines: Regex::new(r"\n{3,}").unwrap(),
+        multiple_spaces: Regex::new(r" {2,}").unwrap(),
+    })
 }
 
 /// A simple hash for deduplication based on normalized content
@@ -372,68 +363,123 @@ impl Preprocessor {
 
     /// Extract semantic content from raw text, removing noise patterns
     pub fn extract_semantic_content(&self, raw: &str) -> String {
+        let regexes = preprocessing_regexes();
         let mut result = raw.to_string();
 
         // Remove tool artifacts
         if self.config.remove_tool_artifacts {
-            result = FUNCTION_CALLS_BLOCK.replace_all(&result, "").to_string();
-            result = ANTML_INVOKE_BLOCK.replace_all(&result, "").to_string();
-            result = ANTML_PARAMETER_BLOCK.replace_all(&result, "").to_string();
-            result = FUNCTION_RESULTS_BLOCK.replace_all(&result, "").to_string();
-            result = RESULT_BLOCK.replace_all(&result, "").to_string();
-            result = TOOL_OUTPUT_TAGS.replace_all(&result, "").to_string();
+            result = regexes
+                .function_calls_block
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes
+                .antml_invoke_block
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes
+                .antml_parameter_block
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes
+                .function_results_block
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes.result_block.replace_all(&result, "").to_string();
+            result = regexes
+                .tool_output_tags
+                .replace_all(&result, "")
+                .to_string();
         }
 
         // Remove CLI output
         if self.config.remove_cli_output {
-            result = GIT_STATUS_OUTPUT.replace_all(&result, "").to_string();
-            result = GIT_DIFF_OUTPUT.replace_all(&result, "").to_string();
-            result = CARGO_OUTPUT.replace_all(&result, "").to_string();
-            result = NPM_OUTPUT.replace_all(&result, "").to_string();
-            result = FILE_LISTING.replace_all(&result, "").to_string();
-            result = TREE_OUTPUT.replace_all(&result, "").to_string();
+            result = regexes
+                .git_status_output
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes.git_diff_output.replace_all(&result, "").to_string();
+            result = regexes.cargo_output.replace_all(&result, "").to_string();
+            result = regexes.npm_output.replace_all(&result, "").to_string();
+            result = regexes.file_listing.replace_all(&result, "").to_string();
+            result = regexes.tree_output.replace_all(&result, "").to_string();
         }
 
         // Remove metadata
         if self.config.remove_metadata {
-            result = UUID_PATTERN.replace_all(&result, "[UUID]").to_string();
-            result = TIMESTAMP_ISO
+            result = regexes
+                .uuid_pattern
+                .replace_all(&result, "[UUID]")
+                .to_string();
+            result = regexes
+                .timestamp_iso
                 .replace_all(&result, "[TIMESTAMP]")
                 .to_string();
-            result = UNIX_TIMESTAMP
+            result = regexes
+                .unix_timestamp
                 .replace_all(&result, "[TIMESTAMP]")
                 .to_string();
-            result = SESSION_ID_PATTERN.replace_all(&result, "").to_string();
-            result = FILE_PATH_METADATA.replace_all(&result, "").to_string();
+            result = regexes
+                .session_id_pattern
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes
+                .file_path_metadata
+                .replace_all(&result, "")
+                .to_string();
         }
 
         // Remove empty content patterns
         if self.config.remove_empty_content {
-            result = EMPTY_CONTENT_JSON.replace_all(&result, "").to_string();
-            result = EMPTY_TEXT_JSON.replace_all(&result, "").to_string();
-            result = PLACEHOLDER_MESSAGE.replace_all(&result, "").to_string();
+            result = regexes
+                .empty_content_json
+                .replace_all(&result, "")
+                .to_string();
+            result = regexes.empty_text_json.replace_all(&result, "").to_string();
+            result = regexes
+                .placeholder_message
+                .replace_all(&result, "")
+                .to_string();
         }
 
         // Normalize whitespace
-        result = MULTIPLE_NEWLINES.replace_all(&result, "\n\n").to_string();
-        result = MULTIPLE_SPACES.replace_all(&result, " ").to_string();
+        result = regexes
+            .multiple_newlines
+            .replace_all(&result, "\n\n")
+            .to_string();
+        result = regexes
+            .multiple_spaces
+            .replace_all(&result, " ")
+            .to_string();
 
         result.trim().to_string()
     }
 
     /// Check if content is predominantly tool artifacts
     fn is_mostly_tool_artifact(&self, content: &str) -> bool {
+        let regexes = preprocessing_regexes();
         let original_len = content.len();
         if original_len == 0 {
             return false;
         }
 
         let mut cleaned = content.to_string();
-        cleaned = FUNCTION_CALLS_BLOCK.replace_all(&cleaned, "").to_string();
-        cleaned = ANTML_INVOKE_BLOCK.replace_all(&cleaned, "").to_string();
-        cleaned = ANTML_PARAMETER_BLOCK.replace_all(&cleaned, "").to_string();
-        cleaned = FUNCTION_RESULTS_BLOCK.replace_all(&cleaned, "").to_string();
-        cleaned = RESULT_BLOCK.replace_all(&cleaned, "").to_string();
+        cleaned = regexes
+            .function_calls_block
+            .replace_all(&cleaned, "")
+            .to_string();
+        cleaned = regexes
+            .antml_invoke_block
+            .replace_all(&cleaned, "")
+            .to_string();
+        cleaned = regexes
+            .antml_parameter_block
+            .replace_all(&cleaned, "")
+            .to_string();
+        cleaned = regexes
+            .function_results_block
+            .replace_all(&cleaned, "")
+            .to_string();
+        cleaned = regexes.result_block.replace_all(&cleaned, "").to_string();
 
         let remaining_len = cleaned.trim().len();
         let artifact_ratio = 1.0 - (remaining_len as f32 / original_len as f32);
@@ -444,6 +490,7 @@ impl Preprocessor {
 
     /// Check if content is predominantly CLI output
     fn is_mostly_cli_output(&self, content: &str) -> bool {
+        let regexes = preprocessing_regexes();
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             return false;
@@ -452,12 +499,12 @@ impl Preprocessor {
         let cli_lines = lines
             .iter()
             .filter(|line| {
-                GIT_STATUS_OUTPUT.is_match(line)
-                    || GIT_DIFF_OUTPUT.is_match(line)
-                    || CARGO_OUTPUT.is_match(line)
-                    || NPM_OUTPUT.is_match(line)
-                    || FILE_LISTING.is_match(line)
-                    || TREE_OUTPUT.is_match(line)
+                regexes.git_status_output.is_match(line)
+                    || regexes.git_diff_output.is_match(line)
+                    || regexes.cargo_output.is_match(line)
+                    || regexes.npm_output.is_match(line)
+                    || regexes.file_listing.is_match(line)
+                    || regexes.tree_output.is_match(line)
             })
             .count();
 
