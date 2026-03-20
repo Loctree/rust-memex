@@ -1,0 +1,45 @@
+#!/bin/sh
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+echo "=== Pre-push validation ==="
+
+remote="$1"
+url="$2"
+echo "Pushing to: $remote ($url)"
+
+echo ""
+echo "[1/3] Format check..."
+cargo fmt -- --check || {
+  echo "Formatting issues. Run: cargo fmt"
+  exit 1
+}
+
+echo ""
+echo "[2/3] Clippy..."
+cargo clippy -- -D warnings
+
+echo ""
+echo "[3/3] Tests..."
+cargo test --quiet
+
+# Optional: Semgrep security scan
+if command -v semgrep >/dev/null 2>&1; then
+  echo ""
+  echo "[+] Semgrep security scan..."
+  semgrep \
+    --config p/secrets \
+    --config p/owasp-top-ten \
+    --config p/r2c-security-audit \
+    --error --metrics=off \
+    --exclude target \
+    --quiet || {
+      echo "Semgrep found issues. Fix before pushing."
+      exit 1
+    }
+fi
+
+echo ""
+echo "=== All pre-push checks passed ==="
