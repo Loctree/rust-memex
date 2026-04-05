@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -16,7 +16,6 @@ use crate::{
 
 pub struct MCPServer {
     mcp_core: Arc<McpCore>,
-    max_request_bytes: usize,
 }
 
 impl MCPServer {
@@ -48,39 +47,10 @@ impl MCPServer {
                 continue;
             }
 
-            if trimmed.len() > self.max_request_bytes {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32600,
-                        "message": format!(
-                            "Request too large: {} bytes (max {})",
-                            trimmed.len(),
-                            self.max_request_bytes
-                        )
-                    }
-                });
-                write_json_line(&mut stdout, &response).await?;
-                continue;
-            }
-
-            let request: Value = match serde_json::from_str(trimmed) {
-                Ok(request) => request,
-                Err(error) => {
-                    let response = json!({
-                        "jsonrpc": "2.0",
-                        "error": {"code": -32700, "message": format!("Parse error: {}", error)}
-                    });
-                    write_json_line(&mut stdout, &response).await?;
-                    continue;
-                }
-            };
-
             if let Some(response) = self
                 .mcp_core
-                .handle_jsonrpc_request(request, McpTransport::Stdio)
+                .handle_payload(trimmed, McpTransport::Stdio)
                 .await
-                .into_option()
             {
                 write_json_line(&mut stdout, &response).await?;
             }
@@ -132,14 +102,12 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
         rag,
         hybrid_searcher,
         embedding_client,
+        config.max_request_bytes,
         config.allowed_paths,
         access_manager,
     ));
 
-    Ok(MCPServer {
-        mcp_core,
-        max_request_bytes: config.max_request_bytes,
-    })
+    Ok(MCPServer { mcp_core })
 }
 
 async fn write_json_line(stdout: &mut tokio::io::Stdout, response: &Value) -> anyhow::Result<()> {

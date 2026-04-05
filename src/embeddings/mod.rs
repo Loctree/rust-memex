@@ -557,6 +557,24 @@ impl EmbeddingClient {
         self.required_dimension
     }
 
+    /// Create a stub client for tests that don't need real embeddings.
+    /// The client will fail on any actual embed() call, but lets McpCore
+    /// be constructed and dispatch protocol-level requests.
+    #[cfg(test)]
+    pub(crate) fn stub_for_tests() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            embedder_url: "http://stub:0/v1/embeddings".to_string(),
+            embedder_model: "stub".to_string(),
+            reranker_url: None,
+            reranker_model: None,
+            connected_to: "stub-test".to_string(),
+            required_dimension: 4096,
+            max_batch_chars: 32000,
+            max_batch_items: 16,
+        }
+    }
+
     pub async fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let text_preview: String = text.chars().take(100).collect();
         tracing::debug!(

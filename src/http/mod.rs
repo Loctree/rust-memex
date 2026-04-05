@@ -2212,17 +2212,16 @@ async fn mcp_messages_handler(
             )
         })?;
 
-    // Parse the JSON-RPC request
-    let request: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
-
-    debug!("MCP: session={} method={}", session_id, request["method"]);
-
     let response = state
         .mcp_core
-        .handle_jsonrpc_request(request, McpTransport::HttpSse)
-        .await
-        .into_option();
+        .handle_payload(&body, McpTransport::HttpSse)
+        .await;
+
+    debug!(
+        "MCP: session={} payload_bytes={}",
+        session_id,
+        body.trim().len()
+    );
 
     // Only send response for requests (not notifications)
     if let Some(response) = response

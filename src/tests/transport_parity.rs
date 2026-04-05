@@ -24,8 +24,8 @@
 //! diagnostics. All other tool responses are transport-independent.
 
 use crate::mcp_protocol::{
-    McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error,
-    jsonrpc_success, shared_initialize_result, shared_tools_list_result,
+    McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error, jsonrpc_success,
+    shared_initialize_result, shared_tools_list_result,
 };
 use serde_json::{Value, json};
 
@@ -90,12 +90,19 @@ fn initialize_result_has_tools_and_resources_capabilities() {
 #[test]
 fn initialize_result_has_no_extra_top_level_keys() {
     let result = shared_initialize_result();
-    let obj = result.as_object().expect("initialize result should be an object");
+    let obj = result
+        .as_object()
+        .expect("initialize result should be an object");
     let keys: Vec<&String> = obj.keys().collect();
     assert!(keys.contains(&&"protocolVersion".to_string()));
     assert!(keys.contains(&&"serverInfo".to_string()));
     assert!(keys.contains(&&"capabilities".to_string()));
-    assert_eq!(keys.len(), 3, "unexpected keys in initialize result: {:?}", keys);
+    assert_eq!(
+        keys.len(),
+        3,
+        "unexpected keys in initialize result: {:?}",
+        keys
+    );
 }
 
 #[test]
@@ -254,7 +261,7 @@ fn jsonrpc_error_omits_id_when_none() {
 /// Returns None if the embedding server is unreachable (test should skip).
 async fn try_build_mcp_core() -> Option<McpCore> {
     use crate::{
-        EmbeddingConfig, EmbeddingClient, ProviderConfig,
+        EmbeddingClient, EmbeddingConfig, ProviderConfig,
         rag::RAGPipeline,
         security::{NamespaceAccessManager, NamespaceSecurityConfig},
         storage::StorageManager,
@@ -291,17 +298,22 @@ async fn try_build_mcp_core() -> Option<McpCore> {
     std::mem::forget(tmp);
 
     let storage = Arc::new(StorageManager::new(&db_path_str).await.ok()?);
-    let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage).await.ok()?);
-
-    let access_manager = Arc::new(
-        NamespaceAccessManager::new(NamespaceSecurityConfig::default()),
+    let rag = Arc::new(
+        RAGPipeline::new(embedding_client.clone(), storage)
+            .await
+            .ok()?,
     );
+
+    let access_manager = Arc::new(NamespaceAccessManager::new(
+        NamespaceSecurityConfig::default(),
+    ));
     let _ = access_manager.init().await;
 
     Some(McpCore::new(
         rag,
         None, // no hybrid searcher needed for protocol tests
         embedding_client,
+        5 * 1024 * 1024,
         vec![],
         access_manager,
     ))
@@ -576,4 +588,386 @@ async fn health_tool_transport_field_difference_is_intentional() {
     assert_eq!(stdio_json["version"], http_json["version"]);
     assert_eq!(stdio_json["backend"], http_json["backend"]);
     assert_eq!(stdio_json["db_path"], http_json["db_path"]);
+}
+
+// ---------------------------------------------------------------------------
+// Stub-backed dispatch tests (no embedding server required)
+// ---------------------------------------------------------------------------
+
+/// Build an McpCore with a stub embedding client.
+/// These tests cover protocol dispatch paths that don't touch embeddings.
+async fn build_mcp_core_stub() -> McpCore {
+    use crate::{
+        EmbeddingClient,
+        rag::RAGPipeline,
+        security::{NamespaceAccessManager, NamespaceSecurityConfig},
+        storage::StorageManager,
+    };
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::stub_for_tests()));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join(".lancedb");
+    let db_path_str = db_path.to_string_lossy().to_string();
+    std::mem::forget(tmp);
+
+    let storage = Arc::new(
+        StorageManager::new(&db_path_str)
+            .await
+            .expect("StorageManager::new"),
+    );
+    let rag = Arc::new(
+        RAGPipeline::new(embedding_client.clone(), storage)
+            .await
+            .expect("RAGPipeline::new"),
+    );
+
+    let access_manager = Arc::new(NamespaceAccessManager::new(
+        NamespaceSecurityConfig::default(),
+    ));
+    let _ = access_manager.init().await;
+
+    McpCore::new(
+        rag,
+        None,
+        embedding_client,
+        5 * 1024 * 1024,
+        vec![],
+        access_manager,
+    )
+}
+
+/// `namespace_security_status` returns identical responses across transports.
+/// This is a representative tools/call success path that needs no embeddings.
+#[tokio::test]
+async fn dispatch_tools_call_security_status_parity() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "sec-1",
+        "method": "tools/call",
+        "params": {
+            "name": "namespace_security_status",
+            "arguments": {}
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("namespace_security_status must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("namespace_security_status must return a response");
+
+    assert_eq!(
+        stdio_resp, http_resp,
+        "namespace_security_status must be identical across transports"
+    );
+
+    // Verify the response shape: MCP content array with text
+    let text = stdio_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("should have text content");
+    assert!(
+        text.contains("Namespace security"),
+        "response should contain security status info"
+    );
+}
+
+/// `namespace_list_protected` returns identical responses across transports.
+#[tokio::test]
+async fn dispatch_tools_call_list_protected_parity() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "list-p-1",
+        "method": "tools/call",
+        "params": {
+            "name": "namespace_list_protected",
+            "arguments": {}
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("namespace_list_protected must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("namespace_list_protected must return a response");
+
+    assert_eq!(
+        stdio_resp, http_resp,
+        "namespace_list_protected must be identical across transports"
+    );
+}
+
+/// `dive` with missing required args returns the same error across transports.
+/// This is a representative tools/call failure path (parameter validation).
+#[tokio::test]
+async fn dispatch_tools_call_dive_missing_args_parity() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "dive-err-1",
+        "method": "tools/call",
+        "params": {
+            "name": "dive",
+            "arguments": {
+                "namespace": "",
+                "query": ""
+            }
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("dive validation error must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("dive validation error must return a response");
+
+    assert_eq!(
+        stdio_resp, http_resp,
+        "dive validation error must be identical across transports"
+    );
+
+    // Should be a JSON-RPC error with parameter validation code
+    assert_eq!(stdio_resp["error"]["code"], -32602);
+    assert!(
+        stdio_resp["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("required"),
+        "error should mention required fields"
+    );
+}
+
+/// `health` tool returns the same structure for both transports
+/// (except the documented `transport` field).
+/// Uses stub — doesn't need real MLX.
+#[tokio::test]
+async fn dispatch_tools_call_health_structure_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "health-stub-1",
+        "method": "tools/call",
+        "params": {
+            "name": "health",
+            "arguments": {}
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("health must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("health must return a response");
+
+    // Both must have content array with text
+    assert!(stdio_resp["result"]["content"][0]["text"].is_string());
+    assert!(http_resp["result"]["content"][0]["text"].is_string());
+
+    // Parse the JSON text
+    let stdio_json: Value =
+        serde_json::from_str(stdio_resp["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("stdio health JSON");
+    let http_json: Value =
+        serde_json::from_str(http_resp["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("http health JSON");
+
+    // Stdio: no transport field; HttpSse: has it
+    assert!(stdio_json.get("transport").is_none());
+    assert_eq!(http_json["transport"], "mcp-over-sse");
+
+    // Shared fields must match
+    assert_eq!(stdio_json["version"], http_json["version"]);
+    assert_eq!(stdio_json["backend"], http_json["backend"]);
+}
+
+/// Stub-based initialize parity — proves the path works even without MLX.
+#[tokio::test]
+async fn dispatch_initialize_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("initialize must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("initialize must return a response");
+
+    assert_eq!(stdio_resp, http_resp);
+    assert_eq!(stdio_resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+}
+
+/// Stub-based tools/list parity.
+#[tokio::test]
+async fn dispatch_tools_list_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "tl-stub",
+        "method": "tools/list",
+        "params": {}
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("tools/list must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("tools/list must return a response");
+
+    assert_eq!(stdio_resp, http_resp);
+    assert_eq!(
+        stdio_resp["result"]["tools"].as_array().unwrap().len(),
+        EXPECTED_TOOLS.len()
+    );
+}
+
+/// Unknown tool via stub — proves error parity without MLX.
+#[tokio::test]
+async fn dispatch_unknown_tool_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "ut-stub",
+        "method": "tools/call",
+        "params": {
+            "name": "nonexistent_tool",
+            "arguments": {}
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("unknown tool must return error");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("unknown tool must return error");
+
+    assert_eq!(stdio_resp, http_resp);
+    assert_eq!(stdio_resp["error"]["code"], -32601);
+}
+
+/// Notification via stub — proves both transports swallow it.
+#[tokio::test]
+async fn dispatch_notification_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+
+    let stdio = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option();
+    let http = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option();
+
+    assert!(stdio.is_none());
+    assert!(http.is_none());
+}
+
+/// Raw payload parse failures now come from the shared framing path.
+#[tokio::test]
+async fn handle_payload_parse_error_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let payload = "{";
+
+    let stdio = core.handle_payload(payload, McpTransport::Stdio).await;
+    let http = core.handle_payload(payload, McpTransport::HttpSse).await;
+
+    assert_eq!(stdio, http);
+
+    let response = stdio.expect("parse errors must produce a JSON-RPC response");
+    assert_eq!(response["error"]["code"], -32700);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Parse error")
+    );
+}
+
+/// Oversized payloads are rejected before transport-specific delivery.
+#[tokio::test]
+async fn handle_payload_request_too_large_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let oversized_payload = "x".repeat(5 * 1024 * 1024 + 1);
+
+    let stdio = core
+        .handle_payload(&oversized_payload, McpTransport::Stdio)
+        .await;
+    let http = core
+        .handle_payload(&oversized_payload, McpTransport::HttpSse)
+        .await;
+
+    assert_eq!(stdio, http);
+
+    let response = stdio.expect("oversized payload must produce a JSON-RPC response");
+    assert_eq!(response["error"]["code"], -32600);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Request too large")
+    );
 }

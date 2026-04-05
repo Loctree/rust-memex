@@ -85,6 +85,7 @@ pub struct McpCore {
     rag: Arc<RAGPipeline>,
     hybrid_searcher: Option<Arc<HybridSearcher>>,
     embedding_client: Arc<Mutex<EmbeddingClient>>,
+    max_request_bytes: usize,
     allowed_paths: Vec<String>,
     access_manager: Arc<NamespaceAccessManager>,
 }
@@ -94,6 +95,7 @@ impl McpCore {
         rag: Arc<RAGPipeline>,
         hybrid_searcher: Option<Arc<HybridSearcher>>,
         embedding_client: Arc<Mutex<EmbeddingClient>>,
+        max_request_bytes: usize,
         allowed_paths: Vec<String>,
         access_manager: Arc<NamespaceAccessManager>,
     ) -> Self {
@@ -101,6 +103,7 @@ impl McpCore {
             rag,
             hybrid_searcher,
             embedding_client,
+            max_request_bytes,
             allowed_paths,
             access_manager,
         }
@@ -108,6 +111,17 @@ impl McpCore {
 
     pub fn rag(&self) -> Arc<RAGPipeline> {
         self.rag.clone()
+    }
+
+    pub async fn handle_payload(&self, payload: &str, transport: McpTransport) -> Option<Value> {
+        let request = match parse_jsonrpc_payload(payload, self.max_request_bytes) {
+            Ok(request) => request,
+            Err(response) => return Some(response),
+        };
+
+        self.handle_jsonrpc_request(request, transport)
+            .await
+            .into_option()
     }
 
     pub async fn handle_jsonrpc_request(
@@ -775,6 +789,28 @@ fn requested_search_mode(query: &str, args: &Value) -> SearchMode {
     }
 }
 
+fn parse_jsonrpc_payload(
+    payload: &str,
+    max_request_bytes: usize,
+) -> std::result::Result<Value, Value> {
+    let trimmed = payload.trim();
+
+    if trimmed.len() > max_request_bytes {
+        return Err(jsonrpc_error(
+            None,
+            -32600,
+            format!(
+                "Request too large: {} bytes (max {})",
+                trimmed.len(),
+                max_request_bytes
+            ),
+        ));
+    }
+
+    serde_json::from_str(trimmed)
+        .map_err(|error| jsonrpc_error(None, -32700, format!("Parse error: {}", error)))
+}
+
 fn tool_error(error: impl ToString) -> Value {
     tool_error_message(error.to_string())
 }
@@ -860,7 +896,7 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
 #[cfg(test)]
 mod tests {
-    use super::{McpCore, jsonrpc_error, jsonrpc_success};
+    use super::{McpCore, jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload};
     use serde_json::{Value, json};
 
     #[test]
@@ -902,5 +938,41 @@ mod tests {
         assert!(names.contains(&"memory_purge_namespace"));
         assert!(names.contains(&"namespace_create_token"));
         assert!(names.contains(&"dive"));
+    }
+
+    #[test]
+    fn parse_jsonrpc_payload_rejects_oversized_requests() {
+        let response = parse_jsonrpc_payload("123456", 5).expect_err("payload should be rejected");
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Request too large")
+        );
+    }
+
+    #[test]
+    fn parse_jsonrpc_payload_returns_jsonrpc_parse_error() {
+        let response = parse_jsonrpc_payload("{", 1024).expect_err("payload should not parse");
+        assert_eq!(response["error"]["code"], -32700);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Parse error")
+        );
+    }
+
+    #[test]
+    fn parse_jsonrpc_payload_accepts_valid_json_with_whitespace() {
+        let request = parse_jsonrpc_payload(
+            "  {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}  ",
+            1024,
+        )
+        .expect("payload should parse");
+
+        assert_eq!(request["method"], "initialize");
+        assert_eq!(request["id"], 1);
     }
 }
