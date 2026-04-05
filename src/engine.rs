@@ -1086,8 +1086,10 @@ mod tests {
 
     #[test]
     fn test_memex_config_with_embedding_config_syncs_dimension() {
-        let mut embedding_config = EmbeddingConfig::default();
-        embedding_config.required_dimension = 768;
+        let embedding_config = EmbeddingConfig {
+            required_dimension: 768,
+            ..EmbeddingConfig::default()
+        };
 
         let config = MemexConfig::new("sync-test", "ns").with_embedding_config(embedding_config);
 
@@ -1108,8 +1110,10 @@ mod tests {
 
     #[test]
     fn test_memex_config_sync_dimension_fields_rejects_true_conflict() {
-        let mut config = MemexConfig::default();
-        config.dimension = 768;
+        let mut config = MemexConfig {
+            dimension: 768,
+            ..MemexConfig::default()
+        };
         config.embedding_config.required_dimension = 1024;
 
         let err = config.sync_dimension_fields().unwrap_err().to_string();
