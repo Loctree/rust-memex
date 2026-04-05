@@ -4,6 +4,7 @@ pub mod engine;
 pub mod handlers;
 pub mod http;
 pub mod mcp_protocol;
+mod mcp_runtime;
 pub mod path_utils;
 pub mod preprocessing;
 pub mod query;
@@ -35,6 +36,7 @@ pub use handlers::{MCPServer, create_server};
 pub use mcp_protocol::{
     McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
 };
+pub use mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request};
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,

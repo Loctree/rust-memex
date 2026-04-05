@@ -2,16 +2,12 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 
 use crate::{
     ServerConfig,
-    embeddings::EmbeddingClient,
     mcp_protocol::{McpCore, McpTransport, jsonrpc_success},
+    mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request},
     rag::RAGPipeline,
-    search::HybridSearcher,
-    security::NamespaceAccessManager,
-    storage::StorageManager,
 };
 
 pub struct MCPServer {
@@ -47,10 +43,8 @@ impl MCPServer {
                 continue;
             }
 
-            if let Some(response) = self
-                .mcp_core
-                .handle_payload(trimmed, McpTransport::Stdio)
-                .await
+            if let Some(response) =
+                dispatch_mcp_payload(self.mcp_core.as_ref(), trimmed, McpTransport::Stdio).await
             {
                 write_json_line(&mut stdout, &response).await?;
             }
@@ -64,47 +58,14 @@ impl MCPServer {
     }
 
     pub async fn handle_request(&self, request: Value) -> Value {
-        self.mcp_core
-            .handle_request(request, McpTransport::Stdio)
+        dispatch_mcp_request(self.mcp_core.as_ref(), request, McpTransport::Stdio)
             .await
             .unwrap_or_else(|| jsonrpc_success(&Value::Null, Value::Null))
     }
 }
 
 pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
-    let embedding_client = EmbeddingClient::new(&config.embeddings).await?;
-    tracing::info!(
-        "Embedding: Connected to {}",
-        embedding_client.connected_to()
-    );
-    let embedding_client = Arc::new(Mutex::new(embedding_client));
-
-    let db_path = shellexpand::tilde(&config.db_path).to_string();
-    let storage = Arc::new(StorageManager::new(&db_path).await?);
-    let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage.clone()).await?);
-
-    let hybrid_searcher = if config.hybrid.mode != crate::search::SearchMode::Vector {
-        tracing::info!("Hybrid search: mode={:?}", config.hybrid.mode);
-        Some(Arc::new(
-            HybridSearcher::new(storage, config.hybrid.clone()).await?,
-        ))
-    } else {
-        tracing::info!("Hybrid search: disabled (vector-only mode)");
-        None
-    };
-
-    let access_manager = NamespaceAccessManager::new(config.security.clone());
-    access_manager.init().await?;
-    let access_manager = Arc::new(access_manager);
-
-    let mcp_core = Arc::new(McpCore::new(
-        rag,
-        hybrid_searcher,
-        embedding_client,
-        config.max_request_bytes,
-        config.allowed_paths,
-        access_manager,
-    ));
+    let mcp_core = build_mcp_core(config).await?;
 
     Ok(MCPServer { mcp_core })
 }
