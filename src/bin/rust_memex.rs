@@ -1,15 +1,11 @@
-//! rust-memex CLI - Vector memory management tool
+//! rust-memex CLI - Convenience alias
 //!
-//! This binary is an alias for rmcp-memex, providing a CLI-focused name.
-//! Both binaries share the same codebase.
+//! This binary is strictly a convenience alias for `rmcp-memex`.
+//! The canonical product name and primary entrypoint is `rmcp-memex`.
+//! Both binaries share the exact same codebase and behavior (stdio MCP & HTTP/SSE daemon).
 //!
 //! Usage:
-//!   rust-memex index <path>                - Index documents
-//!   rust-memex search -n <ns> -q <query>   - Search documents
-//!   rust-memex audit                       - Check database quality
-//!   rust-memex purge-quality               - Remove low-quality namespaces
-//!
-//! For MCP server: rust-memex serve (or use rmcp-memex)
+//!   rust-memex <command> [args]
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 

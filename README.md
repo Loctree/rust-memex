@@ -1,11 +1,17 @@
 # rmcp-memex
 [![Crates.io](https://img.shields.io/crates/v/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![License](https://img.shields.io/crates/l/rmcp-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![CI](https://github.com/VetCoders/rmcp-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/VetCoders/rmcp-memex/actions)
 
-RAG/Memory MCP Server with LanceDB vector storage for AI agents.
+`rmcp-memex` is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.
+
+It exposes two explicit transport modes from a single canonical surface:
+1.  **`stdio` (Standard MCP)**: Native MCP integration for local agents (e.g., Claude Desktop).
+2.  **`HTTP/SSE` (Multi-Agent Daemon)**: A central daemon mode allowing concurrent AI agents to access the same memory pool over the network, resolving LanceDB's exclusive lock constraints.
+
+> **Note on Aliases:** The published package and primary entrypoint is `rmcp-memex`. For operational convenience, it installs the aliases `rust-memex`, `rmmx`, and `rmemex`. These are strictly convenience links to the identical `rmcp-memex` kernel, not separate products.
 
 ## Overview
 
-`rmcp-memex` is an MCP (Model Context Protocol) server providing:
+As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
 - **RAG (Retrieval-Augmented Generation)** - document indexing and semantic search
 - **Hybrid Search** - BM25 keyword + semantic vector search (Tantivy-based)
 - **Vector Memory** - semantic storage and retrieval of text chunks

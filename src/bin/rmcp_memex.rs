@@ -271,7 +271,12 @@ impl FileConfig {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "RAG/memory MCP server with LanceDB vector storage", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "rmcp-memex: Custom Rust MCP kernel for RAG and long-term memory.\nPrimary entrypoint. Supports stdio (native MCP) & SSE/HTTP (multi-agent) transports.\n(Aliases: rust-memex, rmmx, rmemex)",
+    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nNote: rust-memex, rmmx, and rmemex are strictly convenience aliases for this identical kernel, not separate products."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -5778,19 +5783,19 @@ async fn main() -> Result<()> {
             // HTTP-only mode: run HTTP server as main process (blocking)
             if http_only {
                 let port = http_port.expect("validated above");
-                let rag = server.rag();
+                let mcp_core = server.mcp_core();
                 info!("Starting HTTP-only server on port {} (no MCP stdio)", port);
-                rmcp_memex::http::start_server(rag, port, http_server_config).await?;
+                rmcp_memex::http::start_server(mcp_core, port, http_server_config).await?;
                 return Ok(());
             }
 
             // If HTTP port specified, start HTTP/SSE server in background
             if let Some(port) = http_port {
-                let rag = server.rag();
+                let mcp_core = server.mcp_core();
                 info!("Starting HTTP/SSE server on port {}", port);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        rmcp_memex::http::start_server(rag, port, http_server_config).await
+                        rmcp_memex::http::start_server(mcp_core, port, http_server_config).await
                     {
                         tracing::error!("HTTP server error: {}", e);
                     }

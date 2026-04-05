@@ -3,6 +3,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod handlers;
 pub mod http;
+pub mod mcp_protocol;
 pub mod path_utils;
 pub mod preprocessing;
 pub mod query;
@@ -31,6 +32,7 @@ pub use embeddings::{
     truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
+pub use mcp_protocol::{McpCore, McpDispatch, McpTransport};
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,
