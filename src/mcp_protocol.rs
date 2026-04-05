@@ -80,6 +80,300 @@ impl McpDispatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpMethod {
+    Initialize,
+    ToolsList,
+    ToolsCall,
+}
+
+impl McpMethod {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "initialize" => Some(Self::Initialize),
+            "tools/list" => Some(Self::ToolsList),
+            "tools/call" => Some(Self::ToolsCall),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpTool {
+    Health,
+    RagIndex,
+    RagIndexText,
+    RagSearch,
+    MemoryUpsert,
+    MemoryGet,
+    MemorySearch,
+    MemoryDelete,
+    MemoryPurgeNamespace,
+    NamespaceCreateToken,
+    NamespaceRevokeToken,
+    NamespaceListProtected,
+    NamespaceSecurityStatus,
+    Dive,
+}
+
+impl McpTool {
+    const ALL: [Self; 14] = [
+        Self::Health,
+        Self::RagIndex,
+        Self::RagIndexText,
+        Self::RagSearch,
+        Self::MemoryUpsert,
+        Self::MemoryGet,
+        Self::MemorySearch,
+        Self::MemoryDelete,
+        Self::MemoryPurgeNamespace,
+        Self::NamespaceCreateToken,
+        Self::NamespaceRevokeToken,
+        Self::NamespaceListProtected,
+        Self::NamespaceSecurityStatus,
+        Self::Dive,
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "health" => Some(Self::Health),
+            "rag_index" => Some(Self::RagIndex),
+            "rag_index_text" => Some(Self::RagIndexText),
+            "rag_search" => Some(Self::RagSearch),
+            "memory_upsert" => Some(Self::MemoryUpsert),
+            "memory_get" => Some(Self::MemoryGet),
+            "memory_search" => Some(Self::MemorySearch),
+            "memory_delete" => Some(Self::MemoryDelete),
+            "memory_purge_namespace" => Some(Self::MemoryPurgeNamespace),
+            "namespace_create_token" => Some(Self::NamespaceCreateToken),
+            "namespace_revoke_token" => Some(Self::NamespaceRevokeToken),
+            "namespace_list_protected" => Some(Self::NamespaceListProtected),
+            "namespace_security_status" => Some(Self::NamespaceSecurityStatus),
+            "dive" => Some(Self::Dive),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::RagIndex => "rag_index",
+            Self::RagIndexText => "rag_index_text",
+            Self::RagSearch => "rag_search",
+            Self::MemoryUpsert => "memory_upsert",
+            Self::MemoryGet => "memory_get",
+            Self::MemorySearch => "memory_search",
+            Self::MemoryDelete => "memory_delete",
+            Self::MemoryPurgeNamespace => "memory_purge_namespace",
+            Self::NamespaceCreateToken => "namespace_create_token",
+            Self::NamespaceRevokeToken => "namespace_revoke_token",
+            Self::NamespaceListProtected => "namespace_list_protected",
+            Self::NamespaceSecurityStatus => "namespace_security_status",
+            Self::Dive => "dive",
+        }
+    }
+
+    fn definition(self) -> Value {
+        match self {
+            Self::Health => json!({
+                "name": self.name(),
+                "description": "Health/status of rmcp-memex server",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }),
+            Self::RagIndex => json!({
+                "name": self.name(),
+                "description": "Index a document for RAG",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "namespace": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }
+            }),
+            Self::RagIndexText => json!({
+                "name": self.name(),
+                "description": "Index raw text for RAG/memory",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "id": {"type": "string"},
+                        "namespace": {"type": "string"},
+                        "metadata": {"type": "object"}
+                    },
+                    "required": ["text"]
+                }
+            }),
+            Self::RagSearch => json!({
+                "name": self.name(),
+                "description": "Search documents using RAG",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "k": {"type": "integer", "default": 10},
+                        "namespace": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                        "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
+                    },
+                    "required": ["query"]
+                }
+            }),
+            Self::MemoryUpsert => json!({
+                "name": self.name(),
+                "description": "Upsert a text chunk into vector memory. If the namespace is protected, provide the access token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "metadata": {"type": "object"},
+                        "token": {"type": "string", "description": "Access token for protected namespaces"}
+                    },
+                    "required": ["namespace", "id", "text"]
+                }
+            }),
+            Self::MemoryGet => json!({
+                "name": self.name(),
+                "description": "Get a stored chunk by namespace + id. If the namespace is protected, provide the access token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "id": {"type": "string"},
+                        "token": {"type": "string", "description": "Access token for protected namespaces"}
+                    },
+                    "required": ["namespace", "id"]
+                }
+            }),
+            Self::MemorySearch => json!({
+                "name": self.name(),
+                "description": "Semantic search within a namespace. If the namespace is protected, provide the access token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "query": {"type": "string"},
+                        "k": {"type": "integer", "default": 5},
+                        "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
+                        "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
+                        "token": {"type": "string", "description": "Access token for protected namespaces"}
+                    },
+                    "required": ["namespace", "query"]
+                }
+            }),
+            Self::MemoryDelete => json!({
+                "name": self.name(),
+                "description": "Delete a chunk by namespace + id. If the namespace is protected, provide the access token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "id": {"type": "string"},
+                        "token": {"type": "string", "description": "Access token for protected namespaces"}
+                    },
+                    "required": ["namespace", "id"]
+                }
+            }),
+            Self::MemoryPurgeNamespace => json!({
+                "name": self.name(),
+                "description": "Delete all chunks in a namespace. If the namespace is protected, provide the access token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "token": {"type": "string", "description": "Access token for protected namespaces"}
+                    },
+                    "required": ["namespace"]
+                }
+            }),
+            Self::NamespaceCreateToken => json!({
+                "name": self.name(),
+                "description": "Create an access token for a namespace. Once created, the namespace will require this token for access.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string", "description": "The namespace to protect with a token"},
+                        "description": {"type": "string", "description": "Optional description for the token"}
+                    },
+                    "required": ["namespace"]
+                }
+            }),
+            Self::NamespaceRevokeToken => json!({
+                "name": self.name(),
+                "description": "Revoke the access token for a namespace, making it publicly accessible again.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string", "description": "The namespace to remove token protection from"}
+                    },
+                    "required": ["namespace"]
+                }
+            }),
+            Self::NamespaceListProtected => json!({
+                "name": self.name(),
+                "description": "List all namespaces that have token protection enabled.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }),
+            Self::NamespaceSecurityStatus => json!({
+                "name": self.name(),
+                "description": "Check if namespace security (token-based access control) is enabled.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }),
+            Self::Dive => json!({
+                "name": self.name(),
+                "description": "Deep exploration with all onion layers. Shows ALL layers (outer/middle/inner/core), both BM25 and vector scores, full metadata, and related chunks.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {"type": "string", "description": "Namespace to search in"},
+                        "query": {"type": "string", "description": "Search query text"},
+                        "limit": {"type": "integer", "default": 5, "description": "Maximum results per layer"},
+                        "verbose": {"type": "boolean", "default": false, "description": "Show full text and metadata"}
+                    },
+                    "required": ["namespace", "query"]
+                }
+            }),
+        }
+    }
+}
+
+/// Shared `initialize` result used by every MCP transport.
+pub fn shared_initialize_result() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": SERVER_NAME,
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "tools": {},
+            "resources": {}
+        }
+    })
+}
+
+/// Shared `tools/list` result used by every MCP transport.
+pub fn shared_tools_list_result() -> Value {
+    let tools: Vec<Value> = McpTool::ALL.into_iter().map(McpTool::definition).collect();
+    json!({ "tools": tools })
+}
+
 #[derive(Clone)]
 pub struct McpCore {
     rag: Arc<RAGPipeline>,
@@ -113,15 +407,19 @@ impl McpCore {
         self.rag.clone()
     }
 
+    pub async fn handle_request(&self, request: Value, transport: McpTransport) -> Option<Value> {
+        self.handle_jsonrpc_request(request, transport)
+            .await
+            .into_option()
+    }
+
     pub async fn handle_payload(&self, payload: &str, transport: McpTransport) -> Option<Value> {
         let request = match parse_jsonrpc_payload(payload, self.max_request_bytes) {
             Ok(request) => request,
             Err(response) => return Some(response),
         };
 
-        self.handle_jsonrpc_request(request, transport)
-            .await
-            .into_option()
+        self.handle_request(request, transport).await
     }
 
     pub async fn handle_jsonrpc_request(
@@ -129,9 +427,9 @@ impl McpCore {
         request: Value,
         transport: McpTransport,
     ) -> McpDispatch {
-        let method = request["method"].as_str().unwrap_or("");
+        let method_name = request["method"].as_str().unwrap_or("");
 
-        if method.starts_with("notifications/") {
+        if method_name.starts_with("notifications/") {
             return McpDispatch::Notification;
         }
 
@@ -149,218 +447,27 @@ impl McpCore {
             }
         };
 
-        let result = match method {
-            "initialize" => Self::initialize_result(),
-            "tools/list" => Self::tools_list_result(),
-            "tools/call" => match self.handle_tool_call(&request, &id, transport).await {
-                Ok(result) => result,
-                Err(response) => return McpDispatch::Response(response),
-            },
-            _ => {
+        let method = match McpMethod::from_name(method_name) {
+            Some(method) => method,
+            None => {
                 return McpDispatch::Response(jsonrpc_error(
                     Some(&id),
                     -32601,
-                    format!("Unknown method: {}", method),
+                    format!("Unknown method: {}", method_name),
                 ));
             }
         };
 
-        McpDispatch::Response(jsonrpc_success(&id, result))
-    }
-
-    fn initialize_result() -> Value {
-        json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "version": env!("CARGO_PKG_VERSION")
+        let result = match method {
+            McpMethod::Initialize => shared_initialize_result(),
+            McpMethod::ToolsList => shared_tools_list_result(),
+            McpMethod::ToolsCall => match self.handle_tool_call(&request, &id, transport).await {
+                Ok(result) => result,
+                Err(response) => return McpDispatch::Response(response),
             },
-            "capabilities": {
-                "tools": {},
-                "resources": {}
-            }
-        })
-    }
+        };
 
-    fn tools_list_result() -> Value {
-        json!({
-            "tools": [
-                {
-                    "name": "health",
-                    "description": "Health/status of rmcp-memex server",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "rag_index",
-                    "description": "Index a document for RAG",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "namespace": {"type": "string"}
-                        },
-                        "required": ["path"]
-                    }
-                },
-                {
-                    "name": "rag_index_text",
-                    "description": "Index raw text for RAG/memory",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "id": {"type": "string"},
-                            "namespace": {"type": "string"},
-                            "metadata": {"type": "object"}
-                        },
-                        "required": ["text"]
-                    }
-                },
-                {
-                    "name": "rag_search",
-                    "description": "Search documents using RAG",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "k": {"type": "integer", "default": 10},
-                            "namespace": {"type": "string"},
-                            "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
-                            "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "memory_upsert",
-                    "description": "Upsert a text chunk into vector memory. If the namespace is protected, provide the access token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"},
-                            "text": {"type": "string"},
-                            "metadata": {"type": "object"},
-                            "token": {"type": "string", "description": "Access token for protected namespaces"}
-                        },
-                        "required": ["namespace", "id", "text"]
-                    }
-                },
-                {
-                    "name": "memory_get",
-                    "description": "Get a stored chunk by namespace + id. If the namespace is protected, provide the access token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"},
-                            "token": {"type": "string", "description": "Access token for protected namespaces"}
-                        },
-                        "required": ["namespace", "id"]
-                    }
-                },
-                {
-                    "name": "memory_search",
-                    "description": "Semantic search within a namespace. If the namespace is protected, provide the access token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "query": {"type": "string"},
-                            "k": {"type": "integer", "default": 5},
-                            "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
-                            "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
-                            "token": {"type": "string", "description": "Access token for protected namespaces"}
-                        },
-                        "required": ["namespace", "query"]
-                    }
-                },
-                {
-                    "name": "memory_delete",
-                    "description": "Delete a chunk by namespace + id. If the namespace is protected, provide the access token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"},
-                            "token": {"type": "string", "description": "Access token for protected namespaces"}
-                        },
-                        "required": ["namespace", "id"]
-                    }
-                },
-                {
-                    "name": "memory_purge_namespace",
-                    "description": "Delete all chunks in a namespace. If the namespace is protected, provide the access token.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "token": {"type": "string", "description": "Access token for protected namespaces"}
-                        },
-                        "required": ["namespace"]
-                    }
-                },
-                {
-                    "name": "namespace_create_token",
-                    "description": "Create an access token for a namespace. Once created, the namespace will require this token for access.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string", "description": "The namespace to protect with a token"},
-                            "description": {"type": "string", "description": "Optional description for the token"}
-                        },
-                        "required": ["namespace"]
-                    }
-                },
-                {
-                    "name": "namespace_revoke_token",
-                    "description": "Revoke the access token for a namespace, making it publicly accessible again.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string", "description": "The namespace to remove token protection from"}
-                        },
-                        "required": ["namespace"]
-                    }
-                },
-                {
-                    "name": "namespace_list_protected",
-                    "description": "List all namespaces that have token protection enabled.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "namespace_security_status",
-                    "description": "Check if namespace security (token-based access control) is enabled.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "dive",
-                    "description": "Deep exploration with all onion layers. Shows ALL layers (outer/middle/inner/core), both BM25 and vector scores, full metadata, and related chunks.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string", "description": "Namespace to search in"},
-                            "query": {"type": "string", "description": "Search query text"},
-                            "limit": {"type": "integer", "default": 5, "description": "Maximum results per layer"},
-                            "verbose": {"type": "boolean", "default": false, "description": "Show full text and metadata"}
-                        },
-                        "required": ["namespace", "query"]
-                    }
-                }
-            ]
-        })
+        McpDispatch::Response(jsonrpc_success(&id, result))
     }
 
     async fn handle_tool_call(
@@ -370,10 +477,13 @@ impl McpCore {
         transport: McpTransport,
     ) -> std::result::Result<Value, Value> {
         let tool_name = request["params"]["name"].as_str().unwrap_or("");
+        let tool = McpTool::from_name(tool_name).ok_or_else(|| {
+            jsonrpc_error(Some(id), -32601, format!("Unknown tool: {}", tool_name))
+        })?;
         let args = &request["params"]["arguments"];
 
-        match tool_name {
-            "health" => {
+        match tool {
+            McpTool::Health => {
                 let mut status = json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "db_path": self.rag.storage().lance_path(),
@@ -387,7 +497,7 @@ impl McpCore {
 
                 Ok(text_result_from_json(&status))
             }
-            "rag_index" => {
+            McpTool::RagIndex => {
                 let path_str = args["path"].as_str().unwrap_or("");
                 let namespace = args["namespace"].as_str();
 
@@ -399,7 +509,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "rag_index_text" => {
+            McpTool::RagIndexText => {
                 let text = args["text"].as_str().unwrap_or("").to_string();
                 let namespace = args["namespace"].as_str();
                 let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
@@ -419,7 +529,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "rag_search" => {
+            McpTool::RagSearch => {
                 let query = args["query"].as_str().unwrap_or("");
                 let limit = args["k"].as_u64().unwrap_or(10) as usize;
                 let namespace = args["namespace"].as_str();
@@ -437,7 +547,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "memory_upsert" => {
+            McpTool::MemoryUpsert => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
@@ -459,7 +569,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "memory_get" => {
+            McpTool::MemoryGet => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
@@ -475,7 +585,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "memory_search" => {
+            McpTool::MemorySearch => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
@@ -500,7 +610,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "memory_delete" => {
+            McpTool::MemoryDelete => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
@@ -515,7 +625,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "memory_purge_namespace" => {
+            McpTool::MemoryPurgeNamespace => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
@@ -532,7 +642,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "namespace_create_token" => {
+            McpTool::NamespaceCreateToken => {
                 let namespace = args["namespace"].as_str().unwrap_or("");
                 let description = args["description"].as_str().map(ToOwned::to_owned);
 
@@ -552,7 +662,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "namespace_revoke_token" => {
+            McpTool::NamespaceRevokeToken => {
                 let namespace = args["namespace"].as_str().unwrap_or("");
 
                 if namespace.is_empty() {
@@ -571,7 +681,7 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            "namespace_list_protected" => {
+            McpTool::NamespaceListProtected => {
                 let protected = self.access_manager.list_protected_namespaces().await;
                 if protected.is_empty() {
                     Ok(text_result(
@@ -591,7 +701,7 @@ impl McpCore {
                     Ok(pretty_text_result_from_json(&list))
                 }
             }
-            "namespace_security_status" => {
+            McpTool::NamespaceSecurityStatus => {
                 let enabled = self.access_manager.is_enabled();
                 let protected_count = self.access_manager.list_protected_namespaces().await.len();
 
@@ -601,7 +711,7 @@ impl McpCore {
                     protected_count
                 )))
             }
-            "dive" => {
+            McpTool::Dive => {
                 let namespace = args["namespace"].as_str().unwrap_or("");
                 let query = args["query"].as_str().unwrap_or("");
                 let limit = args["limit"].as_u64().unwrap_or(5) as usize;
@@ -680,11 +790,6 @@ impl McpCore {
                     "layers": all_results
                 })))
             }
-            _ => Err(jsonrpc_error(
-                Some(id),
-                -32601,
-                format!("Unknown tool: {}", tool_name),
-            )),
         }
     }
 
@@ -753,16 +858,6 @@ impl McpCore {
 
         Ok(Some(text_result_from_json(&payload)))
     }
-}
-
-#[cfg(test)]
-pub(crate) fn shared_initialize_result() -> Value {
-    McpCore::initialize_result()
-}
-
-#[cfg(test)]
-pub(crate) fn shared_tools_list_result() -> Value {
-    McpCore::tools_list_result()
 }
 
 #[derive(Clone, Copy)]
@@ -896,7 +991,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
 #[cfg(test)]
 mod tests {
-    use super::{McpCore, jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload};
+    use super::{
+        jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload, shared_initialize_result,
+        shared_tools_list_result,
+    };
     use serde_json::{Value, json};
 
     #[test]
@@ -917,7 +1015,7 @@ mod tests {
 
     #[test]
     fn initialize_advertises_resources_and_tools() {
-        let response = McpCore::initialize_result();
+        let response = shared_initialize_result();
         assert_eq!(response["protocolVersion"], "2024-11-05");
         assert!(response["capabilities"]["tools"].is_object());
         assert!(response["capabilities"]["resources"].is_object());
@@ -925,7 +1023,7 @@ mod tests {
 
     #[test]
     fn tool_list_contains_extended_stdio_and_http_surface() {
-        let result = McpCore::tools_list_result();
+        let result = shared_tools_list_result();
         let tools = result["tools"]
             .as_array()
             .expect("tools list should be an array");

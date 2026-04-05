@@ -65,9 +65,8 @@ impl MCPServer {
 
     pub async fn handle_request(&self, request: Value) -> Value {
         self.mcp_core
-            .handle_jsonrpc_request(request, McpTransport::Stdio)
+            .handle_request(request, McpTransport::Stdio)
             .await
-            .into_option()
             .unwrap_or_else(|| jsonrpc_success(&Value::Null, Value::Null))
     }
 }

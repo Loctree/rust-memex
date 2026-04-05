@@ -32,7 +32,9 @@ pub use embeddings::{
     truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
-pub use mcp_protocol::{McpCore, McpDispatch, McpTransport};
+pub use mcp_protocol::{
+    McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
+};
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,
