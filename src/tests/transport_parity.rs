@@ -6,16 +6,21 @@
 //!
 //! ## Coverage matrix
 //!
-//! | Surface              | Static | Dispatch (requires MLX) |
-//! |----------------------|--------|-------------------------|
-//! | initialize           | ✓      | ✓                       |
-//! | tools/list           | ✓      | ✓                       |
-//! | tools/call (health)  |        | ✓ (known difference)    |
-//! | tools/call (unknown) |        | ✓                       |
-//! | unknown method       |        | ✓                       |
-//! | missing id           |        | ✓                       |
-//! | notifications        |        | ✓                       |
-//! | JSON-RPC framing     | ✓      |                         |
+//! | Surface                        | Static | Stub dispatch | Full dispatch (MLX) |
+//! |--------------------------------|--------|---------------|---------------------|
+//! | initialize                     | ✓      | ✓             | ✓                   |
+//! | tools/list                     | ✓      | ✓             | ✓                   |
+//! | tools/call (health)            |        | ✓ (known diff)| ✓ (known diff)      |
+//! | tools/call (security_status)   |        | ✓             |                     |
+//! | tools/call (list_protected)    |        | ✓             |                     |
+//! | tools/call (dive validation)   |        | ✓             |                     |
+//! | tools/call (unknown)           |        | ✓             | ✓                   |
+//! | unknown method                 |        |               | ✓                   |
+//! | missing id                     |        |               | ✓                   |
+//! | notifications                  |        | ✓             | ✓                   |
+//! | JSON-RPC framing               | ✓      |               |                     |
+//! | payload parse error            |        | ✓             |                     |
+//! | payload too large              |        | ✓             |                     |
 //!
 //! ## Known transport differences
 //!
