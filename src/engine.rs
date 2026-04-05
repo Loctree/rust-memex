@@ -41,7 +41,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::embeddings::{EmbeddingClient, EmbeddingConfig};
+use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, EmbeddingClient, EmbeddingConfig};
 use crate::rag::{SearchResult, SliceLayer};
 use crate::search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
@@ -88,7 +88,7 @@ fn default_enable_hybrid() -> bool {
 }
 
 fn default_dimension() -> usize {
-    4096 // qwen3-embedding default
+    DEFAULT_REQUIRED_DIMENSION
 }
 
 impl Default for MemexConfig {
@@ -132,8 +132,33 @@ impl MemexConfig {
 
     /// Set embedding configuration
     pub fn with_embedding_config(mut self, config: EmbeddingConfig) -> Self {
+        self.dimension = config.required_dimension;
         self.embedding_config = config;
         self
+    }
+
+    fn sync_dimension_fields(&mut self) -> Result<()> {
+        if self.dimension == self.embedding_config.required_dimension {
+            return Ok(());
+        }
+
+        let default_dim = default_dimension();
+        if self.dimension == default_dim {
+            self.dimension = self.embedding_config.required_dimension;
+            return Ok(());
+        }
+
+        if self.embedding_config.required_dimension == default_dim {
+            self.embedding_config.required_dimension = self.dimension;
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "MemexConfig.dimension={} conflicts with embedding_config.required_dimension={}. \
+             Set them to the same value or use with_dimension()/with_embedding_config() so one source of truth updates both.",
+            self.dimension,
+            self.embedding_config.required_dimension
+        ))
     }
 
     /// Enable BM25 hybrid search
@@ -379,7 +404,8 @@ impl MemexEngine {
     ///     .with_dimension(1024);
     /// let engine = MemexEngine::new(config).await?;
     /// ```
-    pub async fn new(config: MemexConfig) -> Result<Self> {
+    pub async fn new(mut config: MemexConfig) -> Result<Self> {
+        config.sync_dimension_fields()?;
         let db_path = config.effective_db_path();
 
         info!(
@@ -399,16 +425,6 @@ impl MemexEngine {
             embeddings.connected_to(),
             embeddings.required_dimension()
         );
-
-        // Validate dimension matches config
-        if embeddings.required_dimension() != config.dimension {
-            return Err(anyhow!(
-                "Embedding dimension mismatch! Config: {}, Provider: {}. \
-                 Update config.dimension to match your embedding model.",
-                config.dimension,
-                embeddings.required_dimension()
-            ));
-        }
 
         // Initialize BM25 if enabled
         let bm25 = if config.enable_bm25 {
@@ -878,8 +894,8 @@ impl MemexEngine {
         // This is expensive but necessary for metadata-based filtering
         // Note: A more efficient implementation would add filter support to StorageManager
 
-        // For now, we'll search with a broad query and filter
-        // TODO: Add native metadata filtering to LanceDB queries
+        // For now, we'll scan namespace documents and filter in memory.
+        // TODO: Add native metadata filtering to LanceDB queries.
 
         let mut deleted_count = 0;
         let mut deleted_ids = Vec::new();
@@ -888,13 +904,9 @@ impl MemexEngine {
         // We use a high limit and paginate if needed
         const BATCH_SIZE: usize = 1000;
 
-        // Generate a dummy embedding for the search
-        // (we'll rely on metadata filtering, not vector similarity)
-        let dummy_embedding = vec![0.0f32; self.config.dimension];
-
         let candidates = self
             .storage
-            .search_store(Some(&self.namespace), dummy_embedding, BATCH_SIZE)
+            .all_documents(Some(&self.namespace), BATCH_SIZE)
             .await?;
 
         for doc in candidates {
@@ -1050,7 +1062,11 @@ mod tests {
     #[test]
     fn test_memex_config_defaults() {
         let config = MemexConfig::default();
-        assert_eq!(config.dimension, 4096);
+        assert_eq!(config.dimension, DEFAULT_REQUIRED_DIMENSION);
+        assert_eq!(
+            config.embedding_config.required_dimension,
+            DEFAULT_REQUIRED_DIMENSION
+        );
         assert_eq!(config.namespace, "default");
         assert_eq!(config.effective_db_path(), "~/.rmcp-servers/memex/lancedb");
     }
@@ -1064,7 +1080,40 @@ mod tests {
         assert_eq!(config.app_name, "vista");
         assert_eq!(config.namespace, "patients");
         assert_eq!(config.dimension, 1024);
+        assert_eq!(config.embedding_config.required_dimension, 1024);
         assert_eq!(config.effective_db_path(), "/custom/path/db");
+    }
+
+    #[test]
+    fn test_memex_config_with_embedding_config_syncs_dimension() {
+        let mut embedding_config = EmbeddingConfig::default();
+        embedding_config.required_dimension = 768;
+
+        let config = MemexConfig::new("sync-test", "ns").with_embedding_config(embedding_config);
+
+        assert_eq!(config.dimension, 768);
+        assert_eq!(config.embedding_config.required_dimension, 768);
+    }
+
+    #[test]
+    fn test_memex_config_sync_dimension_fields_uses_non_default_embedding_dimension() {
+        let mut config = MemexConfig::default();
+        config.embedding_config.required_dimension = 1024;
+
+        config.sync_dimension_fields().unwrap();
+
+        assert_eq!(config.dimension, 1024);
+        assert_eq!(config.embedding_config.required_dimension, 1024);
+    }
+
+    #[test]
+    fn test_memex_config_sync_dimension_fields_rejects_true_conflict() {
+        let mut config = MemexConfig::default();
+        config.dimension = 768;
+        config.embedding_config.required_dimension = 1024;
+
+        let err = config.sync_dimension_fields().unwrap_err().to_string();
+        assert!(err.contains("conflicts with embedding_config.required_dimension"));
     }
 
     #[test]
@@ -1241,6 +1290,7 @@ mod tests {
         assert_eq!(deserialized.app_name, "test");
         assert_eq!(deserialized.namespace, "ns");
         assert_eq!(deserialized.dimension, 512);
+        assert_eq!(deserialized.embedding_config.required_dimension, 512);
         assert_eq!(deserialized.db_path, Some("/tmp/test".to_string()));
     }
 

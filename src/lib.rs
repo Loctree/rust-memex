@@ -25,9 +25,10 @@ use tracing::Level;
 
 // Re-export core types for library consumers
 pub use embeddings::{
-    DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, MlxMergeOptions,
-    ProviderConfig, RerankerConfig, TokenConfig, cross_dimension_search_adapt, estimate_tokens,
-    safe_chunk_size, truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
+    MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
+    cross_dimension_search_adapt, estimate_tokens, infer_embedding_dimension, safe_chunk_size,
+    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
 pub use preprocessing::{

@@ -3,7 +3,9 @@
 //! Main application state and step management for the configuration wizard.
 //! Implements the new wizard flow with EmbedderSetup as the first configuration step.
 
-use crate::embeddings::{EmbeddingConfig, ProviderConfig};
+use crate::embeddings::{
+    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, infer_embedding_dimension,
+};
 use crate::tui::detection::{
     DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
 };
@@ -16,7 +18,7 @@ use crate::tui::indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, import_lancedb,
     start_indexing,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -132,14 +134,33 @@ impl Default for EmbedderState {
             detecting: false,
             selected_provider: None,
             manual_url: "http://localhost:11434".to_string(),
-            manual_model: "qwen3-embedding:8b".to_string(),
-            dimension: 4096,
+            manual_model: String::new(),
+            dimension: DEFAULT_REQUIRED_DIMENSION,
             use_manual: false,
         }
     }
 }
 
 impl EmbedderState {
+    pub fn selected_model(&self) -> Option<String> {
+        if self.use_manual {
+            let model = self.manual_model.trim();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            }
+        } else if let Some(ref detected) = self.selected_provider {
+            detected
+                .model()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        }
+    }
+
     /// Get dimension explanation text
     pub fn dimension_hint(&self) -> &'static str {
         dimension_explanation(self.dimension)
@@ -173,7 +194,7 @@ impl EmbedderState {
             ProviderConfig {
                 name: "ollama-local".to_string(),
                 base_url: "http://localhost:11434".to_string(),
-                model: "qwen3-embedding:8b".to_string(),
+                model: self.selected_model().unwrap_or_default(),
                 priority: 1,
                 ..Default::default()
             }
@@ -648,7 +669,14 @@ impl App {
                         {
                             match field {
                                 0 => self.embedder_state.manual_url = self.input_buffer.clone(),
-                                1 => self.embedder_state.manual_model = self.input_buffer.clone(),
+                                1 => {
+                                    self.embedder_state.manual_model = self.input_buffer.clone();
+                                    if let Some(dim) =
+                                        infer_embedding_dimension(&self.embedder_state.manual_model)
+                                    {
+                                        self.embedder_state.dimension = dim;
+                                    }
+                                }
                                 2 => {
                                     if let Ok(dim) = self.input_buffer.parse() {
                                         self.embedder_state.dimension = dim;
@@ -739,7 +767,9 @@ impl App {
         } else if self.focus < self.embedder_state.detected_providers.len() {
             // Select a detected provider
             let provider = self.embedder_state.detected_providers[self.focus].clone();
-            self.embedder_state.dimension = provider.dimension();
+            self.embedder_state.dimension = provider
+                .inferred_dimension()
+                .unwrap_or(self.embedder_state.dimension);
             self.embedder_state.selected_provider = Some(provider);
         } else {
             // Switch to manual configuration (last option)
@@ -966,13 +996,16 @@ impl App {
                 .find(|p| p.is_usable())
             {
                 self.embedder_state.selected_provider = Some(provider.clone());
-                self.embedder_state.dimension = provider.dimension();
+                self.embedder_state.dimension = provider
+                    .inferred_dimension()
+                    .unwrap_or(self.embedder_state.dimension);
             }
         }
     }
 
     /// Generate the complete config TOML for rmcp-memex
     pub fn generate_config_toml(&self) -> String {
+        const MODEL_PLACEHOLDER: &str = "<set-your-embedding-model>";
         let mut toml = String::new();
 
         // Header
@@ -1024,7 +1057,9 @@ impl App {
             ));
             toml.push_str(&format!(
                 "model = \"{}\"\n",
-                self.embedder_state.manual_model
+                self.embedder_state
+                    .selected_model()
+                    .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string())
             ));
         } else if let Some(ref provider) = self.embedder_state.selected_provider {
             let name = match provider.kind {
@@ -1037,13 +1072,13 @@ impl App {
             toml.push_str(&format!("base_url = \"{}\"\n", provider.base_url));
             toml.push_str(&format!(
                 "model = \"{}\"\n",
-                provider.model().unwrap_or("unknown")
+                provider.model().unwrap_or(MODEL_PLACEHOLDER)
             ));
         } else {
-            // Fallback default
+            // No provider selected yet: write an explicit placeholder instead of a false default.
             toml.push_str("name = \"ollama-local\"\n");
             toml.push_str("base_url = \"http://localhost:11434\"\n");
-            toml.push_str("model = \"qwen3-embedding:8b\"\n");
+            toml.push_str(&format!("model = \"{}\"\n", MODEL_PLACEHOLDER));
         }
         toml.push_str("priority = 1\n");
         toml.push_str("endpoint = \"/v1/embeddings\"\n");
@@ -1053,6 +1088,12 @@ impl App {
 
     /// Write rmcp-memex config file to disk
     pub fn write_memex_config(&mut self) -> Result<()> {
+        if self.embedder_state.selected_model().is_none() {
+            return Err(anyhow!(
+                "No embedding model selected. Pick a detected provider or enter a manual model before writing config."
+            ));
+        }
+
         if self.dry_run {
             self.messages
                 .push("DRY RUN: Config would be written to:".to_string());

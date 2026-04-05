@@ -6,14 +6,14 @@
 //! # Example config.toml
 //! ```toml
 //! [embeddings]
-//! required_dimension = 4096
+//! required_dimension = 2560
 //! max_batch_chars = 32000
 //! max_batch_items = 16
 //!
 //! [[embeddings.providers]]
 //! name = "ollama-local"
 //! base_url = "http://localhost:11434"
-//! model = "qwen3-embedding:8b"
+//! model = "qwen3-embedding:4b"
 //! priority = 1
 //!
 //! [[embeddings.providers]]
@@ -27,6 +27,35 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+pub const DEFAULT_REQUIRED_DIMENSION: usize = 2560;
+pub const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "qwen3-embedding:4b";
+
+pub fn infer_embedding_dimension(model: &str) -> Option<usize> {
+    let model = model.to_ascii_lowercase();
+
+    if model.contains("qwen3-vl-embedding") {
+        Some(2048)
+    } else if model.contains("qwen3-embedding") {
+        if model.contains("0.6b") {
+            Some(1024)
+        } else if model.contains("4b") {
+            Some(2560)
+        } else if model.contains("8b") {
+            Some(4096)
+        } else {
+            None
+        }
+    } else if model.contains("bge-m3") || model.contains("mxbai-embed") {
+        Some(1024)
+    } else if model.contains("nomic-embed") {
+        Some(768)
+    } else if model.contains("all-minilm") {
+        Some(384)
+    } else {
+        None
+    }
+}
 
 // =============================================================================
 // REQUEST/RESPONSE TYPES (OpenAI-compatible)
@@ -115,7 +144,7 @@ fn default_rerank_endpoint() -> String {
 }
 
 fn default_dimension() -> usize {
-    4096
+    DEFAULT_REQUIRED_DIMENSION
 }
 
 fn default_max_batch_chars() -> usize {
@@ -124,6 +153,16 @@ fn default_max_batch_chars() -> usize {
 
 fn default_max_batch_items() -> usize {
     64 // Increased 4x - fewer API calls, better throughput
+}
+
+fn build_provider_endpoint(base_url: &str, endpoint: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with('/') {
+        format!("{}{}", base_url, endpoint)
+    } else {
+        format!("{}/{}", base_url, endpoint)
+    }
 }
 
 /// Complete embedding configuration
@@ -149,14 +188,14 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            required_dimension: 4096,
+            required_dimension: default_dimension(),
             max_batch_chars: default_max_batch_chars(),
             max_batch_items: default_max_batch_items(),
             providers: vec![
                 ProviderConfig {
                     name: "ollama-local".to_string(),
                     base_url: "http://localhost:11434".to_string(),
-                    model: "qwen3-embedding:8b".to_string(),
+                    model: DEFAULT_OLLAMA_EMBEDDING_MODEL.to_string(),
                     priority: 1,
                     endpoint: default_embeddings_endpoint(),
                 },
@@ -325,9 +364,11 @@ impl MlxConfig {
     /// Convert legacy config to new EmbeddingConfig
     pub fn to_embedding_config(&self) -> EmbeddingConfig {
         let reranker_port = self.local_port + self.reranker_port_offset;
+        let required_dimension =
+            infer_embedding_dimension(&self.embedder_model).unwrap_or(DEFAULT_REQUIRED_DIMENSION);
 
         EmbeddingConfig {
-            required_dimension: 4096,
+            required_dimension,
             max_batch_chars: self.max_batch_chars,
             max_batch_items: self.max_batch_items,
             providers: vec![
@@ -405,16 +446,27 @@ impl EmbeddingClient {
         let mut providers = config.providers.clone();
         providers.sort_by_key(|p| p.priority);
 
-        // Try each provider in order
+        // Try each provider in order using the real embedding endpoint.
         let mut tried = Vec::new();
         for provider in &providers {
             let base_url = provider.base_url.trim_end_matches('/');
+            let provider_name = if provider.name.trim().is_empty() {
+                "<unnamed-provider>"
+            } else {
+                provider.name.as_str()
+            };
+            let model = provider.model.trim();
+            let embedder_url = build_provider_endpoint(base_url, &provider.endpoint);
 
-            match Self::health_check(&client, base_url).await {
-                Ok(()) => {
-                    tracing::info!("Embedding: Connected to {} ({})", provider.name, base_url);
-
-                    let embedder_url = format!("{}{}", base_url, provider.endpoint);
+            match probe_provider_dimension(&client, provider).await {
+                Ok(actual_dim) if actual_dim == config.required_dimension => {
+                    tracing::info!(
+                        "Embedding: Connected to {} ({}) with model '{}' [{} dims]",
+                        provider_name,
+                        embedder_url,
+                        model,
+                        actual_dim
+                    );
 
                     // Build reranker URL if configured
                     let (reranker_url, reranker_model) =
@@ -431,63 +483,48 @@ impl EmbeddingClient {
                             (None, None)
                         };
 
-                    // FAIL-FAST: Test embedding dimension before accepting this provider
-                    let test_dim = Self::test_dimension(
-                        &client,
-                        &embedder_url,
-                        &provider.model,
+                    return Ok(Self {
+                        client,
+                        embedder_url,
+                        embedder_model: provider.model.clone(),
+                        reranker_url,
+                        reranker_model,
+                        connected_to: provider.name.clone(),
+                        required_dimension: config.required_dimension,
+                        max_batch_chars: config.max_batch_chars,
+                        max_batch_items: config.max_batch_items,
+                    });
+                }
+                Ok(actual_dim) => {
+                    let failure = format!(
+                        "- {} ({} model='{}'): the configured embedding endpoint returned {} dims, but config.required_dimension={}.\n  Action: set [embeddings].required_dimension = {} or choose a {}-dim model.",
+                        provider_name,
+                        embedder_url,
+                        model,
+                        actual_dim,
                         config.required_dimension,
-                    )
-                    .await;
-
-                    match test_dim {
-                        Ok(actual_dim) => {
-                            tracing::info!(
-                                "Embedding: Dimension verified: {} (required: {})",
-                                actual_dim,
-                                config.required_dimension
-                            );
-                            return Ok(Self {
-                                client,
-                                embedder_url,
-                                embedder_model: provider.model.clone(),
-                                reranker_url,
-                                reranker_model,
-                                connected_to: provider.name.clone(),
-                                required_dimension: config.required_dimension,
-                                max_batch_chars: config.max_batch_chars,
-                                max_batch_items: config.max_batch_items,
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Embedding: {} dimension check FAILED: {}",
-                                provider.name,
-                                e
-                            );
-                            tried.push(format!(
-                                "- {} ({}): dimension check failed: {}",
-                                provider.name, base_url, e
-                            ));
-                            // Continue to next provider
-                        }
-                    }
+                        actual_dim,
+                        config.required_dimension
+                    );
+                    tracing::error!("Embedding: validation failed: {}", failure);
+                    tried.push(failure);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Embedding: {} ({}) unavailable: {}",
-                        provider.name,
-                        base_url,
-                        e
+                    let failure = format!(
+                        "- {} ({} model='{}'): {}",
+                        provider_name, embedder_url, model, e
                     );
-                    tried.push(format!("- {} ({}): {}", provider.name, base_url, e));
+                    tracing::warn!("Embedding: provider probe failed: {}", failure);
+                    tried.push(failure);
                 }
             }
         }
 
         // All providers failed
         Err(anyhow!(
-            "All embedding providers unavailable!\nTried:\n{}",
+            "No embedding provider passed validation for required_dimension={}. \
+             Each provider must succeed on its configured embedding endpoint before rmcp-memex will start.\nTried:\n{}",
+            config.required_dimension,
             tried.join("\n")
         ))
     }
@@ -508,90 +545,6 @@ impl EmbeddingClient {
     pub async fn from_env() -> Result<Self> {
         let config = MlxConfig::from_env();
         Self::from_legacy(&config).await
-    }
-
-    async fn health_check(client: &Client, base_url: &str) -> Result<()> {
-        // Try /v1/models first (OpenAI-compat)
-        let url = format!("{}/v1/models", base_url);
-        let response = client
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) if resp.status().as_u16() == 404 => {
-                // Try Ollama-native endpoint
-                let ollama_url = format!("{}/api/tags", base_url);
-                let ollama_resp = client
-                    .get(&ollama_url)
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await?;
-                if ollama_resp.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(anyhow!("Neither /v1/models nor /api/tags available"))
-                }
-            }
-            Ok(resp) => Err(anyhow!("Health check failed: {}", resp.status())),
-            Err(e) => Err(anyhow!("Connection failed: {}", e)),
-        }
-    }
-
-    /// Test embedding dimension by sending a probe request.
-    /// Returns actual dimension if it matches required, otherwise error.
-    async fn test_dimension(
-        client: &Client,
-        embedder_url: &str,
-        model: &str,
-        required_dimension: usize,
-    ) -> Result<usize> {
-        let request = EmbeddingRequest {
-            input: vec!["dimension test".to_string()],
-            model: model.to_string(),
-        };
-
-        let response = client
-            .post(embedder_url)
-            .json(&request)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| anyhow!("Dimension probe failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Dimension probe returned {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let embed_response: EmbeddingResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse dimension probe response: {}", e))?;
-
-        let actual_dim = embed_response
-            .data
-            .first()
-            .map(|d| d.embedding.len())
-            .ok_or_else(|| anyhow!("No embedding in dimension probe response"))?;
-
-        if actual_dim != required_dimension {
-            return Err(anyhow!(
-                "DIMENSION MISMATCH: model returns {} dims, but database requires {}. \
-                 Using this provider would CORRUPT the database!",
-                actual_dim,
-                required_dimension
-            ));
-        }
-
-        Ok(actual_dim)
     }
 
     /// Get which provider we're connected to
@@ -1103,6 +1056,80 @@ impl EmbeddingClient {
     }
 }
 
+pub(crate) async fn probe_provider_dimension(
+    client: &Client,
+    provider: &ProviderConfig,
+) -> Result<usize> {
+    let base_url = provider.base_url.trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(anyhow!("provider base_url is empty"));
+    }
+
+    let endpoint = provider.endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(anyhow!("provider endpoint is empty"));
+    }
+
+    let model = provider.model.trim();
+    if model.is_empty() {
+        return Err(anyhow!("provider model is empty"));
+    }
+
+    let embedder_url = build_provider_endpoint(base_url, endpoint);
+    let request = EmbeddingRequest {
+        input: vec!["dimension probe".to_string()],
+        model: model.to_string(),
+    };
+
+    let response = client
+        .post(&embedder_url)
+        .json(&request)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow!("POST {} failed: {}", embedder_url, e))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let hint = if status.as_u16() == 404 {
+            " Check provider.endpoint; Ollama and OpenAI-compatible servers typically use /v1/embeddings."
+        } else {
+            ""
+        };
+        return Err(anyhow!(
+            "POST {} returned {} for model '{}': {}{}",
+            embedder_url,
+            status,
+            model,
+            body.chars().take(300).collect::<String>(),
+            hint
+        ));
+    }
+
+    let embed_response: EmbeddingResponse = serde_json::from_str(&body).map_err(|e| {
+        anyhow!(
+            "POST {} returned non-embedding JSON for model '{}': {} (body: {})",
+            embedder_url,
+            model,
+            e,
+            body.chars().take(200).collect::<String>()
+        )
+    })?;
+
+    embed_response
+        .data
+        .first()
+        .map(|d| d.embedding.len())
+        .ok_or_else(|| {
+            anyhow!(
+                "POST {} returned no embeddings for model '{}'",
+                embedder_url,
+                model
+            )
+        })
+}
+
 /// Truncate text at a word/sentence boundary to avoid cutting mid-word (UTF-8 safe)
 fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
@@ -1257,6 +1284,32 @@ pub fn validate_batch_tokens(texts: &[String], config: &TokenConfig) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use serde_json::json;
+
+    async fn mock_embeddings(State(dim): State<usize>) -> Json<serde_json::Value> {
+        Json(json!({
+            "data": [{
+                "embedding": vec![0.25_f32; dim]
+            }]
+        }))
+    }
+
+    async fn spawn_mock_embedding_server(dim: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/embeddings", post(mock_embeddings))
+            .with_state(dim);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        format!("http://{}", addr)
+    }
 
     #[test]
     fn test_provider_sorting() {
@@ -1305,10 +1358,68 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = EmbeddingConfig::default();
-        assert_eq!(config.required_dimension, 4096);
+        assert_eq!(config.required_dimension, DEFAULT_REQUIRED_DIMENSION);
         assert_eq!(config.max_batch_chars, 128000); // 4x larger for GPU efficiency
         assert_eq!(config.max_batch_items, 64); // 4x more items per batch
         assert!(!config.providers.is_empty());
+        assert_eq!(config.providers[0].model, DEFAULT_OLLAMA_EMBEDDING_MODEL);
+    }
+
+    #[test]
+    fn test_infer_embedding_dimension() {
+        assert_eq!(
+            infer_embedding_dimension("qwen3-embedding:0.6b"),
+            Some(1024)
+        );
+        assert_eq!(infer_embedding_dimension("qwen3-embedding:4b"), Some(2560));
+        assert_eq!(infer_embedding_dimension("qwen3-embedding:8b"), Some(4096));
+        assert_eq!(
+            infer_embedding_dimension("MedAIBase/Qwen3-VL-Embedding:2b-q8_0"),
+            Some(2048)
+        );
+        assert_eq!(infer_embedding_dimension("nomic-embed-text"), Some(768));
+        assert_eq!(infer_embedding_dimension("qwen3-embedding"), None);
+        assert_eq!(infer_embedding_dimension("unknown-model"), None);
+    }
+
+    #[tokio::test]
+    async fn test_probe_provider_dimension_reads_actual_dimension() {
+        let base_url = spawn_mock_embedding_server(2560).await;
+        let client = Client::new();
+        let provider = ProviderConfig {
+            name: "mock".into(),
+            base_url,
+            model: "mock-embedder".into(),
+            priority: 1,
+            endpoint: "/v1/embeddings".into(),
+        };
+
+        let dim = probe_provider_dimension(&client, &provider).await.unwrap();
+        assert_eq!(dim, 2560);
+    }
+
+    #[tokio::test]
+    async fn test_embedding_client_fails_fast_on_dimension_mismatch() {
+        let base_url = spawn_mock_embedding_server(2560).await;
+        let config = EmbeddingConfig {
+            required_dimension: 1024,
+            providers: vec![ProviderConfig {
+                name: "mock".into(),
+                base_url,
+                model: "mock-embedder".into(),
+                priority: 1,
+                endpoint: "/v1/embeddings".into(),
+            }],
+            ..EmbeddingConfig::default()
+        };
+
+        let err = EmbeddingClient::new(&config)
+            .await
+            .err()
+            .expect("dimension mismatch should fail")
+            .to_string();
+        assert!(err.contains("returned 2560 dims"));
+        assert!(err.contains("required_dimension=1024"));
     }
 
     #[test]

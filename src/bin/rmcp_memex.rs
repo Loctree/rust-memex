@@ -11,11 +11,11 @@ use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
 use rmcp_memex::{
-    BM25Config, EmbeddingClient, EmbeddingConfig, HealthChecker, HybridConfig, HybridSearchResult,
-    HybridSearcher, IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig,
-    ProviderConfig, QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation,
-    ServerConfig, SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils,
-    run_wizard,
+    BM25Config, DEFAULT_REQUIRED_DIMENSION, EmbeddingClient, EmbeddingConfig, HealthChecker,
+    HybridConfig, HybridSearchResult, HybridSearcher, IndexProgressTracker, MlxConfig,
+    NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig, QueryRouter, RAGPipeline,
+    RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig, SliceLayer, SliceMode,
+    StorageManager, WizardConfig, create_server, path_utils, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -120,13 +120,13 @@ struct EmbeddingsFileConfig {
 }
 
 fn default_dimension() -> usize {
-    4096
+    DEFAULT_REQUIRED_DIMENSION
 }
 
 impl Default for EmbeddingsFileConfig {
     fn default() -> Self {
         Self {
-            required_dimension: 4096,
+            required_dimension: default_dimension(),
             providers: vec![],
             reranker: None,
         }
@@ -217,39 +217,46 @@ fn default_version_threshold() -> usize {
 impl FileConfig {
     /// Convert to EmbeddingConfig - new format takes precedence over legacy
     fn to_embedding_config(&self) -> EmbeddingConfig {
-        // New format takes precedence
-        if let Some(ref emb) = self.embeddings
-            && !emb.providers.is_empty()
-        {
-            let providers = emb
-                .providers
-                .iter()
-                .map(|p| ProviderConfig {
-                    name: p.name.clone(),
-                    base_url: p.base_url.clone(),
-                    model: p.model.clone(),
-                    priority: p.priority,
-                    endpoint: p.endpoint.clone(),
-                })
-                .collect();
-
-            let reranker = emb
-                .reranker
-                .as_ref()
-                .map(|r| RerankerConfig {
-                    base_url: Some(r.base_url.clone()),
-                    model: Some(r.model.clone()),
-                    endpoint: r.endpoint.clone(),
-                })
-                .unwrap_or_default();
-
-            return EmbeddingConfig {
-                required_dimension: emb.required_dimension,
-                max_batch_chars: 32000, // ~8K tokens, safe for most models
-                max_batch_items: 16,    // max texts per batch
-                providers,
-                reranker,
+        // New format takes precedence, even when it only overrides dimension or reranker.
+        if let Some(ref emb) = self.embeddings {
+            let mut config = if emb.providers.is_empty() {
+                if let Some(ref mlx) = self.mlx {
+                    tracing::warn!(
+                        "Using legacy [mlx] providers with [embeddings] overrides - please migrate to [embeddings.providers]"
+                    );
+                    mlx.to_mlx_config().to_embedding_config()
+                } else {
+                    MlxConfig::from_env().to_embedding_config()
+                }
+            } else {
+                EmbeddingConfig::default()
             };
+
+            config.required_dimension = emb.required_dimension;
+
+            if !emb.providers.is_empty() {
+                config.providers = emb
+                    .providers
+                    .iter()
+                    .map(|p| ProviderConfig {
+                        name: p.name.clone(),
+                        base_url: p.base_url.clone(),
+                        model: p.model.clone(),
+                        priority: p.priority,
+                        endpoint: p.endpoint.clone(),
+                    })
+                    .collect();
+            }
+
+            if let Some(ref reranker) = emb.reranker {
+                config.reranker = RerankerConfig {
+                    base_url: Some(reranker.base_url.clone()),
+                    model: Some(reranker.model.clone()),
+                    endpoint: reranker.endpoint.clone(),
+                };
+            }
+
+            return config;
         }
 
         // Fallback to legacy [mlx] config
@@ -1608,8 +1615,7 @@ async fn run_list_namespaces(stats: bool, json_output: bool, db_path: String) ->
     // Use a dummy embedding to get all documents (we'll use a zero vector)
     // This is a workaround since LanceDB doesn't have a direct "list all" method
     // We search with a large limit to get namespace statistics
-    let zero_embedding = vec![0.0_f32; 4096]; // Max dimension for Qwen3
-    let all_docs = storage.search_store(None, zero_embedding, 10000).await?;
+    let all_docs = storage.all_documents(None, 10000).await?;
 
     // Collect unique namespaces with counts
     let mut namespace_counts: std::collections::HashMap<String, usize> =
@@ -1684,8 +1690,7 @@ async fn run_cross_search(
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
 
     // First, get list of all namespaces
-    let zero_embedding = vec![0.0_f32; embedding_config.required_dimension];
-    let all_docs = storage.search_store(None, zero_embedding, 10000).await?;
+    let all_docs = storage.all_documents(None, 10000).await?;
 
     let mut namespace_set: HashSet<String> = HashSet::new();
     for doc in &all_docs {
@@ -1839,10 +1844,7 @@ async fn run_overview(namespace: Option<String>, json_output: bool, db_path: Str
     let storage = Arc::new(storage);
 
     // Use a zero embedding to get all documents
-    let zero_embedding = vec![0.0_f32; 4096];
-    let all_docs = storage
-        .search_store(namespace.as_deref(), zero_embedding, 100000)
-        .await?;
+    let all_docs = storage.all_documents(namespace.as_deref(), 100000).await?;
 
     if all_docs.is_empty() {
         if json_output {
@@ -3079,10 +3081,7 @@ async fn run_export(
 
     // Get all documents in the namespace
     // Using a zero vector to search - this gets documents by namespace filter
-    let zero_embedding = vec![0.0_f32; 4096]; // Max dimension
-    let docs = storage
-        .search_store(Some(&namespace), zero_embedding, 100000)
-        .await?;
+    let docs = storage.all_documents(Some(&namespace), 100000).await?;
 
     if docs.is_empty() {
         eprintln!("No documents found in namespace '{}'", namespace);
@@ -4215,9 +4214,8 @@ async fn run_dedup(
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
 
     // Get all documents (optionally filtered by namespace)
-    let zero_embedding = vec![0.0_f32; 4096];
     let all_docs = storage
-        .search_store(namespace.as_deref(), zero_embedding, 1_000_000)
+        .all_documents(namespace.as_deref(), 1_000_000)
         .await?;
 
     if all_docs.is_empty() {
@@ -4782,8 +4780,7 @@ async fn run_merge(
         && let Some(ref target) = target_storage
     {
         // Get all existing documents from target to extract their hashes
-        let zero_embedding = vec![0.0_f32; 4096];
-        if let Ok(existing_docs) = target.search_store(None, zero_embedding, 100000).await {
+        if let Ok(existing_docs) = target.all_documents(None, 100000).await {
             for doc in existing_docs {
                 if let Some(hash) = doc.content_hash {
                     seen_hashes.insert(hash);
@@ -4819,11 +4816,7 @@ async fn run_merge(
         };
 
         // Get all documents from source (using zero embedding for full scan)
-        let zero_embedding = vec![0.0_f32; 4096];
-        let source_docs = match source_storage
-            .search_store(None, zero_embedding, 100000)
-            .await
-        {
+        let source_docs = match source_storage.all_documents(None, 100000).await {
             Ok(docs) => docs,
             Err(e) => {
                 if !json_output {

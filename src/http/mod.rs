@@ -1260,12 +1260,10 @@ async fn browse_handler(
         Some(ns.as_str())
     };
 
-    // Use a zero embedding to get all docs (sorted by default order)
-    let zero_embedding = vec![0.0_f32; 4096];
     let all_docs = state
         .rag
         .storage()
-        .search_store(namespace, zero_embedding, params.limit + params.offset)
+        .all_documents(namespace, params.limit + params.offset)
         .await
         .map_err(|e| {
             error!("API: /api/browse/{} - error: {}", ns, e);
@@ -1317,12 +1315,10 @@ async fn browse_all_handler(
         params.limit, params.offset
     );
 
-    // Use a zero embedding to get documents (random order without real search)
-    let zero_embedding = vec![0.0_f32; 4096];
     let all_docs = state
         .rag
         .storage()
-        .search_store(None, zero_embedding, params.limit + params.offset)
+        .all_documents(None, params.limit + params.offset)
         .await
         .map_err(|e| {
             error!("API: /api/browse (all) - error: {}", e);
@@ -1493,12 +1489,10 @@ async fn cross_search_handler(
 
     let start = std::time::Instant::now();
 
-    // Get all namespaces by searching with zero embedding
-    let zero_embedding = vec![0.0_f32; 4096]; // Max dimension
     let all_docs = state
         .rag
         .storage()
-        .search_store(None, zero_embedding, 10000)
+        .all_documents(None, 10000)
         .await
         .map_err(|e| {
             error!("Cross-search namespace lookup error: {}", e);
@@ -1585,8 +1579,7 @@ async fn sse_cross_search_handler(
             }).to_string()));
 
         // Get all namespaces
-        let zero_embedding = vec![0.0_f32; 4096];
-        let all_docs = match state.rag.storage().search_store(None, zero_embedding, 10000).await {
+        let all_docs = match state.rag.storage().all_documents(None, 10000).await {
             Ok(docs) => docs,
             Err(e) => {
                 yield Ok(Event::default()
