@@ -426,7 +426,7 @@ impl BM25Index {
     ///
     /// # Errors
     /// Returns error if index is in read-only mode or another process holds the lock
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+    pub async fn delete_namespace_term(&self, namespace: &str) -> Result<usize> {
         let namespace_field = self.namespace_field;
         let namespace_owned = namespace.to_string();
         let namespace_log = namespace.to_string();
@@ -440,6 +440,11 @@ impl BM25Index {
 
         tracing::info!("Purged namespace '{}' from BM25 index", namespace_log);
         Ok(1)
+    }
+
+    #[deprecated(note = "use delete_namespace_term")]
+    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+        self.delete_namespace_term(namespace).await
     }
 
     /// Escape special query characters
@@ -593,7 +598,7 @@ mod tests {
         index.add_documents(&docs).await.unwrap();
         assert_eq!(index.search("shared", None, 10).unwrap().len(), 2);
 
-        let deleted = index.purge_namespace("team:alpha").await.unwrap();
+        let deleted = index.delete_namespace_term("team:alpha").await.unwrap();
         assert_eq!(deleted, 1);
 
         assert!(

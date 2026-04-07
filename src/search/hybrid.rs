@@ -234,6 +234,7 @@ impl HybridSearcher {
             })
             .collect();
         Self::dedup_by_content_hash(&mut results);
+        Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         Ok(results)
     }
@@ -274,6 +275,7 @@ impl HybridSearcher {
         }
 
         Self::dedup_by_content_hash(&mut results);
+        Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         Ok(results)
     }
@@ -359,6 +361,7 @@ impl HybridSearcher {
         }
 
         Self::dedup_by_content_hash(&mut final_results);
+        Self::dedup_by_source_path(&mut final_results);
         Self::enforce_source_diversity(&mut final_results, self.config.max_per_source);
 
         tracing::debug!(
@@ -387,6 +390,35 @@ impl HybridSearcher {
         if removed > 0 {
             tracing::debug!(
                 "Dedup: removed {} duplicate chunks by content_hash",
+                removed
+            );
+        }
+    }
+
+    /// Deduplicate results by their source document path when present.
+    ///
+    /// This keeps only the highest-ranked hit per source file after chunk-level dedup,
+    /// so one heavily sliced document does not dominate the result list.
+    fn dedup_by_source_path(results: &mut Vec<HybridSearchResult>) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let before = results.len();
+
+        results.retain(|result| {
+            let source_key = result
+                .metadata
+                .get("source_path")
+                .and_then(|value| value.as_str())
+                .or_else(|| result.metadata.get("path").and_then(|value| value.as_str()))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("{}::{}", result.namespace, result.id));
+
+            seen.insert(source_key)
+        });
+
+        let removed = before - results.len();
+        if removed > 0 {
+            tracing::debug!(
+                "Dedup: removed {} duplicate hits by source path/doc id",
                 removed
             );
         }
@@ -515,17 +547,6 @@ impl HybridSearcher {
 
         if let Some(ref bm25) = self.bm25_index {
             bm25.delete_documents(ids).await?;
-        }
-
-        Ok(deleted)
-    }
-
-    /// Purge entire namespace from both indices
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        let deleted = self.storage.purge_namespace(namespace).await?;
-
-        if let Some(ref bm25) = self.bm25_index {
-            bm25.purge_namespace(namespace).await?;
         }
 
         Ok(deleted)
@@ -671,5 +692,56 @@ mod tests {
                 .iter()
                 .any(|result| result.namespace == "namespace-b")
         );
+    }
+
+    #[test]
+    fn test_dedup_by_source_path_keeps_highest_ranked_hit_per_file() {
+        let mut results = vec![
+            HybridSearchResult {
+                id: "doc-outer".to_string(),
+                namespace: "ns".to_string(),
+                document: "outer".to_string(),
+                combined_score: 0.9,
+                vector_score: Some(0.9),
+                bm25_score: Some(0.8),
+                metadata: json!({"path": "/tmp/shared.md"}),
+                layer: None,
+                parent_id: None,
+                children_ids: vec![],
+                keywords: vec![],
+            },
+            HybridSearchResult {
+                id: "doc-inner".to_string(),
+                namespace: "ns".to_string(),
+                document: "inner".to_string(),
+                combined_score: 0.7,
+                vector_score: Some(0.7),
+                bm25_score: Some(0.6),
+                metadata: json!({"path": "/tmp/shared.md"}),
+                layer: None,
+                parent_id: None,
+                children_ids: vec![],
+                keywords: vec![],
+            },
+            HybridSearchResult {
+                id: "doc-other".to_string(),
+                namespace: "ns".to_string(),
+                document: "other".to_string(),
+                combined_score: 0.5,
+                vector_score: Some(0.5),
+                bm25_score: Some(0.4),
+                metadata: json!({"path": "/tmp/other.md"}),
+                layer: None,
+                parent_id: None,
+                children_ids: vec![],
+                keywords: vec![],
+            },
+        ];
+
+        HybridSearcher::dedup_by_source_path(&mut results);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "doc-outer");
+        assert_eq!(results[1].id, "doc-other");
     }
 }

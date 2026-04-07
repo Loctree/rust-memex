@@ -72,14 +72,14 @@ async fn memory_roundtrip_and_search() -> Result<()> {
 
     // Read it back
     let fetched = rag
-        .memory_get("testns", "doc1")
+        .lookup_memory("testns", "doc1")
         .await?
         .ok_or_else(|| anyhow!("doc missing"))?;
     assert_eq!(fetched.text, "Ala ma kota");
     assert_eq!(fetched.namespace, "testns");
 
     // Semantic search within namespace
-    let results = rag.memory_search("testns", "kota", 1).await?;
+    let results = rag.search_memory("testns", "kota", 1).await?;
     assert!(!results.is_empty(), "expected at least one search result");
     assert_eq!(results[0].namespace, "testns");
 
@@ -210,7 +210,7 @@ async fn test_exact_dedup_skips_identical_content() -> Result<()> {
         .index_document_with_dedup(&test_file, Some("dedup-test"), SliceMode::Flat)
         .await?;
 
-    assert!(result1.is_indexed(), "First indexing should succeed");
+    assert!(result1.was_indexed(), "First indexing should succeed");
 
     // Second indexing of SAME content should skip
     let result2 = rag
@@ -250,13 +250,13 @@ async fn test_dedup_allows_different_content() -> Result<()> {
     let result1 = rag
         .index_document_with_dedup(&test_file1, Some("dedup-test"), SliceMode::Flat)
         .await?;
-    assert!(result1.is_indexed());
+    assert!(result1.was_indexed());
 
     // Index second file - should NOT be skipped (different content)
     let result2 = rag
         .index_document_with_dedup(&test_file2, Some("dedup-test"), SliceMode::Flat)
         .await?;
-    assert!(result2.is_indexed(), "Different content should be indexed");
+    assert!(result2.was_indexed(), "Different content should be indexed");
 
     // Hashes should be different
     assert_ne!(result1.content_hash(), result2.content_hash());
@@ -284,7 +284,7 @@ async fn test_dedup_different_namespaces() -> Result<()> {
     let result1 = rag
         .index_document_with_dedup(&test_file, Some("namespace-a"), SliceMode::Flat)
         .await?;
-    assert!(result1.is_indexed());
+    assert!(result1.was_indexed());
 
     // Same content in different namespace should also be indexed
     // (dedup is per-namespace, not global)
@@ -292,7 +292,7 @@ async fn test_dedup_different_namespaces() -> Result<()> {
         .index_document_with_dedup(&test_file, Some("namespace-b"), SliceMode::Flat)
         .await?;
     assert!(
-        result2.is_indexed(),
+        result2.was_indexed(),
         "Same content in different namespace should be indexed"
     );
 
@@ -329,7 +329,7 @@ async fn test_has_content_hash() -> Result<()> {
     let result = rag
         .index_document_with_dedup(&test_file, Some("hash-test"), SliceMode::Flat)
         .await?;
-    assert!(result.is_indexed());
+    assert!(result.was_indexed());
 
     // After indexing, hash should exist
     let exists_after = rag

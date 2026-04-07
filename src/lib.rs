@@ -162,9 +162,15 @@ impl ServerConfig {
         Self::default()
     }
 
-    pub fn with_db_path(mut self, db_path: impl Into<String>) -> Self {
+    #[doc(alias = "with_db_path")]
+    pub fn with_storage_path(mut self, db_path: impl Into<String>) -> Self {
         self.db_path = db_path.into();
         self
+    }
+
+    #[deprecated(note = "use with_storage_path")]
+    pub fn with_db_path(self, db_path: impl Into<String>) -> Self {
+        self.with_storage_path(db_path)
     }
 
     pub fn with_features(mut self, features: Vec<String>) -> Self {

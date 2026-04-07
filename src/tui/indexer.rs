@@ -282,7 +282,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 
 /// Collect files from a directory for indexing
-pub fn collect_files(dir_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn collect_indexable_files(dir_path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     if !dir_path.exists() {
@@ -463,7 +463,7 @@ async fn run_indexing(
     use tokio::sync::Mutex;
 
     // Collect files first
-    let files = collect_files(&dir_path)?;
+    let files = collect_indexable_files(&dir_path)?;
     let total = files.len();
 
     if total == 0 {

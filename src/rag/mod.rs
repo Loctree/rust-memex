@@ -177,8 +177,13 @@ pub enum IndexResult {
 
 impl IndexResult {
     /// Check if content was indexed
-    pub fn is_indexed(&self) -> bool {
+    pub fn was_indexed(&self) -> bool {
         matches!(self, IndexResult::Indexed { .. })
+    }
+
+    #[deprecated(note = "use was_indexed")]
+    pub fn is_indexed(&self) -> bool {
+        self.was_indexed()
     }
 
     /// Check if content was skipped
@@ -1150,10 +1155,10 @@ impl RAGPipeline {
     }
 
     async fn clear_namespace_from_indices(&self, namespace: &str) -> Result<usize> {
-        let deleted = self.storage.purge_namespace(namespace).await?;
+        let deleted = self.storage.delete_namespace_documents(namespace).await?;
 
         if let Some(bm25_writer) = &self.bm25_writer {
-            bm25_writer.purge_namespace(namespace).await?;
+            bm25_writer.delete_namespace_term(namespace).await?;
         }
 
         Ok(deleted)
@@ -1973,6 +1978,7 @@ impl RAGPipeline {
         Ok(None)
     }
 
+    #[deprecated(note = "use lookup_memory")]
     pub async fn memory_get(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
         self.lookup_memory(namespace, id).await
     }
@@ -1981,6 +1987,7 @@ impl RAGPipeline {
         self.delete_memory_from_indices(namespace, id).await
     }
 
+    #[deprecated(note = "use remove_memory")]
     pub async fn memory_delete(&self, namespace: &str, id: &str) -> Result<usize> {
         self.remove_memory(namespace, id).await
     }
@@ -1989,6 +1996,7 @@ impl RAGPipeline {
         self.clear_namespace_from_indices(namespace).await
     }
 
+    #[deprecated(note = "use clear_namespace")]
     pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
         self.clear_namespace(namespace).await
     }
@@ -2003,6 +2011,7 @@ impl RAGPipeline {
             .await
     }
 
+    #[deprecated(note = "use search_memory")]
     pub async fn memory_search(
         &self,
         namespace: &str,

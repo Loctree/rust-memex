@@ -182,6 +182,45 @@ impl MemexConfig {
             .map(|c| c.index_path.clone())
             .unwrap_or_else(|| format!("~/.rmcp-servers/{}/bm25", self.app_name))
     }
+
+    fn hybrid_uses_bm25(&self) -> bool {
+        self.enable_hybrid
+            && self.hybrid_config.clone().unwrap_or_default().mode != SearchMode::Vector
+    }
+
+    fn normalize_bm25_config(&self, mut config: BM25Config) -> BM25Config {
+        if config.index_path == BM25Config::default().index_path {
+            config.index_path = self.effective_bm25_path();
+        }
+        config
+    }
+
+    fn resolved_bm25_config(&self) -> Option<BM25Config> {
+        if !self.enable_bm25 && !self.hybrid_uses_bm25() {
+            return None;
+        }
+
+        let config = self
+            .bm25_config
+            .clone()
+            .or_else(|| {
+                self.hybrid_config
+                    .as_ref()
+                    .filter(|cfg| cfg.mode != SearchMode::Vector)
+                    .map(|cfg| cfg.bm25.clone())
+            })
+            .unwrap_or_default();
+
+        Some(self.normalize_bm25_config(config))
+    }
+
+    fn resolved_hybrid_config(&self) -> HybridConfig {
+        let mut config = self.hybrid_config.clone().unwrap_or_default();
+        if let Some(bm25) = self.resolved_bm25_config() {
+            config.bm25 = bm25;
+        }
+        config
+    }
 }
 
 /// Metadata filter for search and deletion operations.
@@ -388,7 +427,7 @@ pub struct DiveResult {
 pub struct MemexEngine {
     storage: Arc<StorageManager>,
     embeddings: Arc<Mutex<EmbeddingClient>>,
-    bm25: Option<BM25Index>,
+    bm25: Option<Arc<BM25Index>>,
     hybrid_searcher: Option<HybridSearcher>,
     namespace: String,
     config: MemexConfig,
@@ -427,22 +466,25 @@ impl MemexEngine {
         );
 
         // Initialize BM25 if enabled
-        let bm25 = if config.enable_bm25 {
-            let bm25_config = config
-                .bm25_config
-                .clone()
-                .unwrap_or_else(|| BM25Config::default().with_path(config.effective_bm25_path()));
-            Some(BM25Index::new(&bm25_config)?)
-        } else {
-            None
-        };
+        let bm25 = config
+            .resolved_bm25_config()
+            .map(|bm25_config| BM25Index::new(&bm25_config).map(Arc::new))
+            .transpose()?;
 
         let storage_arc = Arc::new(storage);
 
         // Initialize HybridSearcher if hybrid mode is enabled
         let hybrid_searcher = if config.enable_hybrid {
-            let hybrid_config = config.hybrid_config.clone().unwrap_or_default();
-            Some(HybridSearcher::new(storage_arc.clone(), hybrid_config).await?)
+            let hybrid_config = config.resolved_hybrid_config();
+            Some(if let Some(ref bm25_index) = bm25 {
+                HybridSearcher::with_bm25_index(
+                    storage_arc.clone(),
+                    bm25_index.clone(),
+                    hybrid_config,
+                )
+            } else {
+                HybridSearcher::new(storage_arc.clone(), hybrid_config).await?
+            })
         } else {
             None
         };
@@ -936,10 +978,13 @@ impl MemexEngine {
     pub async fn purge_namespace(&self) -> Result<usize> {
         info!("Purging namespace: {}", self.namespace);
 
-        let deleted = self.storage.purge_namespace(&self.namespace).await?;
+        let deleted = self
+            .storage
+            .delete_namespace_documents(&self.namespace)
+            .await?;
 
         if let Some(ref bm25) = self.bm25 {
-            bm25.purge_namespace(&self.namespace).await?;
+            bm25.delete_namespace_term(&self.namespace).await?;
         }
 
         Ok(deleted)
@@ -1265,6 +1310,24 @@ mod tests {
     fn test_memex_config_effective_bm25_path() {
         let config = MemexConfig::new("my-app", "docs");
         assert_eq!(config.effective_bm25_path(), "~/.rmcp-servers/my-app/bm25");
+    }
+
+    #[test]
+    fn test_resolved_bm25_config_uses_app_specific_path_for_hybrid_defaults() {
+        let config = MemexConfig::new("my-app", "docs");
+        let bm25 = config
+            .resolved_bm25_config()
+            .expect("hybrid defaults should provision BM25");
+
+        assert_eq!(bm25.index_path, "~/.rmcp-servers/my-app/bm25");
+    }
+
+    #[test]
+    fn test_resolved_hybrid_config_reuses_resolved_bm25_path() {
+        let config = MemexConfig::new("my-app", "docs");
+        let hybrid = config.resolved_hybrid_config();
+
+        assert_eq!(hybrid.bm25.index_path, "~/.rmcp-servers/my-app/bm25");
     }
 
     #[test]

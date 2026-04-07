@@ -22,3 +22,5 @@ target/
 /.loctree
 AGENTS.md
 /lancedb
+/*.py
+/tmp

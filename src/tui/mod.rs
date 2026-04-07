@@ -29,6 +29,6 @@ pub use detection::{
 pub use health::{CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker};
 pub use host_detection::{HostDetection, detect_hosts};
 pub use indexer::{
-    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, collect_files,
-    import_lancedb, start_indexing, validate_path,
+    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress,
+    collect_indexable_files, import_lancedb, start_indexing, validate_path,
 };

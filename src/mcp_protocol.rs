@@ -219,6 +219,7 @@ impl McpTool {
                         "query": {"type": "string"},
                         "k": {"type": "integer", "default": 10},
                         "namespace": {"type": "string"},
+                        "deep": {"type": "boolean", "default": false, "description": "Include all onion layers instead of only outer summaries"},
                         "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
                         "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
                     },
@@ -262,6 +263,7 @@ impl McpTool {
                         "namespace": {"type": "string"},
                         "query": {"type": "string"},
                         "k": {"type": "integer", "default": 5},
+                        "deep": {"type": "boolean", "default": false, "description": "Include all onion layers instead of only outer summaries"},
                         "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
                         "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
                         "token": {"type": "string", "description": "Access token for protected namespaces"}
@@ -531,12 +533,20 @@ impl McpCore {
             }
             McpTool::RagSearch => {
                 let query = args["query"].as_str().unwrap_or("");
-                let limit = args["k"].as_u64().unwrap_or(10) as usize;
+                let limit = requested_limit(args, 10);
                 let namespace = args["namespace"].as_str();
                 let mode = requested_search_mode(query, args);
+                let layer_filter = requested_layer_filter(args);
 
                 if let Some(hybrid_result) = self
-                    .try_hybrid_search(query, namespace, limit, mode, id, SearchShape::Rag)
+                    .try_hybrid_search(
+                        query,
+                        namespace,
+                        limit,
+                        (mode, layer_filter),
+                        id,
+                        SearchShape::Rag,
+                    )
                     .await?
                 {
                     return Ok(hybrid_result);
@@ -595,11 +605,19 @@ impl McpCore {
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
                 let query = args["query"].as_str().unwrap_or("");
-                let limit = args["k"].as_u64().unwrap_or(5) as usize;
+                let limit = requested_limit(args, 5);
                 let mode = requested_search_mode(query, args);
+                let layer_filter = requested_layer_filter(args);
 
                 if let Some(hybrid_result) = self
-                    .try_hybrid_search(query, Some(namespace), limit, mode, id, SearchShape::Memory)
+                    .try_hybrid_search(
+                        query,
+                        Some(namespace),
+                        limit,
+                        (mode, layer_filter),
+                        id,
+                        SearchShape::Memory,
+                    )
                     .await?
                 {
                     return Ok(hybrid_result);
@@ -798,10 +816,11 @@ impl McpCore {
         query: &str,
         namespace: Option<&str>,
         limit: usize,
-        mode: SearchMode,
+        search: (SearchMode, Option<SliceLayer>),
         id: &Value,
         shape: SearchShape,
     ) -> std::result::Result<Option<Value>, Value> {
+        let (mode, layer_filter) = search;
         if mode == SearchMode::Vector {
             return Ok(None);
         }
@@ -819,7 +838,7 @@ impl McpCore {
             .map_err(|e| jsonrpc_error(Some(id), -32603, format!("Embedding failed: {}", e)))?;
 
         let results = hybrid_searcher
-            .search(query, query_embedding, namespace, limit, None)
+            .search(query, query_embedding, namespace, limit, layer_filter)
             .await
             .map_err(|e| jsonrpc_error(Some(id), -32603, format!("Hybrid search failed: {}", e)))?;
 
@@ -882,6 +901,21 @@ fn requested_search_mode(query: &str, args: &Value) -> SearchMode {
             _ => SearchMode::Hybrid,
         }
     }
+}
+
+fn requested_layer_filter(args: &Value) -> Option<SliceLayer> {
+    if args["deep"].as_bool().unwrap_or(false) {
+        None
+    } else {
+        Some(SliceLayer::Outer)
+    }
+}
+
+fn requested_limit(args: &Value, default: usize) -> usize {
+    args["k"]
+        .as_u64()
+        .map(|value| value as usize)
+        .unwrap_or(default)
 }
 
 fn parse_jsonrpc_payload(
@@ -992,9 +1026,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::{
-        jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload, shared_initialize_result,
-        shared_tools_list_result,
+        jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload, requested_layer_filter,
+        requested_limit, shared_initialize_result, shared_tools_list_result,
     };
+    use crate::rag::SliceLayer;
     use serde_json::{Value, json};
 
     #[test]
@@ -1072,5 +1107,21 @@ mod tests {
 
         assert_eq!(request["method"], "initialize");
         assert_eq!(request["id"], 1);
+    }
+
+    #[test]
+    fn requested_limit_prefers_request_k_over_default() {
+        assert_eq!(requested_limit(&json!({"k": 17}), 5), 17);
+        assert_eq!(requested_limit(&json!({}), 5), 5);
+    }
+
+    #[test]
+    fn requested_layer_filter_defaults_to_outer_only() {
+        assert_eq!(requested_layer_filter(&json!({})), Some(SliceLayer::Outer));
+    }
+
+    #[test]
+    fn requested_layer_filter_allows_deep_search() {
+        assert_eq!(requested_layer_filter(&json!({"deep": true})), None);
     }
 }

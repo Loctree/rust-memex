@@ -399,7 +399,7 @@ impl StorageManager {
         Ok(deleted.version as usize)
     }
 
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+    pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
         let table = match self.ensure_table(0).await {
             Ok(t) => t,
             Err(_) => return Ok(0),
@@ -407,6 +407,11 @@ impl StorageManager {
         let predicate = self.namespace_filter(namespace);
         let deleted = table.delete(predicate.as_str()).await?;
         Ok(deleted.version as usize)
+    }
+
+    #[deprecated(note = "use delete_namespace_documents")]
+    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+        self.delete_namespace_documents(namespace).await
     }
 
     pub fn get_collection_name(&self) -> &str {
@@ -1161,7 +1166,8 @@ impl StorageManager {
     // =========================================================================
 
     /// Run garbage collection based on configuration
-    pub async fn run_gc(&self, config: &GcConfig) -> Result<GcStats> {
+    #[doc(alias = "run_gc")]
+    pub async fn garbage_collect(&self, config: &GcConfig) -> Result<GcStats> {
         let mut stats = GcStats::default();
 
         // Get all documents for analysis
@@ -1213,6 +1219,11 @@ impl StorageManager {
         }
 
         Ok(stats)
+    }
+
+    #[deprecated(note = "use garbage_collect")]
+    pub async fn run_gc(&self, config: &GcConfig) -> Result<GcStats> {
+        self.garbage_collect(config).await
     }
 
     /// Find orphan embeddings - documents with parent_id pointing to non-existent documents
