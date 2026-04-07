@@ -1158,7 +1158,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
 async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".to_string(),
-        db_path: state.rag.storage().lance_path().to_string(),
+        db_path: state.rag.storage_manager().lance_path().to_string(),
         embedding_provider: state.rag.mlx_connected_to(),
     })
 }
@@ -1211,7 +1211,7 @@ async fn overview_handler(
     info!("API: /api/overview - fetching stats");
 
     // Use efficient stats() - only counts rows, doesn't load all data
-    let stats = state.rag.storage().stats().await.map_err(|e| {
+    let stats = state.rag.storage_manager().stats().await.map_err(|e| {
         error!("API: /api/overview - stats error: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -1266,7 +1266,7 @@ async fn browse_handler(
 
     let all_docs = state
         .rag
-        .storage()
+        .storage_manager()
         .all_documents(namespace, params.limit + params.offset)
         .await
         .map_err(|e| {
@@ -1321,7 +1321,7 @@ async fn browse_all_handler(
 
     let all_docs = state
         .rag
-        .storage()
+        .storage_manager()
         .all_documents(None, params.limit + params.offset)
         .await
         .map_err(|e| {
@@ -1402,7 +1402,7 @@ async fn search_handler(
         // Regular search
         state
             .rag
-            .memory_search(
+            .search_memory(
                 req.namespace.as_deref().unwrap_or("default"),
                 &req.query,
                 req.limit,
@@ -1443,7 +1443,7 @@ async fn sse_search_handler(
 
         let namespace = params.namespace.as_deref().unwrap_or("default");
 
-        match state.rag.memory_search(namespace, &params.query, params.limit).await {
+        match state.rag.search_memory(namespace, &params.query, params.limit).await {
             Ok(results) => {
                 let total = results.len();
 
@@ -1495,7 +1495,7 @@ async fn cross_search_handler(
 
     let all_docs = state
         .rag
-        .storage()
+        .storage_manager()
         .all_documents(None, 10000)
         .await
         .map_err(|e| {
@@ -1528,7 +1528,7 @@ async fn cross_search_handler(
     for ns in &namespaces {
         match state
             .rag
-            .memory_search(ns, &params.query, params.limit)
+            .search_memory(ns, &params.query, params.limit)
             .await
         {
             Ok(results) => {
@@ -1583,7 +1583,7 @@ async fn sse_cross_search_handler(
             }).to_string()));
 
         // Get all namespaces
-        let all_docs = match state.rag.storage().all_documents(None, 10000).await {
+        let all_docs = match state.rag.storage_manager().all_documents(None, 10000).await {
             Ok(docs) => docs,
             Err(e) => {
                 yield Ok(Event::default()
@@ -1617,7 +1617,7 @@ async fn sse_cross_search_handler(
                 .event("searching")
                 .data(serde_json::json!({"namespace": ns}).to_string()));
 
-            match state.rag.memory_search(ns, &params.query, params.limit).await {
+            match state.rag.search_memory(ns, &params.query, params.limit).await {
                 Ok(results) => {
                     let ns_count = results.len();
                     for r in results {
@@ -1712,7 +1712,7 @@ async fn discovery_handler(State(state): State<HttpState>) -> Json<serde_json::V
     Json(json!({
         "status": if cache.is_some() { "ok" } else { "loading" },
         "version": env!("CARGO_PKG_VERSION"),
-        "db_path": state.rag.storage().lance_path(),
+        "db_path": state.rag.storage_manager().lance_path(),
         "embedding_provider": state.rag.mlx_connected_to(),
         "total_documents": total_documents,
         "namespaces": namespaces,
@@ -1734,7 +1734,7 @@ async fn sse_namespaces_handler(
             }).to_string()));
 
         // Get namespace list
-        let namespaces = match state.rag.storage().list_namespaces().await {
+        let namespaces = match state.rag.storage_manager().list_namespaces().await {
             Ok(ns) => ns,
             Err(e) => {
                 yield Ok(Event::default()
@@ -1760,7 +1760,7 @@ async fn sse_namespaces_handler(
             let mut layer_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut all_keywords: Vec<String> = Vec::new();
 
-            if let Ok(docs) = state.rag.storage().get_all_in_namespace(ns_name).await {
+            if let Ok(docs) = state.rag.storage_manager().get_all_in_namespace(ns_name).await {
                 for doc in &docs {
                     let layer_name = SliceLayer::from_u8(doc.layer)
                         .map(|l| l.name().to_string())
@@ -1817,13 +1817,13 @@ async fn sse_optimize_handler(
         let start = std::time::Instant::now();
 
         // Pre-optimize stats
-        let pre_stats = state.rag.storage().stats().await.ok();
+        let pre_stats = state.rag.storage_manager().stats().await.ok();
 
         yield Ok(Event::default()
             .event("start")
             .data(serde_json::json!({
                 "status": "starting_optimization",
-                "db_path": state.rag.storage().lance_path(),
+                "db_path": state.rag.storage_manager().lance_path(),
                 "pre_row_count": pre_stats.as_ref().map(|s| s.row_count),
                 "pre_version_count": pre_stats.as_ref().map(|s| s.version_count),
             }).to_string()));
@@ -1837,7 +1837,7 @@ async fn sse_optimize_handler(
                 "description": "Merging small files into larger ones"
             }).to_string()));
 
-        let compact_result = state.rag.storage().compact().await;
+        let compact_result = state.rag.storage_manager().compact().await;
 
         match &compact_result {
             Ok(stats) => {
@@ -1874,7 +1874,7 @@ async fn sse_optimize_handler(
                 "description": "Removing old versions (>7 days)"
             }).to_string()));
 
-        let prune_result = state.rag.storage().cleanup(Some(7)).await;
+        let prune_result = state.rag.storage_manager().cleanup(Some(7)).await;
 
         match &prune_result {
             Ok(stats) => {
@@ -1899,7 +1899,7 @@ async fn sse_optimize_handler(
         }
 
         // Post-optimize stats
-        let post_stats = state.rag.storage().stats().await.ok();
+        let post_stats = state.rag.storage_manager().stats().await.ok();
 
         yield Ok(Event::default()
             .event("done")
@@ -2055,7 +2055,7 @@ async fn get_handler(
     State(state): State<HttpState>,
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.memory_get(&ns, &id).await {
+    match state.rag.lookup_memory(&ns, &id).await {
         Ok(Some(r)) => {
             let result: SearchResultJson = r.into();
             Ok(Json(serde_json::json!(result)))
@@ -2076,7 +2076,7 @@ async fn delete_handler(
     State(state): State<HttpState>,
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.memory_delete(&ns, &id).await {
+    match state.rag.remove_memory(&ns, &id).await {
         Ok(deleted) => Ok(Json(serde_json::json!({
             "status": if deleted > 0 { "deleted" } else { "not_found" },
             "id": id,
@@ -2094,7 +2094,7 @@ async fn purge_namespace_handler(
     State(state): State<HttpState>,
     Path(namespace): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.purge_namespace(&namespace).await {
+    match state.rag.clear_namespace(&namespace).await {
         Ok(deleted) => Ok(Json(serde_json::json!({
             "status": "purged",
             "namespace": namespace,
@@ -2280,8 +2280,11 @@ pub async fn start_server(
     tokio::spawn(async move {
         // Initial load (with longer timeout for startup)
         info!("Background: Loading namespace cache (may take a while on large DB)...");
-        match tokio::time::timeout(Duration::from_secs(120), bg_rag.storage().list_namespaces())
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(120),
+            bg_rag.storage_manager().list_namespaces(),
+        )
+        .await
         {
             Ok(Ok(ns_list)) => {
                 let namespaces: Vec<NamespaceInfo> = ns_list
@@ -2310,8 +2313,11 @@ pub async fn start_server(
         loop {
             interval.tick().await;
             debug!("Background: Refreshing namespace cache...");
-            match tokio::time::timeout(Duration::from_secs(60), bg_rag.storage().list_namespaces())
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                bg_rag.storage_manager().list_namespaces(),
+            )
+            .await
             {
                 Ok(Ok(ns_list)) => {
                     let namespaces: Vec<NamespaceInfo> = ns_list

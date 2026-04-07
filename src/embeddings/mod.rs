@@ -1223,7 +1223,7 @@ impl TokenConfig {
     }
 
     /// Create config for multilingual/Polish content
-    pub fn multilingual() -> Self {
+    pub fn for_multilingual_text() -> Self {
         Self {
             max_tokens: 8192,
             chars_per_token: 2.5,

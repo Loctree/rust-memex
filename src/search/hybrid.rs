@@ -339,6 +339,9 @@ impl HybridSearcher {
             } else if let Some(doc) = self.storage.get_document(&result_namespace, &id).await? {
                 // BM25-only result, fetch from storage
                 let layer = doc.slice_layer(); // Call before moving fields
+                if layer_filter.is_some() && layer != layer_filter {
+                    continue;
+                }
                 final_results.push(HybridSearchResult {
                     id: doc.id,
                     namespace: doc.namespace,
@@ -503,7 +506,7 @@ impl HybridSearcher {
     }
 
     /// Delete documents from both indices
-    pub async fn delete_documents(&self, namespace: &str, ids: &[String]) -> Result<usize> {
+    pub async fn delete_from_indices(&self, namespace: &str, ids: &[String]) -> Result<usize> {
         let mut deleted = 0;
 
         for id in ids {

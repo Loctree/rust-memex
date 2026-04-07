@@ -1,6 +1,6 @@
 use crate::{
-    EmbeddingConfig, MLXBridge, ProviderConfig, SliceMode, compute_content_hash, rag::RAGPipeline,
-    storage::StorageManager,
+    BM25Config, BM25Index, EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer,
+    SliceMode, compute_content_hash, rag::RAGPipeline, storage::StorageManager,
 };
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -84,6 +84,82 @@ async fn memory_roundtrip_and_search() -> Result<()> {
     assert_eq!(results[0].namespace, "testns");
 
     Ok(())
+}
+
+#[tokio::test]
+async fn rag_pipeline_syncs_bm25_writes() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let bm25 = Arc::new(BM25Index::new(
+        &BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()),
+    )?);
+    let rag = RAGPipeline::new_with_bm25(mlx, storage, Some(bm25.clone())).await?;
+
+    rag.index_text_with_mode(
+        Some("testns"),
+        "doc1".to_string(),
+        "Ala ma kota".to_string(),
+        json!({"lang": "pl"}),
+        SliceMode::Flat,
+    )
+    .await?;
+
+    let results = bm25.search("kota", Some("testns"), 10)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "doc1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn onion_text_index_overrides_stale_slice_mode_metadata() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage).await?;
+
+    rag.index_text_with_mode(
+        Some("onion-test"),
+        "doc1".to_string(),
+        "This is a longer document about onions and embeddings. It should create layered slices for metadata verification."
+            .to_string(),
+        json!({"slice_mode": "flat"}),
+        SliceMode::OnionFast,
+    )
+    .await?;
+
+    let docs = rag
+        .storage_manager()
+        .get_all_in_namespace("onion-test")
+        .await?;
+    assert!(!docs.is_empty(), "expected onion slices to be stored");
+    assert!(
+        docs.iter()
+            .all(|doc| doc.metadata["slice_mode"] == "onion-fast"),
+        "all stored slices should carry the actual onion slice_mode"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn search_options_default_to_outer_layer() {
+    assert_eq!(
+        SearchOptions::default().layer_filter,
+        Some(SliceLayer::Outer)
+    );
 }
 
 #[test]
@@ -244,7 +320,7 @@ async fn test_has_content_hash() -> Result<()> {
 
     // Before indexing, hash should not exist
     let exists_before = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &content_hash)
         .await?;
     assert!(!exists_before, "Hash should not exist before indexing");
@@ -257,7 +333,7 @@ async fn test_has_content_hash() -> Result<()> {
 
     // After indexing, hash should exist
     let exists_after = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &content_hash)
         .await?;
     assert!(exists_after, "Hash should exist after indexing");
@@ -265,7 +341,7 @@ async fn test_has_content_hash() -> Result<()> {
     // Non-existent hash should return false
     let fake_hash = compute_content_hash("non-existent content");
     let fake_exists = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &fake_hash)
         .await?;
     assert!(!fake_exists, "Non-existent hash should return false");

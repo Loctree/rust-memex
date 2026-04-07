@@ -167,7 +167,7 @@ impl EmbedderState {
     }
 
     /// Update embedding config from state
-    pub fn to_embedding_config(&self) -> EmbeddingConfig {
+    pub fn build_embedding_config(&self) -> EmbeddingConfig {
         let provider = if self.use_manual {
             ProviderConfig {
                 name: "manual".to_string(),
@@ -273,7 +273,7 @@ impl Default for MemexCfg {
 
 impl MemexCfg {
     /// Get the effective database path (with hostname suffix if per-host mode)
-    pub fn effective_db_path(&self) -> String {
+    pub fn resolved_db_path(&self) -> String {
         match self.db_path_mode {
             DbPathMode::Shared => self.db_path.clone(),
             DbPathMode::PerHost => format!("{}.{}", self.db_path, self.hostname),
@@ -318,7 +318,7 @@ impl App {
         let hosts = detect_extended_hosts();
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp_memex".to_string());
         let embedder_state = EmbedderState::default();
-        let embedding_config = embedder_state.to_embedding_config();
+        let embedding_config = embedder_state.build_embedding_config();
 
         Self {
             step: WizardStep::Welcome,
@@ -348,7 +348,7 @@ impl App {
         if let Some(next) = self.step.next() {
             // On leaving EmbedderSetup, update the embedding config
             if self.step == WizardStep::EmbedderSetup {
-                self.embedding_config = self.embedder_state.to_embedding_config();
+                self.embedding_config = self.embedder_state.build_embedding_config();
             }
             self.step = next;
             self.focus = 0;
@@ -393,7 +393,7 @@ impl App {
     }
 
     pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
@@ -439,7 +439,7 @@ impl App {
         ));
 
         // Check db_path (use effective path)
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
         let expanded_path = shellexpand::tilde(&effective_path).to_string();
         let db_path = PathBuf::from(&expanded_path);
         if db_path.exists() {
@@ -458,7 +458,7 @@ impl App {
     }
 
     pub fn write_configs(&mut self) -> Result<()> {
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
 
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
@@ -472,7 +472,7 @@ impl App {
                         generate_extended_snippet(*kind, &self.binary_path, &effective_path);
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
-                        kind.display_name(),
+                        kind.label(),
                         detection.path.display(),
                         snippet
                     ));
@@ -513,7 +513,7 @@ impl App {
                     Err(e) => {
                         error_count += 1;
                         self.messages
-                            .push(format!("[ERR] {} failed: {}", kind.display_name(), e));
+                            .push(format!("[ERR] {} failed: {}", kind.label(), e));
                     }
                 }
             }
@@ -788,7 +788,7 @@ impl App {
                 if let Some(mode) = modes.get(self.data_setup.focus).cloned() {
                     self.data_setup.select_import_mode(mode);
                     // If import mode is selected, perform the import
-                    if self.data_setup.is_complete()
+                    if self.data_setup.is_done()
                         && self.data_setup.option == DataSetupOption::ImportLanceDB
                     {
                         self.perform_import();
@@ -802,7 +802,7 @@ impl App {
     fn handle_next(&mut self) {
         // For DataSetup, only proceed if complete or skip
         if self.step == WizardStep::DataSetup {
-            if self.data_setup.is_complete() || self.data_setup.option == DataSetupOption::Skip {
+            if self.data_setup.is_done() || self.data_setup.option == DataSetupOption::Skip {
                 self.next_step();
             }
         } else if self.step == WizardStep::HealthCheck {
@@ -1023,7 +1023,7 @@ impl App {
         toml.push_str("# Database configuration\n");
         toml.push_str(&format!(
             "db_path = \"{}\"\n",
-            self.memex_cfg.effective_db_path()
+            self.memex_cfg.resolved_db_path()
         ));
         toml.push_str(&format!("cache_mb = {}\n", self.memex_cfg.cache_mb));
         toml.push_str(&format!("log_level = \"{}\"\n", self.memex_cfg.log_level));

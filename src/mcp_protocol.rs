@@ -486,7 +486,7 @@ impl McpCore {
             McpTool::Health => {
                 let mut status = json!({
                     "version": env!("CARGO_PKG_VERSION"),
-                    "db_path": self.rag.storage().lance_path(),
+                    "db_path": self.rag.storage_manager().lance_path(),
                     "backend": "mlx",
                     "mlx_server": self.rag.mlx_connected_to(),
                 });
@@ -579,7 +579,7 @@ impl McpCore {
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
                 let item_id = args["id"].as_str().unwrap_or("");
-                match self.rag.memory_get(namespace, item_id).await {
+                match self.rag.lookup_memory(namespace, item_id).await {
                     Ok(Some(doc)) => Ok(text_result_from_json(&doc)),
                     Ok(None) => Ok(text_result("Not found")),
                     Err(e) => Ok(tool_error(e)),
@@ -605,7 +605,7 @@ impl McpCore {
                     return Ok(hybrid_result);
                 }
 
-                match self.rag.memory_search(namespace, query, limit).await {
+                match self.rag.search_memory(namespace, query, limit).await {
                     Ok(results) => Ok(text_result_from_json(&results)),
                     Err(e) => Ok(tool_error(e)),
                 }
@@ -620,7 +620,7 @@ impl McpCore {
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
                 let item_id = args["id"].as_str().unwrap_or("");
-                match self.rag.memory_delete(namespace, item_id).await {
+                match self.rag.remove_memory(namespace, item_id).await {
                     Ok(deleted) => Ok(text_result(format!("Deleted {} rows", deleted))),
                     Err(e) => Ok(tool_error(e)),
                 }
@@ -634,7 +634,7 @@ impl McpCore {
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
-                match self.rag.purge_namespace(namespace).await {
+                match self.rag.clear_namespace(namespace).await {
                     Ok(deleted) => Ok(text_result(format!(
                         "Purged namespace '{}', removed {} rows",
                         namespace, deleted

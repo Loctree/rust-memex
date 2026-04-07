@@ -101,7 +101,7 @@ impl HealthCheckResult {
         self.items.iter().any(|i| i.status.is_fail())
     }
 
-    pub fn is_complete(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.items
             .iter()
             .all(|i| !matches!(i.status, CheckStatus::Pending | CheckStatus::Running))
@@ -364,7 +364,7 @@ mod tests {
         let mut result = HealthCheckResult::new();
         assert!(result.items.is_empty());
         assert!(!result.any_failed());
-        assert!(result.is_complete());
+        assert!(result.is_finished());
 
         result
             .items

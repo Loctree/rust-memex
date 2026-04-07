@@ -27,36 +27,27 @@ pub struct DetectedProvider {
 
 impl DetectedProvider {
     /// Get a human-readable description
-    pub fn description(&self) -> String {
+    pub fn summary_line(&self) -> String {
         match &self.status {
             ProviderStatus::Online(model) => {
-                format!(
-                    "{} at {} - {}",
-                    self.kind.display_name(),
-                    self.base_url,
-                    model
-                )
+                format!("{} at {} - {}", self.kind.label(), self.base_url, model)
             }
             ProviderStatus::OnlineNoModel => {
                 format!(
                     "{} at {} (no embedding model)",
-                    self.kind.display_name(),
+                    self.kind.label(),
                     self.base_url
                 )
             }
             ProviderStatus::Offline => {
-                format!(
-                    "{} at {} (offline)",
-                    self.kind.display_name(),
-                    self.base_url
-                )
+                format!("{} at {} (offline)", self.kind.label(), self.base_url)
             }
         }
     }
 
-    /// Get display name for UI
-    pub fn display_name(&self) -> String {
-        self.description()
+    /// Get provider summary for UI
+    pub fn summary(&self) -> String {
+        self.summary_line()
     }
 
     /// Check if provider is usable
@@ -79,7 +70,7 @@ impl DetectedProvider {
     }
 
     /// Get embedding dimension for the detected model
-    pub fn dimension(&self) -> usize {
+    pub fn suggested_dimension(&self) -> usize {
         self.inferred_dimension()
             .unwrap_or(DEFAULT_REQUIRED_DIMENSION)
     }
@@ -122,7 +113,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub fn display_name(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             ProviderKind::Ollama => "Ollama",
             ProviderKind::Mlx => "MLX Server",
@@ -437,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_provider_kind_display() {
-        assert_eq!(ProviderKind::Ollama.display_name(), "Ollama");
-        assert_eq!(ProviderKind::Mlx.display_name(), "MLX Server");
+        assert_eq!(ProviderKind::Ollama.label(), "Ollama");
+        assert_eq!(ProviderKind::Mlx.label(), "MLX Server");
     }
 
     #[test]
@@ -452,7 +443,7 @@ mod tests {
             status: ProviderStatus::Online("qwen3-embedding:4b".to_string()),
         };
         assert_eq!(provider.inferred_dimension(), Some(2560));
-        assert_eq!(provider.dimension(), 2560);
+        assert_eq!(provider.suggested_dimension(), 2560);
     }
 
     #[test]
@@ -466,7 +457,7 @@ mod tests {
             status: ProviderStatus::Online("MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string()),
         };
         assert_eq!(provider.inferred_dimension(), Some(2048));
-        assert_eq!(provider.dimension(), 2048);
+        assert_eq!(provider.suggested_dimension(), 2048);
     }
 
     #[test]

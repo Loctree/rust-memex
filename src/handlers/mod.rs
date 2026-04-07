@@ -7,7 +7,6 @@ use crate::{
     ServerConfig,
     mcp_protocol::{McpCore, McpTransport, jsonrpc_success},
     mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request},
-    rag::RAGPipeline,
 };
 
 pub struct MCPServer {
@@ -15,11 +14,6 @@ pub struct MCPServer {
 }
 
 impl MCPServer {
-    /// Get the RAGPipeline for sharing with the HTTP server.
-    pub fn rag(&self) -> Arc<RAGPipeline> {
-        self.mcp_core.rag()
-    }
-
     /// Get the shared MCP core for reuse across transports.
     pub fn mcp_core(&self) -> Arc<McpCore> {
         self.mcp_core.clone()
@@ -57,7 +51,7 @@ impl MCPServer {
         self.run_stdio().await
     }
 
-    pub async fn handle_request(&self, request: Value) -> Value {
+    pub async fn dispatch_request(&self, request: Value) -> Value {
         dispatch_mcp_request(self.mcp_core.as_ref(), request, McpTransport::Stdio)
             .await
             .unwrap_or_else(|| jsonrpc_success(&Value::Null, Value::Null))

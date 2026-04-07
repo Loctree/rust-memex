@@ -804,7 +804,12 @@ impl StorageManager {
     }
 
     fn layer_filter(&self, layer: SliceLayer) -> String {
-        format!("layer = {}", layer.as_u8())
+        if layer == SliceLayer::Outer {
+            // Default search should surface onion summaries while still seeing legacy flat chunks.
+            "(layer = 0 OR layer = 1)".to_string()
+        } else {
+            format!("layer = {}", layer.as_u8())
+        }
     }
 
     fn content_hash_filter(&self, hash: &str) -> String {

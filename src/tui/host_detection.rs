@@ -3,67 +3,12 @@
 //! Scans known locations for MCP host configurations (Codex, Cursor, Claude Desktop, JetBrains).
 //! Also provides config writing functionality for the wizard.
 
+use crate::common::{HostFormat, HostKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-// =============================================================================
-// HOST TYPES (previously from rmcp-common)
-// =============================================================================
-
-/// Supported MCP host application kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum HostKind {
-    /// Codex CLI (uses TOML config)
-    Codex,
-    /// Cursor editor (uses JSON config)
-    Cursor,
-    /// VS Code with MCP extension (uses JSON config)
-    VSCode,
-    /// Claude Desktop application (uses JSON config)
-    Claude,
-    /// JetBrains IDEs with MCP plugin (uses JSON config)
-    JetBrains,
-    /// Unknown or custom host
-    Unknown,
-}
-
-impl HostKind {
-    /// Returns a lowercase label for the host kind.
-    pub fn as_label(&self) -> &'static str {
-        match self {
-            HostKind::Codex => "codex",
-            HostKind::Cursor => "cursor",
-            HostKind::VSCode => "vscode",
-            HostKind::Claude => "claude",
-            HostKind::JetBrains => "jetbrains",
-            HostKind::Unknown => "unknown",
-        }
-    }
-
-    /// Returns a human-readable display name for the host kind.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            HostKind::Codex => "Codex CLI",
-            HostKind::Cursor => "Cursor",
-            HostKind::VSCode => "VS Code",
-            HostKind::Claude => "Claude Desktop",
-            HostKind::JetBrains => "JetBrains IDEs",
-            HostKind::Unknown => "Unknown",
-        }
-    }
-}
-
-/// Configuration file format for MCP hosts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HostFormat {
-    /// TOML format (used by Codex)
-    Toml,
-    /// JSON format (used by most other hosts)
-    Json,
-}
 
 // =============================================================================
 // MCP SERVER ENTRIES
@@ -129,7 +74,7 @@ pub enum ExtendedHostKind {
 }
 
 impl ExtendedHostKind {
-    pub fn display_name(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             ExtendedHostKind::Standard(k) => k.display_name(),
             ExtendedHostKind::ClaudeCode => "Claude Code",
@@ -577,7 +522,7 @@ pub fn write_extended_host_config(
     };
 
     let mut result = write_host_config(&host, binary_path, db_path)?;
-    result.host_name = kind.display_name().to_string();
+    result.host_name = kind.label().to_string();
     Ok(result)
 }
 
@@ -771,10 +716,10 @@ args = []
     #[test]
     fn test_extended_host_kind_display_names() {
         assert_eq!(
-            ExtendedHostKind::Standard(HostKind::Claude).display_name(),
+            ExtendedHostKind::Standard(HostKind::Claude).label(),
             "Claude Desktop"
         );
-        assert_eq!(ExtendedHostKind::ClaudeCode.display_name(), "Claude Code");
-        assert_eq!(ExtendedHostKind::Junie.display_name(), "Junie");
+        assert_eq!(ExtendedHostKind::ClaudeCode.label(), "Claude Code");
+        assert_eq!(ExtendedHostKind::Junie.label(), "Junie");
     }
 }
