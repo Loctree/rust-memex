@@ -265,7 +265,9 @@ pub async fn memory_store_batch(
 /// // GDPR request - delete all patient data
 /// let filter = MetaFilter::for_patient("P-456");
 /// let result = memory_delete_by_filter(&engine, filter).await?;
-/// println!("Deleted {} documents", result.data.unwrap()["deleted_count"]);
+/// if let Some(data) = result.data {
+///     println!("Deleted {} documents", data["deleted_count"]);
+/// }
 /// ```
 pub async fn memory_delete_by_filter(
     engine: &MemexEngine,

@@ -2623,7 +2623,13 @@ fn extract_sections(content: &str) -> Vec<(Option<String>, &str)> {
         let mut current_header: Option<String> = None;
 
         for caps in re.captures_iter(content) {
-            let match_start = caps.get(0).unwrap().start();
+            let Some(full_match) = caps.get(0) else {
+                continue;
+            };
+            let Some(header_match) = caps.get(2) else {
+                continue;
+            };
+            let match_start = full_match.start();
 
             // Add previous section
             if match_start > last_end {
@@ -2633,8 +2639,8 @@ fn extract_sections(content: &str) -> Vec<(Option<String>, &str)> {
                 }
             }
 
-            current_header = Some(caps.get(2).unwrap().as_str().to_string());
-            last_end = caps.get(0).unwrap().end();
+            current_header = Some(header_match.as_str().to_string());
+            last_end = full_match.end();
         }
 
         // Add final section
