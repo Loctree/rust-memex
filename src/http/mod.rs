@@ -55,7 +55,6 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp_protocol::{McpCore, McpTransport};
-use crate::mcp_runtime::dispatch_mcp_payload;
 use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
 
 // ============================================================================
@@ -2219,8 +2218,10 @@ async fn mcp_messages_handler(
         body.trim().len()
     );
 
-    if let Some(response) =
-        dispatch_mcp_payload(state.mcp_core.as_ref(), &body, McpTransport::HttpSse).await
+    if let Some(response) = state
+        .mcp_core
+        .handle_payload(&body, McpTransport::HttpSse)
+        .await
         && let Err(e) = session.tx.send(response)
     {
         warn!(
