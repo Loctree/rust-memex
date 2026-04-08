@@ -5,10 +5,9 @@
 //! - Test embedding generation and dimension verification
 //! - Database path writability
 
-use crate::embeddings::{EmbeddingConfig, ProviderConfig};
+use crate::embeddings::{EmbeddingConfig, ProviderConfig, probe_provider_dimension};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,7 +101,7 @@ impl HealthCheckResult {
         self.items.iter().any(|i| i.status.is_fail())
     }
 
-    pub fn is_complete(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.items
             .iter()
             .all(|i| !matches!(i.status, CheckStatus::Pending | CheckStatus::Running))
@@ -113,17 +112,6 @@ impl Default for HealthCheckResult {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Response type for embedding endpoint
-#[derive(Debug, Deserialize)]
-struct EmbeddingResponse {
-    data: Vec<EmbeddingData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingData {
-    embedding: Vec<f32>,
 }
 
 /// Health checker that performs all validation
@@ -304,74 +292,31 @@ impl HealthChecker {
         // Sort providers and find the first available
         let mut providers = config.providers.clone();
         providers.sort_by_key(|p| p.priority);
+        let mut failures = Vec::new();
 
         for provider in &providers {
-            let base_url = provider.base_url.trim_end_matches('/');
-            let url = format!("{}{}", base_url, provider.endpoint);
-
-            let request = serde_json::json!({
-                "input": ["hello world"],
-                "model": provider.model
-            });
-
-            match self.client.post(&url).json(&request).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = match resp.text().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read response body from {}: {}",
-                                provider.name,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                    if !status.is_success() {
-                        tracing::warn!(
-                            "Embedding API error from {} (HTTP {}): {}",
-                            provider.name,
-                            status,
-                            &body[..body.len().min(500)]
-                        );
-                        continue;
-                    }
-
-                    match serde_json::from_str::<EmbeddingResponse>(&body) {
-                        Ok(emb_resp) => {
-                            if let Some(data) = emb_resp.data.first() {
-                                let dim = data.embedding.len();
-                                item = item.pass();
-                                item.description =
-                                    format!("Got {}-dim vector from {}", dim, provider.name);
-                                return (item, Some(dim));
-                            } else {
-                                tracing::warn!("Empty embedding data from {}", provider.name);
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to parse embedding response from {}: {} - Body preview: {}",
-                                provider.name,
-                                e,
-                                &body[..body.len().min(200)]
-                            );
-                            item = item.fail(format!("Failed to parse response: {}", e));
-                            return (item, None);
-                        }
-                    }
+            match probe_provider_dimension(&self.client, provider).await {
+                Ok(dim) => {
+                    item = item.pass();
+                    item.description = format!("Got {}-dim vector from {}", dim, provider.name);
+                    return (item, Some(dim));
                 }
                 Err(e) => {
-                    tracing::debug!("Connection failed to {}: {}", provider.name, e);
-                    continue;
+                    failures.push(format!("{}: {}", provider.name, e));
                 }
             }
         }
 
-        (item.fail("No provider returned a valid embedding"), None)
+        let message = if failures.is_empty() {
+            "No provider returned a valid embedding".to_string()
+        } else {
+            format!(
+                "No provider returned a valid embedding:\n  {}",
+                failures.join("\n  ")
+            )
+        };
+
+        (item.fail(message), None)
     }
 
     /// Check if the returned dimension matches the required dimension
@@ -419,7 +364,7 @@ mod tests {
         let mut result = HealthCheckResult::new();
         assert!(result.items.is_empty());
         assert!(!result.any_failed());
-        assert!(result.is_complete());
+        assert!(result.is_finished());
 
         result
             .items

@@ -3,6 +3,8 @@ pub mod embeddings;
 pub mod engine;
 pub mod handlers;
 pub mod http;
+pub mod mcp_protocol;
+mod mcp_runtime;
 pub mod path_utils;
 pub mod preprocessing;
 pub mod query;
@@ -25,11 +27,16 @@ use tracing::Level;
 
 // Re-export core types for library consumers
 pub use embeddings::{
-    DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, MlxMergeOptions,
-    ProviderConfig, RerankerConfig, TokenConfig, cross_dimension_search_adapt, estimate_tokens,
-    safe_chunk_size, truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
+    MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
+    cross_dimension_search_adapt, estimate_tokens, infer_embedding_dimension, safe_chunk_size,
+    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
+pub use mcp_protocol::{
+    McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
+};
+pub use mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request};
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,
@@ -155,9 +162,15 @@ impl ServerConfig {
         Self::default()
     }
 
-    pub fn with_db_path(mut self, db_path: impl Into<String>) -> Self {
+    #[doc(alias = "with_db_path")]
+    pub fn with_storage_path(mut self, db_path: impl Into<String>) -> Self {
         self.db_path = db_path.into();
         self
+    }
+
+    #[deprecated(note = "use with_storage_path")]
+    pub fn with_db_path(self, db_path: impl Into<String>) -> Self {
+        self.with_storage_path(db_path)
     }
 
     pub fn with_features(mut self, features: Vec<String>) -> Self {

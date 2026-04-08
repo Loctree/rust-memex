@@ -112,6 +112,9 @@ pub fn sanitize_existing_path(path: &str) -> Result<PathBuf> {
 
     // This IS the sanitization function. Traversal is checked above,
     // and the path is canonicalized and validated below.
+    // `expanded` has already passed traversal checks and will be canonicalized
+    // plus allowed-base validated before it leaves this function.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let path_buf = PathBuf::from(&expanded);
 
     // Canonicalize to resolve any remaining symlinks
@@ -153,6 +156,9 @@ pub fn sanitize_new_path(path: &str) -> Result<PathBuf> {
 
     // This IS the sanitization function. Traversal is checked above,
     // and parent directory is validated below.
+    // `expanded` has already passed traversal checks and parent/grandparent
+    // validation before this path is accepted for creation.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let path_buf = PathBuf::from(&expanded);
 
     // For new paths, validate the parent exists and is allowed
@@ -236,6 +242,9 @@ pub fn validate_write_path(path: &Path) -> Result<PathBuf> {
 /// Prevents path traversal by combining validation with the read operation.
 pub fn safe_read_to_string(path: &str) -> Result<(PathBuf, String)> {
     let validated = sanitize_existing_path(path)?;
+    // Atomic wrapper: `validated` comes from sanitize_existing_path(), which
+    // canonicalizes the path and enforces the allowed-base policy.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let contents = std::fs::read_to_string(&validated)
         .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
     Ok((validated, contents))
@@ -244,6 +253,9 @@ pub fn safe_read_to_string(path: &str) -> Result<(PathBuf, String)> {
 /// Async variant: validate path and read file contents in one atomic step.
 pub async fn safe_read_to_string_async(path: &Path) -> Result<(PathBuf, String)> {
     let validated = validate_read_path(path)?;
+    // Atomic wrapper: `validated` comes from validate_read_path(), which
+    // canonicalizes the path and enforces the allowed-base policy.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let contents = tokio::fs::read_to_string(&validated)
         .await
         .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
@@ -253,6 +265,9 @@ pub async fn safe_read_to_string_async(path: &Path) -> Result<(PathBuf, String)>
 /// Async variant: validate path and read directory in one atomic step.
 pub async fn safe_read_dir(path: &Path) -> Result<(PathBuf, tokio::fs::ReadDir)> {
     let validated = validate_read_path(path)?;
+    // Atomic wrapper: `validated` comes from validate_read_path(), which
+    // canonicalizes the path and enforces the allowed-base policy.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let entries = tokio::fs::read_dir(&validated)
         .await
         .map_err(|e| anyhow!("Failed to read directory '{}': {}", validated.display(), e))?;
@@ -263,6 +278,8 @@ pub async fn safe_read_dir(path: &Path) -> Result<(PathBuf, tokio::fs::ReadDir)>
 pub fn safe_copy(src: &Path, dst: &Path) -> Result<PathBuf> {
     let safe_src = validate_read_path(src)?;
     let safe_dst = validate_write_path(dst)?;
+    // Atomic wrapper: both paths have already passed read/write validation.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::copy(&safe_src, &safe_dst).map_err(|e| {
         anyhow!(
             "Failed to copy '{}' → '{}': {}",

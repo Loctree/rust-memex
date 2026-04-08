@@ -72,7 +72,7 @@ pub enum DataSetupOption {
 }
 
 impl DataSetupOption {
-    pub fn display_name(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             DataSetupOption::ImportLanceDB => "[1] Import existing LanceDB",
             DataSetupOption::IndexDirectory => "[2] Index a directory now",
@@ -80,7 +80,7 @@ impl DataSetupOption {
         }
     }
 
-    pub fn description(&self) -> &'static str {
+    pub fn detail(&self) -> &'static str {
         match self {
             DataSetupOption::ImportLanceDB => "Copy or link an existing LanceDB database",
             DataSetupOption::IndexDirectory => "Recursively index files with embeddings",
@@ -151,7 +151,7 @@ pub enum ImportMode {
 }
 
 impl ImportMode {
-    pub fn display_name(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             ImportMode::Copy => "[1] Copy database files",
             ImportMode::Symlink => "[2] Create symlink",
@@ -264,7 +264,7 @@ impl DataSetupState {
     }
 
     /// Check if data setup is complete
-    pub fn is_complete(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         self.sub_step == DataSetupSubStep::Complete
     }
 
@@ -282,7 +282,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 
 /// Collect files from a directory for indexing
-pub fn collect_files(dir_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn collect_indexable_files(dir_path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     if !dir_path.exists() {
@@ -463,7 +463,7 @@ async fn run_indexing(
     use tokio::sync::Mutex;
 
     // Collect files first
-    let files = collect_files(&dir_path)?;
+    let files = collect_indexable_files(&dir_path)?;
     let total = files.len();
 
     if total == 0 {

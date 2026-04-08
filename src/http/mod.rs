@@ -54,6 +54,8 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
+use crate::mcp_protocol::{McpCore, McpTransport};
+use crate::mcp_runtime::dispatch_mcp_payload;
 use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
 
 // ============================================================================
@@ -834,6 +836,8 @@ impl Default for McpSessionManager {
 #[derive(Clone)]
 pub struct HttpState {
     pub rag: Arc<RAGPipeline>,
+    /// Shared MCP protocol core reused by stdio and HTTP/SSE transports
+    pub mcp_core: Arc<McpCore>,
     /// MCP session manager for SSE transport
     pub mcp_sessions: Arc<McpSessionManager>,
     /// Base URL for MCP messages endpoint (set at startup)
@@ -1154,7 +1158,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
 async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".to_string(),
-        db_path: state.rag.storage().lance_path().to_string(),
+        db_path: state.rag.storage_manager().lance_path().to_string(),
         embedding_provider: state.rag.mlx_connected_to(),
     })
 }
@@ -1207,7 +1211,7 @@ async fn overview_handler(
     info!("API: /api/overview - fetching stats");
 
     // Use efficient stats() - only counts rows, doesn't load all data
-    let stats = state.rag.storage().stats().await.map_err(|e| {
+    let stats = state.rag.storage_manager().stats().await.map_err(|e| {
         error!("API: /api/overview - stats error: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
@@ -1260,12 +1264,10 @@ async fn browse_handler(
         Some(ns.as_str())
     };
 
-    // Use a zero embedding to get all docs (sorted by default order)
-    let zero_embedding = vec![0.0_f32; 4096];
     let all_docs = state
         .rag
-        .storage()
-        .search_store(namespace, zero_embedding, params.limit + params.offset)
+        .storage_manager()
+        .all_documents(namespace, params.limit + params.offset)
         .await
         .map_err(|e| {
             error!("API: /api/browse/{} - error: {}", ns, e);
@@ -1317,12 +1319,10 @@ async fn browse_all_handler(
         params.limit, params.offset
     );
 
-    // Use a zero embedding to get documents (random order without real search)
-    let zero_embedding = vec![0.0_f32; 4096];
     let all_docs = state
         .rag
-        .storage()
-        .search_store(None, zero_embedding, params.limit + params.offset)
+        .storage_manager()
+        .all_documents(None, params.limit + params.offset)
         .await
         .map_err(|e| {
             error!("API: /api/browse (all) - error: {}", e);
@@ -1402,7 +1402,7 @@ async fn search_handler(
         // Regular search
         state
             .rag
-            .memory_search(
+            .search_memory(
                 req.namespace.as_deref().unwrap_or("default"),
                 &req.query,
                 req.limit,
@@ -1443,7 +1443,7 @@ async fn sse_search_handler(
 
         let namespace = params.namespace.as_deref().unwrap_or("default");
 
-        match state.rag.memory_search(namespace, &params.query, params.limit).await {
+        match state.rag.search_memory(namespace, &params.query, params.limit).await {
             Ok(results) => {
                 let total = results.len();
 
@@ -1493,12 +1493,10 @@ async fn cross_search_handler(
 
     let start = std::time::Instant::now();
 
-    // Get all namespaces by searching with zero embedding
-    let zero_embedding = vec![0.0_f32; 4096]; // Max dimension
     let all_docs = state
         .rag
-        .storage()
-        .search_store(None, zero_embedding, 10000)
+        .storage_manager()
+        .all_documents(None, 10000)
         .await
         .map_err(|e| {
             error!("Cross-search namespace lookup error: {}", e);
@@ -1530,7 +1528,7 @@ async fn cross_search_handler(
     for ns in &namespaces {
         match state
             .rag
-            .memory_search(ns, &params.query, params.limit)
+            .search_memory(ns, &params.query, params.limit)
             .await
         {
             Ok(results) => {
@@ -1585,8 +1583,7 @@ async fn sse_cross_search_handler(
             }).to_string()));
 
         // Get all namespaces
-        let zero_embedding = vec![0.0_f32; 4096];
-        let all_docs = match state.rag.storage().search_store(None, zero_embedding, 10000).await {
+        let all_docs = match state.rag.storage_manager().all_documents(None, 10000).await {
             Ok(docs) => docs,
             Err(e) => {
                 yield Ok(Event::default()
@@ -1620,7 +1617,7 @@ async fn sse_cross_search_handler(
                 .event("searching")
                 .data(serde_json::json!({"namespace": ns}).to_string()));
 
-            match state.rag.memory_search(ns, &params.query, params.limit).await {
+            match state.rag.search_memory(ns, &params.query, params.limit).await {
                 Ok(results) => {
                     let ns_count = results.len();
                     for r in results {
@@ -1715,7 +1712,7 @@ async fn discovery_handler(State(state): State<HttpState>) -> Json<serde_json::V
     Json(json!({
         "status": if cache.is_some() { "ok" } else { "loading" },
         "version": env!("CARGO_PKG_VERSION"),
-        "db_path": state.rag.storage().lance_path(),
+        "db_path": state.rag.storage_manager().lance_path(),
         "embedding_provider": state.rag.mlx_connected_to(),
         "total_documents": total_documents,
         "namespaces": namespaces,
@@ -1737,7 +1734,7 @@ async fn sse_namespaces_handler(
             }).to_string()));
 
         // Get namespace list
-        let namespaces = match state.rag.storage().list_namespaces().await {
+        let namespaces = match state.rag.storage_manager().list_namespaces().await {
             Ok(ns) => ns,
             Err(e) => {
                 yield Ok(Event::default()
@@ -1763,7 +1760,7 @@ async fn sse_namespaces_handler(
             let mut layer_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut all_keywords: Vec<String> = Vec::new();
 
-            if let Ok(docs) = state.rag.storage().get_all_in_namespace(ns_name).await {
+            if let Ok(docs) = state.rag.storage_manager().get_all_in_namespace(ns_name).await {
                 for doc in &docs {
                     let layer_name = SliceLayer::from_u8(doc.layer)
                         .map(|l| l.name().to_string())
@@ -1820,13 +1817,13 @@ async fn sse_optimize_handler(
         let start = std::time::Instant::now();
 
         // Pre-optimize stats
-        let pre_stats = state.rag.storage().stats().await.ok();
+        let pre_stats = state.rag.storage_manager().stats().await.ok();
 
         yield Ok(Event::default()
             .event("start")
             .data(serde_json::json!({
                 "status": "starting_optimization",
-                "db_path": state.rag.storage().lance_path(),
+                "db_path": state.rag.storage_manager().lance_path(),
                 "pre_row_count": pre_stats.as_ref().map(|s| s.row_count),
                 "pre_version_count": pre_stats.as_ref().map(|s| s.version_count),
             }).to_string()));
@@ -1840,7 +1837,7 @@ async fn sse_optimize_handler(
                 "description": "Merging small files into larger ones"
             }).to_string()));
 
-        let compact_result = state.rag.storage().compact().await;
+        let compact_result = state.rag.storage_manager().compact().await;
 
         match &compact_result {
             Ok(stats) => {
@@ -1877,7 +1874,7 @@ async fn sse_optimize_handler(
                 "description": "Removing old versions (>7 days)"
             }).to_string()));
 
-        let prune_result = state.rag.storage().cleanup(Some(7)).await;
+        let prune_result = state.rag.storage_manager().cleanup(Some(7)).await;
 
         match &prune_result {
             Ok(stats) => {
@@ -1902,7 +1899,7 @@ async fn sse_optimize_handler(
         }
 
         // Post-optimize stats
-        let post_stats = state.rag.storage().stats().await.ok();
+        let post_stats = state.rag.storage_manager().stats().await.ok();
 
         yield Ok(Event::default()
             .event("done")
@@ -2058,7 +2055,7 @@ async fn get_handler(
     State(state): State<HttpState>,
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.memory_get(&ns, &id).await {
+    match state.rag.lookup_memory(&ns, &id).await {
         Ok(Some(r)) => {
             let result: SearchResultJson = r.into();
             Ok(Json(serde_json::json!(result)))
@@ -2079,7 +2076,7 @@ async fn delete_handler(
     State(state): State<HttpState>,
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.memory_delete(&ns, &id).await {
+    match state.rag.remove_memory(&ns, &id).await {
         Ok(deleted) => Ok(Json(serde_json::json!({
             "status": if deleted > 0 { "deleted" } else { "not_found" },
             "id": id,
@@ -2097,7 +2094,7 @@ async fn purge_namespace_handler(
     State(state): State<HttpState>,
     Path(namespace): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.rag.purge_namespace(&namespace).await {
+    match state.rag.clear_namespace(&namespace).await {
         Ok(deleted) => Ok(Json(serde_json::json!({
             "status": "purged",
             "namespace": namespace,
@@ -2216,17 +2213,14 @@ async fn mcp_messages_handler(
             )
         })?;
 
-    // Parse the JSON-RPC request
-    let request: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
+    debug!(
+        "MCP: session={} payload_bytes={}",
+        session_id,
+        body.trim().len()
+    );
 
-    debug!("MCP: session={} method={}", session_id, request["method"]);
-
-    // Handle the request (inline MCP protocol handling)
-    let response = handle_mcp_request(&state.rag, request).await;
-
-    // Only send response for requests (not notifications)
-    if let Some(response) = response
+    if let Some(response) =
+        dispatch_mcp_payload(state.mcp_core.as_ref(), &body, McpTransport::HttpSse).await
         && let Err(e) = session.tx.send(response)
     {
         warn!(
@@ -2243,287 +2237,13 @@ async fn mcp_messages_handler(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// Handle MCP JSON-RPC request
-/// Implements core MCP protocol methods using RAGPipeline
-/// Returns None for notifications (no response needed), Some for requests
-async fn handle_mcp_request(
-    rag: &Arc<RAGPipeline>,
-    request: serde_json::Value,
-) -> Option<serde_json::Value> {
-    let method = request["method"].as_str().unwrap_or("");
-    let id = request.get("id").cloned();
-
-    // Notifications start with "notifications/" - no response per JSON-RPC spec
-    if method.starts_with("notifications/") {
-        debug!("MCP: notification '{}' - no response", method);
-        return None;
-    }
-
-    // Requests must have an id (string or number)
-    let id = match id {
-        Some(v) if v.is_string() || v.is_number() => v,
-        _ => {
-            warn!("MCP: request '{}' missing valid id", method);
-            return Some(json!({
-                "jsonrpc": "2.0",
-                "id": serde_json::Value::Null,
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid Request: missing or invalid 'id' field"
-                }
-            }));
-        }
-    };
-
-    let result = match method {
-        "initialize" => json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": {
-                "name": "rmcp-memex",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "tools": {}
-            }
-        }),
-
-        "tools/list" => json!({
-            "tools": [
-                {
-                    "name": "health",
-                    "description": "Health/status of rmcp-memex server",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "rag_index_text",
-                    "description": "Index raw text for RAG/memory",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "id": {"type": "string"},
-                            "namespace": {"type": "string"},
-                            "metadata": {"type": "object"}
-                        },
-                        "required": ["text"]
-                    }
-                },
-                {
-                    "name": "rag_search",
-                    "description": "Search documents using RAG",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "k": {"type": "integer", "default": 10},
-                            "namespace": {"type": "string"}
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "memory_upsert",
-                    "description": "Upsert a text chunk into vector memory",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"},
-                            "text": {"type": "string"},
-                            "metadata": {"type": "object"}
-                        },
-                        "required": ["namespace", "id", "text"]
-                    }
-                },
-                {
-                    "name": "memory_search",
-                    "description": "Semantic search within a namespace",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "query": {"type": "string"},
-                            "k": {"type": "integer", "default": 5}
-                        },
-                        "required": ["namespace", "query"]
-                    }
-                },
-                {
-                    "name": "memory_get",
-                    "description": "Get a stored chunk by namespace + id",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"}
-                        },
-                        "required": ["namespace", "id"]
-                    }
-                },
-                {
-                    "name": "memory_delete",
-                    "description": "Delete a chunk by namespace + id",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "namespace": {"type": "string"},
-                            "id": {"type": "string"}
-                        },
-                        "required": ["namespace", "id"]
-                    }
-                }
-            ]
-        }),
-
-        "tools/call" => {
-            let tool_name = request["params"]["name"].as_str().unwrap_or("");
-            let args = &request["params"]["arguments"];
-
-            match tool_name {
-                "health" => {
-                    let status = json!({
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "db_path": rag.storage().lance_path(),
-                        "backend": "mlx",
-                        "transport": "mcp-over-sse"
-                    });
-                    json!({
-                        "content": [{"type": "text", "text": serde_json::to_string(&status).unwrap_or_default()}]
-                    })
-                }
-                "rag_index_text" => {
-                    let text = args["text"].as_str().unwrap_or("").to_string();
-                    let namespace = args["namespace"].as_str();
-                    let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
-                    let id = args
-                        .get("id")
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-                    match rag.index_text(namespace, id.clone(), text, metadata).await {
-                        Ok(returned_id) => json!({
-                            "content": [{"type": "text", "text": format!("Indexed text with id {}", returned_id)}]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                "rag_search" => {
-                    let query = args["query"].as_str().unwrap_or("");
-                    let k = args["k"].as_u64().unwrap_or(10) as usize;
-                    let namespace = args["namespace"].as_str();
-
-                    match rag.search_inner(namespace, query, k).await {
-                        Ok(results) => json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string(&results).unwrap_or_default()
-                            }]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                "memory_upsert" => {
-                    let namespace = args["namespace"].as_str().unwrap_or("default");
-                    let id_str = args["id"].as_str().unwrap_or("").to_string();
-                    let text = args["text"].as_str().unwrap_or("").to_string();
-                    let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
-
-                    match rag
-                        .memory_upsert(namespace, id_str.clone(), text, metadata)
-                        .await
-                    {
-                        Ok(_) => json!({
-                            "content": [{"type": "text", "text": format!("Upserted {}", id_str)}]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                "memory_search" => {
-                    let namespace = args["namespace"].as_str().unwrap_or("default");
-                    let query = args["query"].as_str().unwrap_or("");
-                    let k = args["k"].as_u64().unwrap_or(5) as usize;
-
-                    match rag.memory_search(namespace, query, k).await {
-                        Ok(results) => json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string(&results).unwrap_or_default()
-                            }]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                "memory_get" => {
-                    let namespace = args["namespace"].as_str().unwrap_or("default");
-                    let id_str = args["id"].as_str().unwrap_or("");
-                    match rag.memory_get(namespace, id_str).await {
-                        Ok(Some(doc)) => json!({
-                            "content": [{"type": "text", "text": serde_json::to_string(&doc).unwrap_or_default()}]
-                        }),
-                        Ok(None) => json!({
-                            "content": [{"type": "text", "text": "Not found"}]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                "memory_delete" => {
-                    let namespace = args["namespace"].as_str().unwrap_or("default");
-                    let id_str = args["id"].as_str().unwrap_or("");
-                    match rag.memory_delete(namespace, id_str).await {
-                        Ok(deleted) => json!({
-                            "content": [{"type": "text", "text": format!("Deleted {} rows", deleted)}]
-                        }),
-                        Err(e) => json!({
-                            "error": {"message": e.to_string()}
-                        }),
-                    }
-                }
-                _ => {
-                    return Some(json!({
-                        "jsonrpc": "2.0",
-                        "error": {"code": -32601, "message": format!("Unknown tool: {}", tool_name)},
-                        "id": id
-                    }));
-                }
-            }
-        }
-
-        _ => {
-            return Some(json!({
-                "jsonrpc": "2.0",
-                "error": {"code": -32601, "message": format!("Unknown method: {}", method)},
-                "id": id
-            }));
-        }
-    };
-
-    Some(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result
-    }))
-}
-
-/// Start the HTTP server with shared RAGPipeline
+/// Start the HTTP server with shared MCP core.
 pub async fn start_server(
-    rag: Arc<RAGPipeline>,
+    mcp_core: Arc<McpCore>,
     port: u16,
     server_config: HttpServerConfig,
 ) -> anyhow::Result<()> {
+    let rag = mcp_core.rag();
     // Fallback base_url - actual URL is derived from Host header in mcp_sse_handler
     let base_url = format!("http://{}:{}", server_config.bind_address, port);
     let cached_namespaces = Arc::new(RwLock::new(None));
@@ -2546,6 +2266,7 @@ pub async fn start_server(
 
     let state = HttpState {
         rag: rag.clone(),
+        mcp_core,
         mcp_sessions: Arc::new(McpSessionManager::new()),
         mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
         cached_namespaces: cached_namespaces.clone(),
@@ -2559,8 +2280,11 @@ pub async fn start_server(
     tokio::spawn(async move {
         // Initial load (with longer timeout for startup)
         info!("Background: Loading namespace cache (may take a while on large DB)...");
-        match tokio::time::timeout(Duration::from_secs(120), bg_rag.storage().list_namespaces())
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(120),
+            bg_rag.storage_manager().list_namespaces(),
+        )
+        .await
         {
             Ok(Ok(ns_list)) => {
                 let namespaces: Vec<NamespaceInfo> = ns_list
@@ -2589,8 +2313,11 @@ pub async fn start_server(
         loop {
             interval.tick().await;
             debug!("Background: Refreshing namespace cache...");
-            match tokio::time::timeout(Duration::from_secs(60), bg_rag.storage().list_namespaces())
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                bg_rag.storage_manager().list_namespaces(),
+            )
+            .await
             {
                 Ok(Ok(ns_list)) => {
                     let namespaces: Vec<NamespaceInfo> = ns_list

@@ -21,13 +21,14 @@ mod host_detection;
 mod indexer;
 mod ui;
 
+pub use crate::common::{HostFormat, HostKind};
 pub use app::{WizardConfig, run_wizard};
 pub use detection::{
     DetectedProvider, ProviderKind, ProviderStatus, check_custom_endpoint, detect_providers,
 };
 pub use health::{CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker};
-pub use host_detection::{HostDetection, HostFormat, HostKind, detect_hosts};
+pub use host_detection::{HostDetection, detect_hosts};
 pub use indexer::{
-    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, collect_files,
-    import_lancedb, start_indexing, validate_path,
+    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress,
+    collect_indexable_files, import_lancedb, start_indexing, validate_path,
 };

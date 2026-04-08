@@ -1,6 +1,6 @@
 use crate::{
-    EmbeddingConfig, MLXBridge, ProviderConfig, SliceMode, compute_content_hash, rag::RAGPipeline,
-    storage::StorageManager,
+    BM25Config, BM25Index, EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer,
+    SliceMode, compute_content_hash, rag::RAGPipeline, storage::StorageManager,
 };
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -72,18 +72,94 @@ async fn memory_roundtrip_and_search() -> Result<()> {
 
     // Read it back
     let fetched = rag
-        .memory_get("testns", "doc1")
+        .lookup_memory("testns", "doc1")
         .await?
         .ok_or_else(|| anyhow!("doc missing"))?;
     assert_eq!(fetched.text, "Ala ma kota");
     assert_eq!(fetched.namespace, "testns");
 
     // Semantic search within namespace
-    let results = rag.memory_search("testns", "kota", 1).await?;
+    let results = rag.search_memory("testns", "kota", 1).await?;
     assert!(!results.is_empty(), "expected at least one search result");
     assert_eq!(results[0].namespace, "testns");
 
     Ok(())
+}
+
+#[tokio::test]
+async fn rag_pipeline_syncs_bm25_writes() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let bm25 = Arc::new(BM25Index::new(
+        &BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()),
+    )?);
+    let rag = RAGPipeline::new_with_bm25(mlx, storage, Some(bm25.clone())).await?;
+
+    rag.index_text_with_mode(
+        Some("testns"),
+        "doc1".to_string(),
+        "Ala ma kota".to_string(),
+        json!({"lang": "pl"}),
+        SliceMode::Flat,
+    )
+    .await?;
+
+    let results = bm25.search("kota", Some("testns"), 10)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "doc1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn onion_text_index_overrides_stale_slice_mode_metadata() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage).await?;
+
+    rag.index_text_with_mode(
+        Some("onion-test"),
+        "doc1".to_string(),
+        "This is a longer document about onions and embeddings. It should create layered slices for metadata verification."
+            .to_string(),
+        json!({"slice_mode": "flat"}),
+        SliceMode::OnionFast,
+    )
+    .await?;
+
+    let docs = rag
+        .storage_manager()
+        .get_all_in_namespace("onion-test")
+        .await?;
+    assert!(!docs.is_empty(), "expected onion slices to be stored");
+    assert!(
+        docs.iter()
+            .all(|doc| doc.metadata["slice_mode"] == "onion-fast"),
+        "all stored slices should carry the actual onion slice_mode"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn search_options_default_to_outer_layer() {
+    assert_eq!(
+        SearchOptions::default().layer_filter,
+        Some(SliceLayer::Outer)
+    );
 }
 
 #[test]
@@ -134,7 +210,7 @@ async fn test_exact_dedup_skips_identical_content() -> Result<()> {
         .index_document_with_dedup(&test_file, Some("dedup-test"), SliceMode::Flat)
         .await?;
 
-    assert!(result1.is_indexed(), "First indexing should succeed");
+    assert!(result1.was_indexed(), "First indexing should succeed");
 
     // Second indexing of SAME content should skip
     let result2 = rag
@@ -174,13 +250,13 @@ async fn test_dedup_allows_different_content() -> Result<()> {
     let result1 = rag
         .index_document_with_dedup(&test_file1, Some("dedup-test"), SliceMode::Flat)
         .await?;
-    assert!(result1.is_indexed());
+    assert!(result1.was_indexed());
 
     // Index second file - should NOT be skipped (different content)
     let result2 = rag
         .index_document_with_dedup(&test_file2, Some("dedup-test"), SliceMode::Flat)
         .await?;
-    assert!(result2.is_indexed(), "Different content should be indexed");
+    assert!(result2.was_indexed(), "Different content should be indexed");
 
     // Hashes should be different
     assert_ne!(result1.content_hash(), result2.content_hash());
@@ -208,7 +284,7 @@ async fn test_dedup_different_namespaces() -> Result<()> {
     let result1 = rag
         .index_document_with_dedup(&test_file, Some("namespace-a"), SliceMode::Flat)
         .await?;
-    assert!(result1.is_indexed());
+    assert!(result1.was_indexed());
 
     // Same content in different namespace should also be indexed
     // (dedup is per-namespace, not global)
@@ -216,7 +292,7 @@ async fn test_dedup_different_namespaces() -> Result<()> {
         .index_document_with_dedup(&test_file, Some("namespace-b"), SliceMode::Flat)
         .await?;
     assert!(
-        result2.is_indexed(),
+        result2.was_indexed(),
         "Same content in different namespace should be indexed"
     );
 
@@ -244,7 +320,7 @@ async fn test_has_content_hash() -> Result<()> {
 
     // Before indexing, hash should not exist
     let exists_before = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &content_hash)
         .await?;
     assert!(!exists_before, "Hash should not exist before indexing");
@@ -253,11 +329,11 @@ async fn test_has_content_hash() -> Result<()> {
     let result = rag
         .index_document_with_dedup(&test_file, Some("hash-test"), SliceMode::Flat)
         .await?;
-    assert!(result.is_indexed());
+    assert!(result.was_indexed());
 
     // After indexing, hash should exist
     let exists_after = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &content_hash)
         .await?;
     assert!(exists_after, "Hash should exist after indexing");
@@ -265,7 +341,7 @@ async fn test_has_content_hash() -> Result<()> {
     // Non-existent hash should return false
     let fake_hash = compute_content_hash("non-existent content");
     let fake_exists = rag
-        .storage()
+        .storage_manager()
         .has_content_hash("hash-test", &fake_hash)
         .await?;
     assert!(!fake_exists, "Non-existent hash should return false");

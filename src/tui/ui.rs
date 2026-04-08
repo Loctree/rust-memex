@@ -253,7 +253,7 @@ fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(prefix, style),
                 Span::styled(format!("{} ", checkbox), style),
                 Span::styled(format!("{} ", status), style),
-                Span::styled(format!("{:<20}", kind.display_name()), style),
+                Span::styled(format!("{:<20}", kind.label()), style),
                 Span::styled(
                     format!(" {} ", detection.status_text()),
                     if detection.has_rmcp_memex {
@@ -297,7 +297,7 @@ fn render_snippet_preview(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         for (kind, snippet) in snippets {
             lines.push(Line::from(Span::styled(
-                format!("--- {} ---", kind.display_name()),
+                format!("--- {} ---", kind.label()),
                 Style::default().fg(Color::Green).bold(),
             )));
             for line in snippet.lines() {
@@ -504,7 +504,7 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
                     format!("{} ", status_icon),
                     Style::default().fg(status_color),
                 ),
-                Span::styled(provider.display_name(), style),
+                Span::styled(provider.summary(), style),
             ]));
         }
     } else {
@@ -551,10 +551,10 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(option.display_name(), style),
+                    Span::styled(option.label(), style),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", option.description()),
+                    format!("    {}", option.detail()),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -598,7 +598,7 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
-                    Span::styled(mode.display_name(), style),
+                    Span::styled(mode.label(), style),
                 ]));
             }
         }
@@ -685,7 +685,7 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         )));
     } else {
         for (kind, _detection) in selected {
-            lines.push(Line::from(format!("  • {}", kind.display_name())));
+            lines.push(Line::from(format!("  • {}", kind.label())));
         }
     }
 

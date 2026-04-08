@@ -2,6 +2,7 @@
 //!
 //! Detects Ollama, MLX server, and other embedding providers automatically.
 
+use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, infer_embedding_dimension};
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
@@ -26,36 +27,27 @@ pub struct DetectedProvider {
 
 impl DetectedProvider {
     /// Get a human-readable description
-    pub fn description(&self) -> String {
+    pub fn summary_line(&self) -> String {
         match &self.status {
             ProviderStatus::Online(model) => {
-                format!(
-                    "{} at {} - {}",
-                    self.kind.display_name(),
-                    self.base_url,
-                    model
-                )
+                format!("{} at {} - {}", self.kind.label(), self.base_url, model)
             }
             ProviderStatus::OnlineNoModel => {
                 format!(
                     "{} at {} (no embedding model)",
-                    self.kind.display_name(),
+                    self.kind.label(),
                     self.base_url
                 )
             }
             ProviderStatus::Offline => {
-                format!(
-                    "{} at {} (offline)",
-                    self.kind.display_name(),
-                    self.base_url
-                )
+                format!("{} at {} (offline)", self.kind.label(), self.base_url)
             }
         }
     }
 
-    /// Get display name for UI
-    pub fn display_name(&self) -> String {
-        self.description()
+    /// Get provider summary for UI
+    pub fn summary(&self) -> String {
+        self.summary_line()
     }
 
     /// Check if provider is usable
@@ -72,18 +64,39 @@ impl DetectedProvider {
         }
     }
 
-    /// Get embedding dimension for the detected model
-    pub fn dimension(&self) -> usize {
-        match self.model() {
-            Some(m) if m.contains("qwen3-embedding") => 4096,
-            Some(m) if m.contains("Qwen3-Embedding") => 4096,
-            Some(m) if m.contains("bge-m3") => 1024,
-            Some(m) if m.contains("nomic-embed") => 768,
-            Some(m) if m.contains("mxbai-embed") => 1024,
-            Some(m) if m.contains("all-minilm") => 384,
-            _ => 4096, // Default to Qwen3 dimension
-        }
+    /// Infer embedding dimension from the detected model name.
+    pub fn inferred_dimension(&self) -> Option<usize> {
+        self.model().and_then(infer_embedding_dimension)
     }
+
+    /// Get embedding dimension for the detected model
+    pub fn suggested_dimension(&self) -> usize {
+        self.inferred_dimension()
+            .unwrap_or(DEFAULT_REQUIRED_DIMENSION)
+    }
+}
+
+fn looks_like_embedding_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("embedding")
+        || model.contains("embed")
+        || model.contains("bge")
+        || model.contains("nomic")
+        || model.contains("mxbai")
+        || model.contains("minilm")
+}
+
+fn pick_embedding_model(models: &[String]) -> Option<String> {
+    models
+        .iter()
+        .find(|m| infer_embedding_dimension(m).is_some())
+        .cloned()
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| looks_like_embedding_model(m))
+                .cloned()
+        })
 }
 
 /// Type of embedding provider.
@@ -100,7 +113,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub fn display_name(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             ProviderKind::Ollama => "Ollama",
             ProviderKind::Mlx => "MLX Server",
@@ -196,7 +209,7 @@ async fn detect_ollama(client: &Client, host: &str, port: u16) -> Option<Detecte
                 base_url: base_url.clone(),
                 port,
                 models: vec![],
-                suggested_model: Some("qwen3-embedding:8b".to_string()),
+                suggested_model: None,
                 status: ProviderStatus::Offline,
             });
         }
@@ -210,7 +223,7 @@ async fn detect_ollama(client: &Client, host: &str, port: u16) -> Option<Detecte
                 base_url,
                 port,
                 models: vec![],
-                suggested_model: Some("qwen3-embedding:8b".to_string()),
+                suggested_model: None,
                 status: ProviderStatus::OnlineNoModel,
             });
         }
@@ -218,16 +231,9 @@ async fn detect_ollama(client: &Client, host: &str, port: u16) -> Option<Detecte
 
     let models: Vec<String> = tags.models.iter().map(|m| m.name.clone()).collect();
 
-    // Look for embedding models (prefer qwen3-embedding)
-    let embedding_model = models
-        .iter()
-        .find(|m| m.contains("qwen3-embedding"))
-        .or_else(|| models.iter().find(|m| m.contains("embedding")))
-        .or_else(|| models.iter().find(|m| m.contains("embed")))
-        .or_else(|| models.iter().find(|m| m.contains("bge")))
-        .or_else(|| models.iter().find(|m| m.contains("nomic")));
+    let embedding_model = pick_embedding_model(&models);
 
-    let status = if let Some(model) = embedding_model {
+    let status = if let Some(ref model) = embedding_model {
         ProviderStatus::Online(model.clone())
     } else {
         ProviderStatus::OnlineNoModel
@@ -238,7 +244,7 @@ async fn detect_ollama(client: &Client, host: &str, port: u16) -> Option<Detecte
         base_url,
         port,
         models,
-        suggested_model: Some("qwen3-embedding:8b".to_string()),
+        suggested_model: embedding_model,
         status,
     })
 }
@@ -265,7 +271,7 @@ async fn detect_mlx(client: &Client, host: &str, port: u16) -> Option<DetectedPr
                 base_url,
                 port,
                 models: vec![],
-                suggested_model: Some("Qwen/Qwen3-Embedding-4B".to_string()),
+                suggested_model: None,
                 status: ProviderStatus::OnlineNoModel,
             });
         }
@@ -273,13 +279,9 @@ async fn detect_mlx(client: &Client, host: &str, port: u16) -> Option<DetectedPr
 
     let models: Vec<String> = models_resp.data.iter().map(|m| m.id.clone()).collect();
 
-    // Look for embedding models
-    let embedding_model = models
-        .iter()
-        .find(|m| m.contains("Embedding") || m.contains("embedding"))
-        .or_else(|| models.iter().find(|m| m.contains("embed")));
+    let embedding_model = pick_embedding_model(&models);
 
-    let status = if let Some(model) = embedding_model {
+    let status = if let Some(ref model) = embedding_model {
         ProviderStatus::Online(model.clone())
     } else {
         ProviderStatus::OnlineNoModel
@@ -290,7 +292,7 @@ async fn detect_mlx(client: &Client, host: &str, port: u16) -> Option<DetectedPr
         base_url,
         port,
         models,
-        suggested_model: Some("Qwen/Qwen3-Embedding-4B".to_string()),
+        suggested_model: embedding_model,
         status,
     })
 }
@@ -362,11 +364,7 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
             if let Ok(tags) = serde_json::from_str::<OllamaTagsResponse>(&body) {
                 let models: Vec<String> = tags.models.iter().map(|m| m.name.clone()).collect();
 
-                let embedding_model = models
-                    .iter()
-                    .find(|m| m.contains("embedding"))
-                    .or_else(|| models.iter().find(|m| m.contains("embed")))
-                    .cloned();
+                let embedding_model = pick_embedding_model(&models);
 
                 let status = if let Some(ref model) = embedding_model {
                     ProviderStatus::Online(model.clone())
@@ -381,7 +379,7 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
                     base_url: base_url.to_string(),
                     port,
                     models,
-                    suggested_model: embedding_model.or(Some("qwen3-embedding:8b".to_string())),
+                    suggested_model: embedding_model,
                     status,
                 });
             } else {
@@ -414,7 +412,9 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
 /// Get dimension explanation for UI
 pub fn dimension_explanation(dim: usize) -> &'static str {
     match dim {
-        4096 => "Qwen3 models (4096 dims) - highest quality, recommended",
+        2560 => "Qwen3-Embedding 4B (2560 dims) - balanced default",
+        4096 => "Large Qwen3 embedding models (4096 dims)",
+        2048 => "Qwen3-VL embedding models (2048 dims) - compact and accurate",
         1024 => "BGE-M3/mxbai-embed (1024 dims) - good balance",
         768 => "nomic-embed (768 dims) - fast and lightweight",
         384 => "all-minilm (384 dims) - fastest, lowest quality",
@@ -428,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_provider_kind_display() {
-        assert_eq!(ProviderKind::Ollama.display_name(), "Ollama");
-        assert_eq!(ProviderKind::Mlx.display_name(), "MLX Server");
+        assert_eq!(ProviderKind::Ollama.label(), "Ollama");
+        assert_eq!(ProviderKind::Mlx.label(), "MLX Server");
     }
 
     #[test]
@@ -439,9 +439,36 @@ mod tests {
             base_url: "http://localhost:11434".to_string(),
             port: 11434,
             models: vec![],
-            suggested_model: Some("qwen3-embedding:8b".to_string()),
-            status: ProviderStatus::Online("qwen3-embedding:8b".to_string()),
+            suggested_model: Some("qwen3-embedding:4b".to_string()),
+            status: ProviderStatus::Online("qwen3-embedding:4b".to_string()),
         };
-        assert_eq!(provider.dimension(), 4096);
+        assert_eq!(provider.inferred_dimension(), Some(2560));
+        assert_eq!(provider.suggested_dimension(), 2560);
+    }
+
+    #[test]
+    fn test_dimension_for_qwen3_vl_models() {
+        let provider = DetectedProvider {
+            kind: ProviderKind::Ollama,
+            base_url: "http://localhost:11434".to_string(),
+            port: 11434,
+            models: vec![],
+            suggested_model: Some("MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string()),
+            status: ProviderStatus::Online("MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string()),
+        };
+        assert_eq!(provider.inferred_dimension(), Some(2048));
+        assert_eq!(provider.suggested_dimension(), 2048);
+    }
+
+    #[test]
+    fn test_pick_embedding_model_prefers_detectable_models_in_order() {
+        let models = vec![
+            "MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string(),
+            "qwen3-embedding:8b".to_string(),
+        ];
+        assert_eq!(
+            pick_embedding_model(&models).as_deref(),
+            Some("MedAIBase/Qwen3-VL-Embedding:2b-q8_0")
+        );
     }
 }

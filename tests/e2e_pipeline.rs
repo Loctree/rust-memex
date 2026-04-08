@@ -10,31 +10,44 @@
 use rmcp_memex::{
     ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tempfile::TempDir;
+
+const LOCAL_OLLAMA_MODEL: &str = "qwen3-embedding:4b";
+const LOCAL_OLLAMA_DIMENSION: usize = 2560;
 
 // =============================================================================
 // HELPER: Check if embedding server is available
 // =============================================================================
 
-async fn embedding_server_available() -> bool {
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModel {
+    name: String,
+}
+
+async fn ollama_qwen4b_available() -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
 
-    // Try Ollama first
-    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await
-        && resp.status().is_success()
-    {
-        return true;
-    }
+    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await {
+        if !resp.status().is_success() {
+            return false;
+        }
 
-    // Try MLX on 12345
-    if let Ok(resp) = client.get("http://localhost:12345/v1/models").send().await
-        && resp.status().is_success()
-    {
-        return true;
+        if let Ok(tags) = resp.json::<OllamaTagsResponse>().await {
+            return tags
+                .models
+                .iter()
+                .any(|model| model.name == LOCAL_OLLAMA_MODEL);
+        }
     }
 
     false
@@ -42,25 +55,16 @@ async fn embedding_server_available() -> bool {
 
 fn create_test_embedding_config() -> EmbeddingConfig {
     EmbeddingConfig {
-        required_dimension: 4096,
+        required_dimension: LOCAL_OLLAMA_DIMENSION,
         max_batch_chars: 32000,
         max_batch_items: 16,
-        providers: vec![
-            ProviderConfig {
-                name: "ollama-local".to_string(),
-                base_url: "http://localhost:11434".to_string(),
-                model: "qwen3-embedding:8b".to_string(),
-                priority: 1,
-                endpoint: "/v1/embeddings".to_string(),
-            },
-            ProviderConfig {
-                name: "mlx-local".to_string(),
-                base_url: "http://localhost:12345".to_string(),
-                model: "mlx-community/Qwen3-Embedding-8B-4bit-DWQ".to_string(),
-                priority: 2,
-                endpoint: "/v1/embeddings".to_string(),
-            },
-        ],
+        providers: vec![ProviderConfig {
+            name: "ollama-local".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            model: LOCAL_OLLAMA_MODEL.to_string(),
+            priority: 1,
+            endpoint: "/v1/embeddings".to_string(),
+        }],
         reranker: Default::default(),
     }
 }
@@ -73,8 +77,11 @@ fn create_test_embedding_config() -> EmbeddingConfig {
 #[tokio::test]
 #[ignore] // Run with: cargo test --test e2e_pipeline -- --ignored
 async fn test_e2e_index_embed_search() {
-    if !embedding_server_available().await {
-        eprintln!("SKIP: No embedding server available (Ollama or MLX)");
+    if !ollama_qwen4b_available().await {
+        eprintln!(
+            "SKIP: Local Ollama model '{}' unavailable at http://localhost:11434",
+            LOCAL_OLLAMA_MODEL
+        );
         return;
     }
 
@@ -128,7 +135,12 @@ async fn test_e2e_index_embed_search() {
             .await
             .expect("Failed to generate embedding");
 
-        assert_eq!(embedding.len(), 4096, "Embedding dimension should be 4096");
+        assert_eq!(
+            embedding.len(),
+            LOCAL_OLLAMA_DIMENSION,
+            "Embedding dimension should be {}",
+            LOCAL_OLLAMA_DIMENSION
+        );
 
         let doc = ChromaDocument::new_flat(
             id.to_string(),
@@ -173,8 +185,11 @@ async fn test_e2e_index_embed_search() {
 #[tokio::test]
 #[ignore]
 async fn test_e2e_batch_embedding() {
-    if !embedding_server_available().await {
-        eprintln!("SKIP: No embedding server available");
+    if !ollama_qwen4b_available().await {
+        eprintln!(
+            "SKIP: Local Ollama model '{}' unavailable",
+            LOCAL_OLLAMA_MODEL
+        );
         return;
     }
 
@@ -204,9 +219,10 @@ async fn test_e2e_batch_embedding() {
     for (i, emb) in embeddings.iter().enumerate() {
         assert_eq!(
             emb.len(),
-            4096,
-            "Embedding {} should have 4096 dimensions",
-            i
+            LOCAL_OLLAMA_DIMENSION,
+            "Embedding {} should have {} dimensions",
+            i,
+            LOCAL_OLLAMA_DIMENSION
         );
 
         // Check no NaN/Inf values
@@ -225,9 +241,12 @@ async fn test_e2e_batch_embedding() {
 /// Test dimension validation at startup (fail-fast)
 #[tokio::test]
 #[ignore]
-async fn test_e2e_dimension_validation() {
-    if !embedding_server_available().await {
-        eprintln!("SKIP: No embedding server available");
+async fn test_e2e_local_ollama_qwen4b_validation() {
+    if !ollama_qwen4b_available().await {
+        eprintln!(
+            "SKIP: Local Ollama model '{}' unavailable",
+            LOCAL_OLLAMA_MODEL
+        );
         return;
     }
 
@@ -239,15 +258,38 @@ async fn test_e2e_dimension_validation() {
         "Should connect with correct dimension config"
     );
 
-    let embedder = result.unwrap();
+    let mut embedder = result.unwrap();
     let connected = embedder.connected_to();
     eprintln!("Connected to: {}", connected);
 
-    // Should connect to one of our configured providers
     assert!(
-        connected == "ollama-local" || connected == "mlx-local",
-        "Should connect to a configured provider, got: {}",
+        connected == "ollama-local",
+        "Should connect to local Ollama, got: {}",
         connected
+    );
+
+    let embedding = embedder
+        .embed("qwen4b validation probe")
+        .await
+        .expect("Expected local Ollama /v1/embeddings to work");
+    assert_eq!(embedding.len(), LOCAL_OLLAMA_DIMENSION);
+
+    let mut bad_config = create_test_embedding_config();
+    bad_config.required_dimension = 4096;
+    let err = EmbeddingClient::new(&bad_config)
+        .await
+        .err()
+        .expect("Mismatched config dimension should fail fast");
+    let message = err.to_string();
+    assert!(
+        message.contains("returned 2560 dims") || message.contains("returned 2560"),
+        "Unexpected error message: {}",
+        message
+    );
+    assert!(
+        message.contains("required_dimension=4096"),
+        "Unexpected error message: {}",
+        message
     );
 }
 
@@ -255,8 +297,11 @@ async fn test_e2e_dimension_validation() {
 #[tokio::test]
 #[ignore]
 async fn test_e2e_deduplication() {
-    if !embedding_server_available().await {
-        eprintln!("SKIP: No embedding server available");
+    if !ollama_qwen4b_available().await {
+        eprintln!(
+            "SKIP: Local Ollama model '{}' unavailable",
+            LOCAL_OLLAMA_MODEL
+        );
         return;
     }
 
@@ -322,7 +367,7 @@ async fn test_storage_rejects_invalid_embeddings() {
     let doc_empty_id = ChromaDocument::new_flat(
         "".to_string(),
         "test-ns".to_string(),
-        vec![0.1f32; 4096],
+        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
         json!({}),
         "Content".to_string(),
     );
@@ -333,7 +378,7 @@ async fn test_storage_rejects_invalid_embeddings() {
     let doc_empty_ns = ChromaDocument::new_flat(
         "valid-id".to_string(),
         "".to_string(),
-        vec![0.1f32; 4096],
+        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
         json!({}),
         "Content".to_string(),
     );
@@ -341,7 +386,7 @@ async fn test_storage_rejects_invalid_embeddings() {
     assert!(result.is_err(), "Empty namespace should be rejected");
 
     // Test: NaN in embedding should be rejected
-    let mut embedding_with_nan = vec![0.1f32; 4096];
+    let mut embedding_with_nan = vec![0.1f32; LOCAL_OLLAMA_DIMENSION];
     embedding_with_nan[100] = f32::NAN;
     let doc_nan = ChromaDocument::new_flat(
         "nan-doc".to_string(),
@@ -354,7 +399,7 @@ async fn test_storage_rejects_invalid_embeddings() {
     assert!(result.is_err(), "NaN in embedding should be rejected");
 
     // Test: Inf in embedding should be rejected
-    let mut embedding_with_inf = vec![0.1f32; 4096];
+    let mut embedding_with_inf = vec![0.1f32; LOCAL_OLLAMA_DIMENSION];
     embedding_with_inf[200] = f32::INFINITY;
     let doc_inf = ChromaDocument::new_flat(
         "inf-doc".to_string(),
@@ -367,10 +412,10 @@ async fn test_storage_rejects_invalid_embeddings() {
     assert!(result.is_err(), "Inf in embedding should be rejected");
 
     // Test: Inconsistent dimensions in batch should be rejected
-    let doc_4096 = ChromaDocument::new_flat(
-        "doc-4096".to_string(),
+    let doc_good = ChromaDocument::new_flat(
+        "doc-good".to_string(),
         "test-ns".to_string(),
-        vec![0.1f32; 4096],
+        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
         json!({}),
         "Content".to_string(),
     );
@@ -381,7 +426,7 @@ async fn test_storage_rejects_invalid_embeddings() {
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_4096, doc_1024]).await;
+    let result = storage.add_to_store(vec![doc_good, doc_1024]).await;
     assert!(
         result.is_err(),
         "Inconsistent dimensions should be rejected"

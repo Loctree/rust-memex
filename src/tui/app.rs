@@ -3,7 +3,9 @@
 //! Main application state and step management for the configuration wizard.
 //! Implements the new wizard flow with EmbedderSetup as the first configuration step.
 
-use crate::embeddings::{EmbeddingConfig, ProviderConfig};
+use crate::embeddings::{
+    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, infer_embedding_dimension,
+};
 use crate::tui::detection::{
     DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
 };
@@ -16,7 +18,7 @@ use crate::tui::indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, import_lancedb,
     start_indexing,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -132,21 +134,40 @@ impl Default for EmbedderState {
             detecting: false,
             selected_provider: None,
             manual_url: "http://localhost:11434".to_string(),
-            manual_model: "qwen3-embedding:8b".to_string(),
-            dimension: 4096,
+            manual_model: String::new(),
+            dimension: DEFAULT_REQUIRED_DIMENSION,
             use_manual: false,
         }
     }
 }
 
 impl EmbedderState {
+    pub fn selected_model(&self) -> Option<String> {
+        if self.use_manual {
+            let model = self.manual_model.trim();
+            if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            }
+        } else if let Some(ref detected) = self.selected_provider {
+            detected
+                .model()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        }
+    }
+
     /// Get dimension explanation text
     pub fn dimension_hint(&self) -> &'static str {
         dimension_explanation(self.dimension)
     }
 
     /// Update embedding config from state
-    pub fn to_embedding_config(&self) -> EmbeddingConfig {
+    pub fn build_embedding_config(&self) -> EmbeddingConfig {
         let provider = if self.use_manual {
             ProviderConfig {
                 name: "manual".to_string(),
@@ -173,7 +194,7 @@ impl EmbedderState {
             ProviderConfig {
                 name: "ollama-local".to_string(),
                 base_url: "http://localhost:11434".to_string(),
-                model: "qwen3-embedding:8b".to_string(),
+                model: self.selected_model().unwrap_or_default(),
                 priority: 1,
                 ..Default::default()
             }
@@ -252,7 +273,7 @@ impl Default for MemexCfg {
 
 impl MemexCfg {
     /// Get the effective database path (with hostname suffix if per-host mode)
-    pub fn effective_db_path(&self) -> String {
+    pub fn resolved_db_path(&self) -> String {
         match self.db_path_mode {
             DbPathMode::Shared => self.db_path.clone(),
             DbPathMode::PerHost => format!("{}.{}", self.db_path, self.hostname),
@@ -297,7 +318,7 @@ impl App {
         let hosts = detect_extended_hosts();
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp_memex".to_string());
         let embedder_state = EmbedderState::default();
-        let embedding_config = embedder_state.to_embedding_config();
+        let embedding_config = embedder_state.build_embedding_config();
 
         Self {
             step: WizardStep::Welcome,
@@ -327,7 +348,7 @@ impl App {
         if let Some(next) = self.step.next() {
             // On leaving EmbedderSetup, update the embedding config
             if self.step == WizardStep::EmbedderSetup {
-                self.embedding_config = self.embedder_state.to_embedding_config();
+                self.embedding_config = self.embedder_state.build_embedding_config();
             }
             self.step = next;
             self.focus = 0;
@@ -372,7 +393,7 @@ impl App {
     }
 
     pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
@@ -418,7 +439,7 @@ impl App {
         ));
 
         // Check db_path (use effective path)
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
         let expanded_path = shellexpand::tilde(&effective_path).to_string();
         let db_path = PathBuf::from(&expanded_path);
         if db_path.exists() {
@@ -437,7 +458,7 @@ impl App {
     }
 
     pub fn write_configs(&mut self) -> Result<()> {
-        let effective_path = self.memex_cfg.effective_db_path();
+        let effective_path = self.memex_cfg.resolved_db_path();
 
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
@@ -451,7 +472,7 @@ impl App {
                         generate_extended_snippet(*kind, &self.binary_path, &effective_path);
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
-                        kind.display_name(),
+                        kind.label(),
                         detection.path.display(),
                         snippet
                     ));
@@ -492,7 +513,7 @@ impl App {
                     Err(e) => {
                         error_count += 1;
                         self.messages
-                            .push(format!("[ERR] {} failed: {}", kind.display_name(), e));
+                            .push(format!("[ERR] {} failed: {}", kind.label(), e));
                     }
                 }
             }
@@ -648,7 +669,14 @@ impl App {
                         {
                             match field {
                                 0 => self.embedder_state.manual_url = self.input_buffer.clone(),
-                                1 => self.embedder_state.manual_model = self.input_buffer.clone(),
+                                1 => {
+                                    self.embedder_state.manual_model = self.input_buffer.clone();
+                                    if let Some(dim) =
+                                        infer_embedding_dimension(&self.embedder_state.manual_model)
+                                    {
+                                        self.embedder_state.dimension = dim;
+                                    }
+                                }
                                 2 => {
                                     if let Ok(dim) = self.input_buffer.parse() {
                                         self.embedder_state.dimension = dim;
@@ -739,7 +767,9 @@ impl App {
         } else if self.focus < self.embedder_state.detected_providers.len() {
             // Select a detected provider
             let provider = self.embedder_state.detected_providers[self.focus].clone();
-            self.embedder_state.dimension = provider.dimension();
+            self.embedder_state.dimension = provider
+                .inferred_dimension()
+                .unwrap_or(self.embedder_state.dimension);
             self.embedder_state.selected_provider = Some(provider);
         } else {
             // Switch to manual configuration (last option)
@@ -758,7 +788,7 @@ impl App {
                 if let Some(mode) = modes.get(self.data_setup.focus).cloned() {
                     self.data_setup.select_import_mode(mode);
                     // If import mode is selected, perform the import
-                    if self.data_setup.is_complete()
+                    if self.data_setup.is_done()
                         && self.data_setup.option == DataSetupOption::ImportLanceDB
                     {
                         self.perform_import();
@@ -772,7 +802,7 @@ impl App {
     fn handle_next(&mut self) {
         // For DataSetup, only proceed if complete or skip
         if self.step == WizardStep::DataSetup {
-            if self.data_setup.is_complete() || self.data_setup.option == DataSetupOption::Skip {
+            if self.data_setup.is_done() || self.data_setup.option == DataSetupOption::Skip {
                 self.next_step();
             }
         } else if self.step == WizardStep::HealthCheck {
@@ -966,13 +996,16 @@ impl App {
                 .find(|p| p.is_usable())
             {
                 self.embedder_state.selected_provider = Some(provider.clone());
-                self.embedder_state.dimension = provider.dimension();
+                self.embedder_state.dimension = provider
+                    .inferred_dimension()
+                    .unwrap_or(self.embedder_state.dimension);
             }
         }
     }
 
     /// Generate the complete config TOML for rmcp-memex
     pub fn generate_config_toml(&self) -> String {
+        const MODEL_PLACEHOLDER: &str = "<set-your-embedding-model>";
         let mut toml = String::new();
 
         // Header
@@ -990,7 +1023,7 @@ impl App {
         toml.push_str("# Database configuration\n");
         toml.push_str(&format!(
             "db_path = \"{}\"\n",
-            self.memex_cfg.effective_db_path()
+            self.memex_cfg.resolved_db_path()
         ));
         toml.push_str(&format!("cache_mb = {}\n", self.memex_cfg.cache_mb));
         toml.push_str(&format!("log_level = \"{}\"\n", self.memex_cfg.log_level));
@@ -1024,7 +1057,9 @@ impl App {
             ));
             toml.push_str(&format!(
                 "model = \"{}\"\n",
-                self.embedder_state.manual_model
+                self.embedder_state
+                    .selected_model()
+                    .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string())
             ));
         } else if let Some(ref provider) = self.embedder_state.selected_provider {
             let name = match provider.kind {
@@ -1037,13 +1072,13 @@ impl App {
             toml.push_str(&format!("base_url = \"{}\"\n", provider.base_url));
             toml.push_str(&format!(
                 "model = \"{}\"\n",
-                provider.model().unwrap_or("unknown")
+                provider.model().unwrap_or(MODEL_PLACEHOLDER)
             ));
         } else {
-            // Fallback default
+            // No provider selected yet: write an explicit placeholder instead of a false default.
             toml.push_str("name = \"ollama-local\"\n");
             toml.push_str("base_url = \"http://localhost:11434\"\n");
-            toml.push_str("model = \"qwen3-embedding:8b\"\n");
+            toml.push_str(&format!("model = \"{}\"\n", MODEL_PLACEHOLDER));
         }
         toml.push_str("priority = 1\n");
         toml.push_str("endpoint = \"/v1/embeddings\"\n");
@@ -1053,6 +1088,12 @@ impl App {
 
     /// Write rmcp-memex config file to disk
     pub fn write_memex_config(&mut self) -> Result<()> {
+        if self.embedder_state.selected_model().is_none() {
+            return Err(anyhow!(
+                "No embedding model selected. Pick a detected provider or enter a manual model before writing config."
+            ));
+        }
+
         if self.dry_run {
             self.messages
                 .push("DRY RUN: Config would be written to:".to_string());

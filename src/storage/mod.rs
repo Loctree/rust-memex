@@ -332,6 +332,34 @@ impl StorageManager {
         Ok(results)
     }
 
+    /// Return documents without running a vector search.
+    /// Used by admin/reporting paths that need a full table scan without
+    /// assuming any embedding dimension or creating a table on read.
+    pub async fn all_documents(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ChromaDocument>> {
+        let table = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]),
+        };
+
+        let mut query = table.query().limit(limit);
+        if let Some(ns) = namespace {
+            query = query.only_if(self.namespace_filter(ns).as_str());
+        }
+        let mut stream = query.execute().await?;
+
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            let mut docs = self.batch_to_docs(&batch)?;
+            results.append(&mut docs);
+        }
+
+        Ok(results)
+    }
+
     pub async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>> {
         let table = match self.ensure_table(0).await {
             Ok(t) => t,
@@ -371,7 +399,7 @@ impl StorageManager {
         Ok(deleted.version as usize)
     }
 
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+    pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
         let table = match self.ensure_table(0).await {
             Ok(t) => t,
             Err(_) => return Ok(0),
@@ -379,6 +407,11 @@ impl StorageManager {
         let predicate = self.namespace_filter(namespace);
         let deleted = table.delete(predicate.as_str()).await?;
         Ok(deleted.version as usize)
+    }
+
+    #[deprecated(note = "use delete_namespace_documents")]
+    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
+        self.delete_namespace_documents(namespace).await
     }
 
     pub fn get_collection_name(&self) -> &str {
@@ -419,6 +452,16 @@ impl StorageManager {
 
         *guard = Some(table.clone());
         Ok(table)
+    }
+
+    async fn open_existing_table(&self) -> Result<Table> {
+        self.ensure_table(0).await.map_err(|_| {
+            anyhow!(
+                "Vector table '{}' not found at {}. Index data first so rmcp-memex can use the stored embedding dimension instead of guessing.",
+                self.collection_name,
+                self.lance_path
+            )
+        })
     }
 
     /// Create the LanceDB schema with onion slice fields and content hash
@@ -648,6 +691,25 @@ impl StorageManager {
         Ok(docs)
     }
 
+    pub async fn get_filtered_in_namespace(
+        &self,
+        namespace: &str,
+        filter: &str,
+    ) -> Result<Vec<ChromaDocument>> {
+        let table = match self.ensure_table(0).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]),
+        };
+        let combined = format!("{} AND ({})", self.namespace_filter(namespace), filter);
+        let mut stream = table.query().only_if(combined.as_str()).execute().await?;
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            let mut docs = self.batch_to_docs(&batch)?;
+            results.append(&mut docs);
+        }
+        Ok(results)
+    }
+
     /// Search with optional layer filtering for onion slice architecture
     pub async fn search_store_with_layer(
         &self,
@@ -747,7 +809,12 @@ impl StorageManager {
     }
 
     fn layer_filter(&self, layer: SliceLayer) -> String {
-        format!("layer = {}", layer.as_u8())
+        if layer == SliceLayer::Outer {
+            // Default search should surface onion summaries while still seeing legacy flat chunks.
+            "(layer = 0 OR layer = 1)".to_string()
+        } else {
+            format!("layer = {}", layer.as_u8())
+        }
     }
 
     fn content_hash_filter(&self, hash: &str) -> String {
@@ -878,7 +945,7 @@ impl StorageManager {
 
     /// Run all optimizations (compact + prune old versions)
     pub async fn optimize(&self) -> Result<OptimizeStats> {
-        let table = self.ensure_table(4096).await?;
+        let table = self.open_existing_table().await?;
         let stats = table.optimize(OptimizeAction::All).await?;
         info!(
             "Optimize complete: compaction={:?}, prune={:?}",
@@ -889,7 +956,7 @@ impl StorageManager {
 
     /// Compact small files into larger ones for better performance
     pub async fn compact(&self) -> Result<OptimizeStats> {
-        let table = self.ensure_table(4096).await?;
+        let table = self.open_existing_table().await?;
         let stats = table
             .optimize(OptimizeAction::Compact {
                 options: Default::default(),
@@ -902,7 +969,7 @@ impl StorageManager {
 
     /// Remove old versions older than specified duration (default: 7 days)
     pub async fn cleanup(&self, older_than_days: Option<u64>) -> Result<OptimizeStats> {
-        let table = self.ensure_table(4096).await?;
+        let table = self.open_existing_table().await?;
         let days = older_than_days.unwrap_or(7) as i64;
         let duration = chrono::TimeDelta::days(days);
         let stats = table
@@ -918,7 +985,7 @@ impl StorageManager {
 
     /// Get table statistics (row count, fragments, etc.)
     pub async fn stats(&self) -> Result<TableStats> {
-        let table = self.ensure_table(4096).await?;
+        let table = self.open_existing_table().await?;
         let row_count = table.count_rows(None).await?;
 
         // Get version count
@@ -935,7 +1002,10 @@ impl StorageManager {
 
     /// Count rows in a specific namespace
     pub async fn count_namespace(&self, namespace: &str) -> Result<usize> {
-        let table = self.ensure_table(4096).await?;
+        let table = match self.ensure_table(0).await {
+            Ok(table) => table,
+            Err(_) => return Ok(0),
+        };
         let filter = self.namespace_filter(namespace);
         let count = table.count_rows(Some(filter)).await?;
         Ok(count)
@@ -1096,13 +1166,13 @@ impl StorageManager {
     // =========================================================================
 
     /// Run garbage collection based on configuration
-    pub async fn run_gc(&self, config: &GcConfig) -> Result<GcStats> {
+    #[doc(alias = "run_gc")]
+    pub async fn garbage_collect(&self, config: &GcConfig) -> Result<GcStats> {
         let mut stats = GcStats::default();
 
         // Get all documents for analysis
-        let zero_embedding = vec![0.0_f32; 4096];
         let all_docs = self
-            .search_store(config.namespace.as_deref(), zero_embedding, 1_000_000)
+            .all_documents(config.namespace.as_deref(), 1_000_000)
             .await?;
 
         if all_docs.is_empty() {
@@ -1149,6 +1219,11 @@ impl StorageManager {
         }
 
         Ok(stats)
+    }
+
+    #[deprecated(note = "use garbage_collect")]
+    pub async fn run_gc(&self, config: &GcConfig) -> Result<GcStats> {
+        self.garbage_collect(config).await
     }
 
     /// Find orphan embeddings - documents with parent_id pointing to non-existent documents
@@ -1275,8 +1350,7 @@ impl StorageManager {
 
     /// List all unique namespaces in the database
     pub async fn list_namespaces(&self) -> Result<Vec<(String, usize)>> {
-        let zero_embedding = vec![0.0_f32; 4096];
-        let all_docs = self.search_store(None, zero_embedding, 1_000_000).await?;
+        let all_docs = self.all_documents(None, 1_000_000).await?;
 
         let mut namespace_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();

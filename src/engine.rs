@@ -41,7 +41,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::embeddings::{EmbeddingClient, EmbeddingConfig};
+use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, EmbeddingClient, EmbeddingConfig};
 use crate::rag::{SearchResult, SliceLayer};
 use crate::search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
@@ -88,7 +88,7 @@ fn default_enable_hybrid() -> bool {
 }
 
 fn default_dimension() -> usize {
-    4096 // qwen3-embedding default
+    DEFAULT_REQUIRED_DIMENSION
 }
 
 impl Default for MemexConfig {
@@ -132,8 +132,33 @@ impl MemexConfig {
 
     /// Set embedding configuration
     pub fn with_embedding_config(mut self, config: EmbeddingConfig) -> Self {
+        self.dimension = config.required_dimension;
         self.embedding_config = config;
         self
+    }
+
+    fn sync_dimension_fields(&mut self) -> Result<()> {
+        if self.dimension == self.embedding_config.required_dimension {
+            return Ok(());
+        }
+
+        let default_dim = default_dimension();
+        if self.dimension == default_dim {
+            self.dimension = self.embedding_config.required_dimension;
+            return Ok(());
+        }
+
+        if self.embedding_config.required_dimension == default_dim {
+            self.embedding_config.required_dimension = self.dimension;
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "MemexConfig.dimension={} conflicts with embedding_config.required_dimension={}. \
+             Set them to the same value or use with_dimension()/with_embedding_config() so one source of truth updates both.",
+            self.dimension,
+            self.embedding_config.required_dimension
+        ))
     }
 
     /// Enable BM25 hybrid search
@@ -156,6 +181,45 @@ impl MemexConfig {
             .as_ref()
             .map(|c| c.index_path.clone())
             .unwrap_or_else(|| format!("~/.rmcp-servers/{}/bm25", self.app_name))
+    }
+
+    fn hybrid_uses_bm25(&self) -> bool {
+        self.enable_hybrid
+            && self.hybrid_config.clone().unwrap_or_default().mode != SearchMode::Vector
+    }
+
+    fn normalize_bm25_config(&self, mut config: BM25Config) -> BM25Config {
+        if config.index_path == BM25Config::default().index_path {
+            config.index_path = self.effective_bm25_path();
+        }
+        config
+    }
+
+    fn resolved_bm25_config(&self) -> Option<BM25Config> {
+        if !self.enable_bm25 && !self.hybrid_uses_bm25() {
+            return None;
+        }
+
+        let config = self
+            .bm25_config
+            .clone()
+            .or_else(|| {
+                self.hybrid_config
+                    .as_ref()
+                    .filter(|cfg| cfg.mode != SearchMode::Vector)
+                    .map(|cfg| cfg.bm25.clone())
+            })
+            .unwrap_or_default();
+
+        Some(self.normalize_bm25_config(config))
+    }
+
+    fn resolved_hybrid_config(&self) -> HybridConfig {
+        let mut config = self.hybrid_config.clone().unwrap_or_default();
+        if let Some(bm25) = self.resolved_bm25_config() {
+            config.bm25 = bm25;
+        }
+        config
     }
 }
 
@@ -363,7 +427,7 @@ pub struct DiveResult {
 pub struct MemexEngine {
     storage: Arc<StorageManager>,
     embeddings: Arc<Mutex<EmbeddingClient>>,
-    bm25: Option<BM25Index>,
+    bm25: Option<Arc<BM25Index>>,
     hybrid_searcher: Option<HybridSearcher>,
     namespace: String,
     config: MemexConfig,
@@ -379,7 +443,8 @@ impl MemexEngine {
     ///     .with_dimension(1024);
     /// let engine = MemexEngine::new(config).await?;
     /// ```
-    pub async fn new(config: MemexConfig) -> Result<Self> {
+    pub async fn new(mut config: MemexConfig) -> Result<Self> {
+        config.sync_dimension_fields()?;
         let db_path = config.effective_db_path();
 
         info!(
@@ -400,33 +465,26 @@ impl MemexEngine {
             embeddings.required_dimension()
         );
 
-        // Validate dimension matches config
-        if embeddings.required_dimension() != config.dimension {
-            return Err(anyhow!(
-                "Embedding dimension mismatch! Config: {}, Provider: {}. \
-                 Update config.dimension to match your embedding model.",
-                config.dimension,
-                embeddings.required_dimension()
-            ));
-        }
-
         // Initialize BM25 if enabled
-        let bm25 = if config.enable_bm25 {
-            let bm25_config = config
-                .bm25_config
-                .clone()
-                .unwrap_or_else(|| BM25Config::default().with_path(config.effective_bm25_path()));
-            Some(BM25Index::new(&bm25_config)?)
-        } else {
-            None
-        };
+        let bm25 = config
+            .resolved_bm25_config()
+            .map(|bm25_config| BM25Index::new(&bm25_config).map(Arc::new))
+            .transpose()?;
 
         let storage_arc = Arc::new(storage);
 
         // Initialize HybridSearcher if hybrid mode is enabled
         let hybrid_searcher = if config.enable_hybrid {
-            let hybrid_config = config.hybrid_config.clone().unwrap_or_default();
-            Some(HybridSearcher::new(storage_arc.clone(), hybrid_config).await?)
+            let hybrid_config = config.resolved_hybrid_config();
+            Some(if let Some(ref bm25_index) = bm25 {
+                HybridSearcher::with_bm25_index(
+                    storage_arc.clone(),
+                    bm25_index.clone(),
+                    hybrid_config,
+                )
+            } else {
+                HybridSearcher::new(storage_arc.clone(), hybrid_config).await?
+            })
         } else {
             None
         };
@@ -878,8 +936,8 @@ impl MemexEngine {
         // This is expensive but necessary for metadata-based filtering
         // Note: A more efficient implementation would add filter support to StorageManager
 
-        // For now, we'll search with a broad query and filter
-        // TODO: Add native metadata filtering to LanceDB queries
+        // For now, we'll scan namespace documents and filter in memory.
+        // TODO: Add native metadata filtering to LanceDB queries.
 
         let mut deleted_count = 0;
         let mut deleted_ids = Vec::new();
@@ -888,13 +946,9 @@ impl MemexEngine {
         // We use a high limit and paginate if needed
         const BATCH_SIZE: usize = 1000;
 
-        // Generate a dummy embedding for the search
-        // (we'll rely on metadata filtering, not vector similarity)
-        let dummy_embedding = vec![0.0f32; self.config.dimension];
-
         let candidates = self
             .storage
-            .search_store(Some(&self.namespace), dummy_embedding, BATCH_SIZE)
+            .all_documents(Some(&self.namespace), BATCH_SIZE)
             .await?;
 
         for doc in candidates {
@@ -924,10 +978,13 @@ impl MemexEngine {
     pub async fn purge_namespace(&self) -> Result<usize> {
         info!("Purging namespace: {}", self.namespace);
 
-        let deleted = self.storage.purge_namespace(&self.namespace).await?;
+        let deleted = self
+            .storage
+            .delete_namespace_documents(&self.namespace)
+            .await?;
 
         if let Some(ref bm25) = self.bm25 {
-            bm25.purge_namespace(&self.namespace).await?;
+            bm25.delete_namespace_term(&self.namespace).await?;
         }
 
         Ok(deleted)
@@ -1050,7 +1107,11 @@ mod tests {
     #[test]
     fn test_memex_config_defaults() {
         let config = MemexConfig::default();
-        assert_eq!(config.dimension, 4096);
+        assert_eq!(config.dimension, DEFAULT_REQUIRED_DIMENSION);
+        assert_eq!(
+            config.embedding_config.required_dimension,
+            DEFAULT_REQUIRED_DIMENSION
+        );
         assert_eq!(config.namespace, "default");
         assert_eq!(config.effective_db_path(), "~/.rmcp-servers/memex/lancedb");
     }
@@ -1064,7 +1125,44 @@ mod tests {
         assert_eq!(config.app_name, "vista");
         assert_eq!(config.namespace, "patients");
         assert_eq!(config.dimension, 1024);
+        assert_eq!(config.embedding_config.required_dimension, 1024);
         assert_eq!(config.effective_db_path(), "/custom/path/db");
+    }
+
+    #[test]
+    fn test_memex_config_with_embedding_config_syncs_dimension() {
+        let embedding_config = EmbeddingConfig {
+            required_dimension: 768,
+            ..EmbeddingConfig::default()
+        };
+
+        let config = MemexConfig::new("sync-test", "ns").with_embedding_config(embedding_config);
+
+        assert_eq!(config.dimension, 768);
+        assert_eq!(config.embedding_config.required_dimension, 768);
+    }
+
+    #[test]
+    fn test_memex_config_sync_dimension_fields_uses_non_default_embedding_dimension() {
+        let mut config = MemexConfig::default();
+        config.embedding_config.required_dimension = 1024;
+
+        config.sync_dimension_fields().unwrap();
+
+        assert_eq!(config.dimension, 1024);
+        assert_eq!(config.embedding_config.required_dimension, 1024);
+    }
+
+    #[test]
+    fn test_memex_config_sync_dimension_fields_rejects_true_conflict() {
+        let mut config = MemexConfig {
+            dimension: 768,
+            ..MemexConfig::default()
+        };
+        config.embedding_config.required_dimension = 1024;
+
+        let err = config.sync_dimension_fields().unwrap_err().to_string();
+        assert!(err.contains("conflicts with embedding_config.required_dimension"));
     }
 
     #[test]
@@ -1215,6 +1313,24 @@ mod tests {
     }
 
     #[test]
+    fn test_resolved_bm25_config_uses_app_specific_path_for_hybrid_defaults() {
+        let config = MemexConfig::new("my-app", "docs");
+        let bm25 = config
+            .resolved_bm25_config()
+            .expect("hybrid defaults should provision BM25");
+
+        assert_eq!(bm25.index_path, "~/.rmcp-servers/my-app/bm25");
+    }
+
+    #[test]
+    fn test_resolved_hybrid_config_reuses_resolved_bm25_path() {
+        let config = MemexConfig::new("my-app", "docs");
+        let hybrid = config.resolved_hybrid_config();
+
+        assert_eq!(hybrid.bm25.index_path, "~/.rmcp-servers/my-app/bm25");
+    }
+
+    #[test]
     fn test_meta_filter_serialization() {
         let filter = MetaFilter::for_patient("P-123").with_custom("status", "active");
 
@@ -1241,6 +1357,7 @@ mod tests {
         assert_eq!(deserialized.app_name, "test");
         assert_eq!(deserialized.namespace, "ns");
         assert_eq!(deserialized.dimension, 512);
+        assert_eq!(deserialized.embedding_config.required_dimension, 512);
         assert_eq!(deserialized.db_path, Some("/tmp/test".to_string()));
     }
 

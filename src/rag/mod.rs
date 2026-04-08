@@ -13,6 +13,7 @@ use tracing::debug;
 use crate::{
     embeddings::MLXBridge,
     preprocessing::{PreprocessingConfig, Preprocessor},
+    search::BM25Index,
     storage::{ChromaDocument, StorageManager},
 };
 
@@ -176,8 +177,13 @@ pub enum IndexResult {
 
 impl IndexResult {
     /// Check if content was indexed
-    pub fn is_indexed(&self) -> bool {
+    pub fn was_indexed(&self) -> bool {
         matches!(self, IndexResult::Indexed { .. })
+    }
+
+    #[deprecated(note = "use was_indexed")]
+    pub fn is_indexed(&self) -> bool {
+        self.was_indexed()
     }
 
     /// Check if content was skipped
@@ -1096,6 +1102,7 @@ fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
 pub struct RAGPipeline {
     mlx_bridge: Arc<Mutex<MLXBridge>>,
     storage: Arc<StorageManager>,
+    bm25_writer: Option<Arc<BM25Index>>,
 }
 
 impl RAGPipeline {
@@ -1104,19 +1111,67 @@ impl RAGPipeline {
         mlx_bridge: Arc<Mutex<MLXBridge>>,
         storage: Arc<StorageManager>,
     ) -> Result<Self> {
+        Self::new_with_bm25(mlx_bridge, storage, None).await
+    }
+
+    pub async fn new_with_bm25(
+        mlx_bridge: Arc<Mutex<MLXBridge>>,
+        storage: Arc<StorageManager>,
+        bm25_writer: Option<Arc<BM25Index>>,
+    ) -> Result<Self> {
         Ok(Self {
             mlx_bridge,
             storage,
+            bm25_writer,
         })
     }
 
-    pub fn storage(&self) -> Arc<StorageManager> {
+    pub fn storage_manager(&self) -> Arc<StorageManager> {
         self.storage.clone()
     }
 
     /// Refresh storage to see new data written by other processes
     pub async fn refresh(&self) -> Result<()> {
         self.storage.refresh().await
+    }
+
+    async fn persist_documents(&self, documents: Vec<ChromaDocument>) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+
+        let bm25_documents: Vec<(String, String, String)> = documents
+            .iter()
+            .map(|doc| (doc.id.clone(), doc.namespace.clone(), doc.document.clone()))
+            .collect();
+
+        self.storage.add_to_store(documents).await?;
+
+        if let Some(bm25_writer) = &self.bm25_writer {
+            bm25_writer.add_documents(&bm25_documents).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn clear_namespace_from_indices(&self, namespace: &str) -> Result<usize> {
+        let deleted = self.storage.delete_namespace_documents(namespace).await?;
+
+        if let Some(bm25_writer) = &self.bm25_writer {
+            bm25_writer.delete_namespace_term(namespace).await?;
+        }
+
+        Ok(deleted)
+    }
+
+    async fn delete_memory_from_indices(&self, namespace: &str, id: &str) -> Result<usize> {
+        let deleted = self.storage.delete_document(namespace, id).await?;
+
+        if let Some(bm25_writer) = &self.bm25_writer {
+            bm25_writer.delete_documents(&[id.to_string()]).await?;
+        }
+
+        Ok(deleted)
     }
 
     /// Get which MLX server we're connected to (for health/status reporting)
@@ -1490,7 +1545,7 @@ impl RAGPipeline {
             }
 
             // Flush this batch to storage
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
@@ -1537,7 +1592,7 @@ impl RAGPipeline {
                 batch_docs.push(doc);
             }
 
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
@@ -1595,7 +1650,7 @@ impl RAGPipeline {
             }
 
             // Flush this batch to storage
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
@@ -1651,7 +1706,7 @@ impl RAGPipeline {
                 batch_docs.push(doc);
             }
 
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
@@ -1705,7 +1760,7 @@ impl RAGPipeline {
             }
 
             // Flush this batch to storage
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} chunks", total_stored, total_chunks);
         }
@@ -1738,7 +1793,7 @@ impl RAGPipeline {
         );
 
         // Store directly
-        self.storage.add_to_store(vec![doc]).await?;
+        self.persist_documents(vec![doc]).await?;
 
         tracing::debug!(
             "Conversation message stored directly: {} ({} chars)",
@@ -1802,7 +1857,7 @@ impl RAGPipeline {
             }
 
             // Flush this batch to storage
-            self.storage.add_to_store(batch_docs).await?;
+            self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} chunks", total_stored, total_chunks);
         }
@@ -1831,6 +1886,11 @@ impl RAGPipeline {
         slice_mode: SliceMode,
     ) -> Result<String> {
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE).to_string();
+        let slice_mode_name = match slice_mode {
+            SliceMode::Onion => "onion",
+            SliceMode::OnionFast => "onion-fast",
+            SliceMode::Flat => "flat",
+        };
 
         match slice_mode {
             SliceMode::Onion | SliceMode::OnionFast => {
@@ -1852,6 +1912,7 @@ impl RAGPipeline {
                     if let serde_json::Value::Object(ref mut map) = meta {
                         map.insert("layer".to_string(), json!(slice.layer.name()));
                         map.insert("original_id".to_string(), json!(id));
+                        map.insert("slice_mode".to_string(), json!(slice_mode_name));
                     }
 
                     let doc = ChromaDocument::from_onion_slice(
@@ -1863,7 +1924,7 @@ impl RAGPipeline {
                     documents.push(doc);
                 }
 
-                self.storage.add_to_store(documents).await?;
+                self.persist_documents(documents).await?;
 
                 // Return the outer slice ID (what search will hit first)
                 Ok(slices
@@ -1874,8 +1935,12 @@ impl RAGPipeline {
             }
             SliceMode::Flat => {
                 let embedding = self.embed_query(&text).await?;
+                let mut metadata = metadata;
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("slice_mode".to_string(), json!(slice_mode_name));
+                }
                 let doc = ChromaDocument::new_flat(id.clone(), ns, embedding, metadata, text);
-                self.storage.add_to_store(vec![doc]).await?;
+                self.persist_documents(vec![doc]).await?;
                 Ok(id)
             }
         }
@@ -1895,7 +1960,7 @@ impl RAGPipeline {
         Ok(())
     }
 
-    pub async fn memory_get(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
+    pub async fn lookup_memory(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
         if let Some(doc) = self.storage.get_document(namespace, id).await? {
             let layer = doc.slice_layer();
             return Ok(Some(SearchResult {
@@ -1913,15 +1978,30 @@ impl RAGPipeline {
         Ok(None)
     }
 
+    #[deprecated(note = "use lookup_memory")]
+    pub async fn memory_get(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
+        self.lookup_memory(namespace, id).await
+    }
+
+    pub async fn remove_memory(&self, namespace: &str, id: &str) -> Result<usize> {
+        self.delete_memory_from_indices(namespace, id).await
+    }
+
+    #[deprecated(note = "use remove_memory")]
     pub async fn memory_delete(&self, namespace: &str, id: &str) -> Result<usize> {
-        self.storage.delete_document(namespace, id).await
+        self.remove_memory(namespace, id).await
     }
 
+    pub async fn clear_namespace(&self, namespace: &str) -> Result<usize> {
+        self.clear_namespace_from_indices(namespace).await
+    }
+
+    #[deprecated(note = "use clear_namespace")]
     pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.storage.purge_namespace(namespace).await
+        self.clear_namespace(namespace).await
     }
 
-    pub async fn memory_search(
+    pub async fn search_memory(
         &self,
         namespace: &str,
         query: &str,
@@ -1929,6 +2009,16 @@ impl RAGPipeline {
     ) -> Result<Vec<SearchResult>> {
         self.search_with_options(Some(namespace), query, k, SearchOptions::default())
             .await
+    }
+
+    #[deprecated(note = "use search_memory")]
+    pub async fn memory_search(
+        &self,
+        namespace: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_memory(namespace, query, k).await
     }
 
     /// Search with layer filter - returns only outer slices by default (efficient context usage)
@@ -2692,7 +2782,7 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 }
 
 /// Options for search operations
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SearchOptions {
     /// Filter by onion slice layer (None = all layers)
     pub layer_filter: Option<SliceLayer>,
@@ -2709,6 +2799,12 @@ impl SearchOptions {
     /// Deep search - include all layers including Core
     pub fn deep() -> Self {
         Self { layer_filter: None }
+    }
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self::outer_only()
     }
 }
 
