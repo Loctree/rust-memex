@@ -3,6 +3,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod handlers;
 pub mod http;
+pub mod mcp_core;
 pub mod mcp_protocol;
 mod mcp_runtime;
 pub mod path_utils;
@@ -33,10 +34,11 @@ pub use embeddings::{
     truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
-pub use mcp_protocol::{
+pub use mcp_core::{
     McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
 };
-pub use mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request};
+pub use mcp_core::{dispatch_mcp_jsonrpc_request, dispatch_mcp_payload, dispatch_mcp_request};
+pub use mcp_runtime::build_mcp_core;
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,

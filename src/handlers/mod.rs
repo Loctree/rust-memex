@@ -5,7 +5,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     ServerConfig,
-    mcp_protocol::{McpCore, McpTransport, jsonrpc_success},
+    mcp_core::{McpCore, McpTransport, dispatch_mcp_payload, dispatch_mcp_request},
+    mcp_protocol::jsonrpc_success,
     mcp_runtime::build_mcp_core,
 };
 
@@ -37,10 +38,8 @@ impl MCPServer {
                 continue;
             }
 
-            if let Some(response) = self
-                .mcp_core
-                .handle_payload(trimmed, McpTransport::Stdio)
-                .await
+            if let Some(response) =
+                dispatch_mcp_payload(self.mcp_core.as_ref(), trimmed, McpTransport::Stdio).await
             {
                 write_json_line(&mut stdout, &response).await?;
             }
@@ -54,8 +53,7 @@ impl MCPServer {
     }
 
     pub async fn dispatch_request(&self, request: Value) -> Value {
-        self.mcp_core
-            .handle_request(request, McpTransport::Stdio)
+        dispatch_mcp_request(self.mcp_core.as_ref(), request, McpTransport::Stdio)
             .await
             .unwrap_or_else(|| jsonrpc_success(&Value::Null, Value::Null))
     }

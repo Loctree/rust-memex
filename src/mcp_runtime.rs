@@ -1,12 +1,11 @@
 use anyhow::Result;
-use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
     ServerConfig,
     embeddings::EmbeddingClient,
-    mcp_protocol::{McpCore, McpTransport},
+    mcp_core::McpCore,
     search::{BM25Index, HybridSearcher},
     security::NamespaceAccessManager,
     storage::StorageManager,
@@ -66,22 +65,4 @@ pub async fn build_mcp_core(config: ServerConfig) -> Result<Arc<McpCore>> {
         config.allowed_paths,
         access_manager,
     )))
-}
-
-/// Dispatch a parsed JSON-RPC request through the shared MCP core.
-pub async fn dispatch_mcp_request(
-    mcp_core: &McpCore,
-    request: Value,
-    transport: McpTransport,
-) -> Option<Value> {
-    mcp_core.handle_request(request, transport).await
-}
-
-/// Dispatch a raw JSON-RPC payload through the shared MCP core.
-pub async fn dispatch_mcp_payload(
-    mcp_core: &McpCore,
-    payload: &str,
-    transport: McpTransport,
-) -> Option<Value> {
-    mcp_core.handle_payload(payload, transport).await
 }
