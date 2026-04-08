@@ -37,15 +37,13 @@ async fn ollama_available() -> bool {
         return false;
     };
     // Check the specific model is pulled, not just that Ollama is running
-    body["models"]
-        .as_array()
-        .is_some_and(|models| {
-            models.iter().any(|m| {
-                m["name"]
-                    .as_str()
-                    .is_some_and(|n| n.starts_with(LOCAL_OLLAMA_MODEL))
-            })
+    body["models"].as_array().is_some_and(|models| {
+        models.iter().any(|m| {
+            m["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with(LOCAL_OLLAMA_MODEL))
         })
+    })
 }
 
 fn test_config(db_path: &str) -> ServerConfig {
@@ -122,7 +120,10 @@ async fn parity_initialize_identical_across_transports() {
     let stdio = stdio.expect("stdio must respond to initialize");
     let sse = sse.expect("sse must respond to initialize");
 
-    assert_eq!(stdio, sse, "initialize responses must be identical across transports");
+    assert_eq!(
+        stdio, sse,
+        "initialize responses must be identical across transports"
+    );
     assert_eq!(stdio["jsonrpc"], "2.0");
     assert_eq!(stdio["id"], 1);
     assert!(stdio["result"]["protocolVersion"].is_string());
@@ -147,7 +148,10 @@ async fn parity_tools_list_identical_across_transports() {
     let stdio = stdio.expect("stdio must respond to tools/list");
     let sse = sse.expect("sse must respond to tools/list");
 
-    assert_eq!(stdio, sse, "tools/list responses must be identical across transports");
+    assert_eq!(
+        stdio, sse,
+        "tools/list responses must be identical across transports"
+    );
 
     let tools = stdio["result"]["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 14, "must expose all 14 tools");
@@ -282,7 +286,10 @@ async fn parity_invalid_json_error_identical() {
 
     let stdio = stdio.expect("stdio must respond with parse error");
     let sse = sse.expect("sse must respond with parse error");
-    assert_eq!(stdio, sse, "parse errors must be identical across transports");
+    assert_eq!(
+        stdio, sse,
+        "parse errors must be identical across transports"
+    );
     assert_eq!(stdio["error"]["code"], -32700);
 }
 

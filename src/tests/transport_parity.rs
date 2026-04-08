@@ -993,7 +993,6 @@ async fn handle_payload_tools_list_roundtrip_parity_stub() {
         EXPECTED_TOOLS.len()
     );
 }
-
 /// Oversized payloads are rejected before transport-specific delivery.
 #[tokio::test]
 async fn handle_payload_request_too_large_parity_stub() {
@@ -1068,8 +1067,7 @@ async fn dispatch_tools_call_create_token_parity_stub() {
 
     // Structure must match (actual token values will differ, so compare shape only)
     assert_eq!(
-        stdio_resp["result"]["content"][0]["type"],
-        http_resp["result"]["content"][0]["type"],
+        stdio_resp["result"]["content"][0]["type"], http_resp["result"]["content"][0]["type"],
         "content type must be identical across transports"
     );
 }
@@ -1124,8 +1122,7 @@ async fn dispatch_tools_call_revoke_token_empty_ns_parity_stub() {
 #[tokio::test]
 async fn handle_payload_tools_call_roundtrip_parity_stub() {
     let core = build_mcp_core_stub().await;
-    let payload =
-        r#"{"jsonrpc":"2.0","id":"wire-tc","method":"tools/call","params":{"name":"namespace_security_status","arguments":{}}}"#;
+    let payload = r#"{"jsonrpc":"2.0","id":"wire-tc","method":"tools/call","params":{"name":"namespace_security_status","arguments":{}}}"#;
 
     let stdio = core.handle_payload(payload, McpTransport::Stdio).await;
     let http = core.handle_payload(payload, McpTransport::HttpSse).await;

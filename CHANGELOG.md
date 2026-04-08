@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Release-facing landing page source under `docs/` with a GitHub Pages workflow and social preview asset
+- Release runbook documenting preflight checks, tagging flow, smoke tests, and post-publish verification
+- SHA256 checksum generation for GitHub release artifacts and installer-side checksum verification
+
+### Changed
+- Resolved the shared MCP transport merge so `mcp_core` remains the single public dispatch surface
+- Hardened CI with library-only and `cargo package` smoke checks in addition to the existing lint/test gates
+- Aligned release automation, install scripts, and docs around the canonical `rmcp-memex` binary name and documented aliases
+
 ## [0.4.0] - 2026-03-09
 
 ### Changed

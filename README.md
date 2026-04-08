@@ -9,6 +9,27 @@ It exposes two explicit transport modes from a single canonical surface:
 
 > **Note on Aliases:** The published package and primary entrypoint is `rmcp-memex`. For operational convenience, it installs the aliases `rust-memex`, `rmmx`, and `rmemex`. These are strictly convenience links to the identical `rmcp-memex` kernel, not separate products.
 
+## Release Surface
+
+- Quick install: `curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh`
+- Release runbook: [docs/RELEASE.md](docs/RELEASE.md)
+- Configuration guide: [docs/02_configuration.md](docs/02_configuration.md)
+- HTTP/SSE reference: [docs/HTTP_API.md](docs/HTTP_API.md)
+- Static launch page source: `docs/index.html` published by `.github/workflows/pages.yml`
+
+## Quick Start
+
+```bash
+# Install from the latest GitHub Release
+curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+
+# Start the MCP server
+rmcp-memex serve
+
+# Or run the multi-agent HTTP/SSE daemon
+rmcp-memex serve --http-port 6660 --http-only
+```
+
 ## Overview
 
 As an MCP (Model Context Protocol) server, `rmcp-memex` provides:

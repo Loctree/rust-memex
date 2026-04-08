@@ -7,6 +7,8 @@ description = "RAG/memory MCP server with LanceDB vector storage"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/VetCoders/rmcp-memex"
 homepage = "https://github.com/VetCoders/rmcp-memex"
+documentation = "https://docs.rs/rmcp-memex"
+readme = "README.md"
 keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 

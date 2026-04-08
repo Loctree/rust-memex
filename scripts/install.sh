@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 echo "=== rmcp-memex setup ==="
@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 echo "Building release binary..."
-cargo build --release
+cargo build --locked --release --bin rmcp-memex
 
 if [[ "${1:-}" == "--bundle-macos" ]]; then
   echo "Creating macOS app bundle..."
@@ -28,7 +28,7 @@ cat <<JSON
   "mcpServers": {
     "rmcp-memex": {
       "command": "$BIN_PATH",
-      "args": ["--log-level", "info"]
+      "args": ["serve"]
     }
   }
 }

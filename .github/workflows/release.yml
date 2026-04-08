@@ -3,8 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+      - 'v*.*.*'
+      - 'v*.*.*-*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,14 +63,15 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --bin rmcp_memex --release --target ${{ matrix.target }}
+        run: cargo build --locked --bin rmcp-memex --release --target ${{ matrix.target }}
 
       - name: Prepare artifact (Unix)
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rmcp_memex dist/
-          chmod +x dist/rmcp_memex
-          cd dist && tar -czvf ../${{ matrix.artifact }}.tar.gz rmcp_memex
+          cp target/${{ matrix.target }}/release/rmcp-memex dist/
+          cp README.md LICENSE LICENSE-APACHE install.sh dist/
+          chmod +x dist/rmcp-memex
+          cd dist && tar -czvf ../${{ matrix.artifact }}.tar.gz rmcp-memex README.md LICENSE LICENSE-APACHE install.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -137,18 +138,23 @@ jobs:
           BODY+="# Or download binary directly\n"
           BODY+="# macOS Apple Silicon\n"
           BODY+="curl -LO https://github.com/VetCoders/rmcp-memex/releases/download/v$VERSION/rmcp-memex-aarch64-apple-darwin.tar.gz\n"
+          BODY+="curl -LO https://github.com/VetCoders/rmcp-memex/releases/download/v$VERSION/rmcp-memex-sha256sums.txt\n"
+          BODY+="grep rmcp-memex-aarch64-apple-darwin.tar.gz rmcp-memex-sha256sums.txt\n"
           BODY+="\`\`\`\n\n"
           BODY+="### MCP Host Configuration\n\n"
           BODY+="\`\`\`json\n"
           BODY+="{\n"
           BODY+="  \"mcpServers\": {\n"
           BODY+="    \"rmcp_memex\": {\n"
-          BODY+="      \"command\": \"/path/to/rmcp_memex\",\n"
+          BODY+="      \"command\": \"/path/to/rmcp-memex\",\n"
           BODY+="      \"args\": [\"serve\"]\n"
           BODY+="    }\n"
           BODY+="  }\n"
           BODY+="}\n"
           BODY+="\`\`\`\n"
+          BODY+="\n### Docs and Launch Surface\n\n"
+          BODY+="- Release runbook: https://github.com/VetCoders/rmcp-memex/blob/main/docs/RELEASE.md\n"
+          BODY+="- Static landing page source: https://github.com/VetCoders/rmcp-memex/blob/main/docs/index.html\n"
 
           # Save to file for the release action
           echo -e "$BODY" > /tmp/release_notes.md
@@ -163,6 +169,10 @@ jobs:
         run: |
           mkdir -p release-files
           find artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
+          (
+            cd release-files
+            sha256sum *.tar.gz > rmcp-memex-sha256sums.txt
+          )
           ls -la release-files/
 
       - name: Create GitHub Release
