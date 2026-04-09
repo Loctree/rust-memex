@@ -260,8 +260,8 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
-        /// Show smart progress bar with ETA based on calibration.
-        /// Displays three phases: pre-scan, calibration, and indexing progress.
+        /// Prefer compact progress output when an interactive terminal is detected.
+        /// Non-interactive runs fall back to line logs.
         #[arg(long)]
         progress: bool,
 

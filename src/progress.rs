@@ -1,15 +1,22 @@
 //! Smart progress tracking for batch indexing operations.
 //!
-//! Provides three-phase progress display:
-//! 1. Pre-scan: Count files and estimate chunks
-//! 2. Calibration: Measure embedding speed on first file
-//! 3. Indexing: Progress bar with ETA based on calibration
+//! Provides a compact interactive viewport for TTY runs and a quieter
+//! summary-oriented fallback for non-interactive stderr.
 //!
 //! This module is only available when the `cli` feature is enabled.
 
-use indicatif::{ProgressBar, ProgressStyle};
+use crossterm::cursor::MoveUp;
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType, size};
+use std::collections::VecDeque;
+use std::io::{IsTerminal, Write, stderr};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const VIEWPORT_LINES: usize = 16;
+const ACTIVE_FILE_LINES: usize = 11;
+const RENDER_THROTTLE: Duration = Duration::from_millis(80);
+const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 /// Format bytes into human-readable string
 fn format_bytes(bytes: u64) -> String {
@@ -75,8 +82,17 @@ pub struct IndexProgressTracker {
     /// Number of files successfully indexed
     pub indexed_files: usize,
 
-    // Progress bar
-    progress_bar: Option<ProgressBar>,
+    // Compact TTY viewport state
+    active_files: VecDeque<String>,
+    last_event: Option<String>,
+    mode_label: Option<String>,
+    dedup_enabled: bool,
+    preprocess_enabled: bool,
+    parallel_workers: Option<u8>,
+    interactive: bool,
+    rendered_lines: usize,
+    spinner_frame: usize,
+    last_render: Option<Instant>,
 }
 
 impl IndexProgressTracker {
@@ -112,12 +128,41 @@ impl IndexProgressTracker {
             skipped_files: 0,
             failed_files: 0,
             indexed_files: 0,
-            progress_bar: None,
+            active_files: VecDeque::new(),
+            last_event: None,
+            mode_label: None,
+            dedup_enabled: false,
+            preprocess_enabled: false,
+            parallel_workers: None,
+            interactive: stderr().is_terminal(),
+            rendered_lines: 0,
+            spinner_frame: 0,
+            last_render: None,
         }
     }
 
+    /// Attach run context that should appear in the compact viewport.
+    pub fn set_run_context(
+        &mut self,
+        mode_label: &str,
+        dedup_enabled: bool,
+        preprocess_enabled: bool,
+        parallel_workers: u8,
+    ) {
+        self.mode_label = Some(mode_label.to_string());
+        self.dedup_enabled = dedup_enabled;
+        self.preprocess_enabled = preprocess_enabled;
+        self.parallel_workers = Some(parallel_workers);
+        self.render(true);
+    }
+
     /// Display Phase 1 pre-scan summary to stderr.
-    pub fn display_pre_scan(&self) {
+    pub fn display_pre_scan(&mut self) {
+        if self.interactive {
+            self.render(true);
+            return;
+        }
+
         eprintln!();
         eprintln!("Phase 1: Pre-scan");
         eprintln!("  |-- Files: {}", self.total_files);
@@ -133,6 +178,10 @@ impl IndexProgressTracker {
     /// Call this before processing the first file.
     pub fn start_calibration(&mut self) {
         self.calibration_start = Some(Instant::now());
+        self.render(true);
+        if self.interactive {
+            return;
+        }
         eprintln!();
         eprintln!("Phase 2: Calibration (first file)...");
     }
@@ -154,6 +203,11 @@ impl IndexProgressTracker {
             self.last_speed_update = Some(Instant::now());
             self.chunks_since_update = 0;
 
+            self.render(true);
+            if self.interactive {
+                return;
+            }
+
             eprintln!(
                 "  `-- Speed: {:.1} chunks/sec ({}) [dynamic]",
                 self.chunks_per_sec.unwrap_or(0.0),
@@ -171,19 +225,12 @@ impl IndexProgressTracker {
     ///
     /// Creates a progress bar based on estimated chunks.
     pub fn start_progress_bar(&mut self) {
-        let pb = ProgressBar::new(self.estimated_chunks as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} chunks | ETA: {eta} | {msg}",
-                )
-                .expect("Invalid progress bar template")
-                .progress_chars("#>-"),
-        );
-
+        self.render(true);
+        if self.interactive {
+            return;
+        }
         eprintln!();
         eprintln!("Phase 3: Indexing...");
-        self.progress_bar = Some(pb);
     }
 
     /// Increment the chunk counter and update progress bar.
@@ -214,10 +261,6 @@ impl IndexProgressTracker {
                 self.chunks_since_update = 0;
             }
         }
-
-        if let Some(ref pb) = self.progress_bar {
-            pb.set_position(self.processed_chunks as u64);
-        }
     }
 
     /// Record a successfully indexed file.
@@ -225,35 +268,64 @@ impl IndexProgressTracker {
     /// # Arguments
     /// * `chunks` - Number of chunks created from this file
     pub fn file_indexed(&mut self, chunks: usize) {
-        self.indexed_files += 1;
-        self.processed_files += 1;
-        self.inc_chunks(chunks);
+        self.last_event = Some(format!("Indexed {} chunks", chunks));
+        self.record_indexed(chunks, false);
+    }
+
+    /// Record a successfully indexed file and remove it from the active viewport.
+    pub fn file_indexed_path(&mut self, path: &str, chunks: usize) {
+        self.remove_active_file(path);
+        self.last_event = Some(format!(
+            "Indexed {} ({} chunks)",
+            short_tail(path, 48),
+            chunks
+        ));
+        self.record_indexed(chunks, false);
     }
 
     /// Record a skipped file (duplicate).
     pub fn file_skipped(&mut self) {
-        self.skipped_files += 1;
-        self.processed_files += 1;
+        self.last_event = Some("Skipped duplicate".to_string());
+        self.record_skipped(false);
+    }
+
+    /// Record a skipped file and remove it from the active viewport.
+    pub fn file_skipped_path(&mut self, path: &str, reason: &str) {
+        self.remove_active_file(path);
+        self.last_event = Some(format!(
+            "Skipped {} ({})",
+            short_tail(path, 48),
+            truncate_end(reason, 28)
+        ));
+        self.record_skipped(false);
     }
 
     /// Record a failed file.
     pub fn file_failed(&mut self) {
-        self.failed_files += 1;
-        self.processed_files += 1;
+        self.last_event = Some("Failed".to_string());
+        self.record_failed(true);
     }
 
-    /// Set the current message on the progress bar.
+    /// Record a failed file and remove it from the active viewport.
+    pub fn file_failed_path(&mut self, path: &str, error: &str) {
+        self.remove_active_file(path);
+        self.last_event = Some(format!(
+            "FAILED {} ({})",
+            short_tail(path, 48),
+            truncate_end(error, 28)
+        ));
+        self.record_failed(true);
+    }
+
+    /// Mark a file as actively processing in the compact viewport.
     pub fn set_message(&mut self, msg: &str) {
-        if let Some(ref pb) = self.progress_bar {
-            pb.set_message(msg.to_string());
-        }
+        self.touch_active_file(msg);
+        self.render(false);
     }
 
     /// Finish the progress bar with completion message.
     pub fn finish(&mut self) {
-        if let Some(ref pb) = self.progress_bar {
-            pb.finish_with_message("Complete");
-        }
+        self.render(true);
     }
 
     /// Display final summary after indexing is complete.
@@ -288,12 +360,248 @@ impl IndexProgressTracker {
             let remaining_chunks = (remaining_bytes as f64 / bytes_per_chunk) as usize;
             // Update total estimate
             self.estimated_chunks = actual_chunks + remaining_chunks;
-
-            // Update progress bar length if active
-            if let Some(ref pb) = self.progress_bar {
-                pb.set_length(self.estimated_chunks as u64);
-            }
         }
+    }
+
+    fn touch_active_file(&mut self, path: &str) {
+        if let Some(existing) = self.active_files.iter().position(|current| current == path) {
+            let entry = self
+                .active_files
+                .remove(existing)
+                .expect("active file exists");
+            self.active_files.push_back(entry);
+        } else {
+            self.active_files.push_back(path.to_string());
+        }
+    }
+
+    fn remove_active_file(&mut self, path: &str) {
+        if let Some(existing) = self.active_files.iter().position(|current| current == path) {
+            self.active_files.remove(existing);
+        }
+    }
+
+    fn record_indexed(&mut self, chunks: usize, force_render: bool) {
+        self.indexed_files += 1;
+        self.processed_files += 1;
+        self.inc_chunks(chunks);
+        self.render(force_render);
+    }
+
+    fn record_skipped(&mut self, force_render: bool) {
+        self.skipped_files += 1;
+        self.processed_files += 1;
+        self.render(force_render);
+    }
+
+    fn record_failed(&mut self, force_render: bool) {
+        self.failed_files += 1;
+        self.processed_files += 1;
+        self.render(force_render);
+    }
+
+    fn render(&mut self, force: bool) {
+        if !self.interactive {
+            return;
+        }
+
+        let now = Instant::now();
+        if !force
+            && self
+                .last_render
+                .is_some_and(|last| now.duration_since(last) < RENDER_THROTTLE)
+        {
+            return;
+        }
+
+        self.last_render = Some(now);
+        let width = size().map(|(cols, _)| cols as usize).unwrap_or(100).max(60);
+        let lines = self.render_lines(width);
+        let mut err = stderr();
+
+        if self.rendered_lines > 0 {
+            let _ = execute!(err, MoveUp(self.rendered_lines as u16));
+        }
+
+        for _ in 0..self.rendered_lines {
+            let _ = execute!(err, Clear(ClearType::CurrentLine));
+            let _ = writeln!(err);
+        }
+
+        if self.rendered_lines > 0 {
+            let _ = execute!(err, MoveUp(self.rendered_lines as u16));
+        }
+
+        for line in &lines {
+            let _ = execute!(err, Clear(ClearType::CurrentLine));
+            let _ = writeln!(err, "{line}");
+        }
+
+        let _ = err.flush();
+        self.rendered_lines = lines.len();
+    }
+
+    fn render_lines(&mut self, width: usize) -> Vec<String> {
+        let progress_ratio = if self.total_files == 0 {
+            0.0
+        } else {
+            self.processed_files as f64 / self.total_files as f64
+        };
+        let progress_pct = progress_ratio * 100.0;
+        let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+
+        let bar_width = width.saturating_sub(34).clamp(12, 40);
+        let filled = (progress_ratio * bar_width as f64).round() as usize;
+        let bar = make_progress_bar(bar_width, filled.min(bar_width));
+
+        let phase = if self.processed_files >= self.total_files && self.total_files > 0 {
+            "complete"
+        } else if self.calibration_done {
+            "indexing"
+        } else if self.calibration_start.is_some() {
+            "calibrating"
+        } else {
+            "preparing"
+        };
+
+        let line1 = truncate_end(
+            &format!(
+                "{} [{}] {}/{} files ({:.1}%) {}",
+                spinner, bar, self.processed_files, self.total_files, progress_pct, phase
+            ),
+            width,
+        );
+
+        let line2 = truncate_end(
+            &format!(
+                "Stats: indexed {} | skipped {} | failed {} | active {} | workers {}",
+                self.indexed_files,
+                self.skipped_files,
+                self.failed_files,
+                self.active_files.len(),
+                self.parallel_workers.unwrap_or(0)
+            ),
+            width,
+        );
+
+        let line3 = truncate_end(
+            &format!(
+                "Chunks: {}/~{} | speed {} | ETA {} | mode {} | dedup {}",
+                self.processed_chunks,
+                self.estimated_chunks.max(self.processed_chunks),
+                self.chunks_per_sec
+                    .map(|speed| format!("{speed:.1}/s"))
+                    .unwrap_or_else(|| "calibrating".to_string()),
+                self.eta_label(),
+                self.mode_label.as_deref().unwrap_or("n/a"),
+                if self.dedup_enabled { "on" } else { "off" }
+            ),
+            width,
+        );
+
+        let line4 = truncate_end(
+            &format!(
+                "Model: {}{}{}",
+                self.embedder_model.as_deref().unwrap_or("warming"),
+                if self.preprocess_enabled {
+                    " | preprocess on"
+                } else {
+                    ""
+                },
+                self.last_event
+                    .as_ref()
+                    .map(|event| format!(" | last: {event}"))
+                    .unwrap_or_default()
+            ),
+            width,
+        );
+
+        let visible_active: Vec<String> = self
+            .active_files
+            .iter()
+            .rev()
+            .take(ACTIVE_FILE_LINES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let mut lines = vec![line1, line2, line3, line4, String::new()];
+        for path in visible_active {
+            lines.push(short_tail(&format!("  * {path}"), width));
+        }
+        while lines.len() < VIEWPORT_LINES {
+            lines.push(String::new());
+        }
+        lines.truncate(VIEWPORT_LINES);
+        lines
+    }
+
+    fn eta_label(&self) -> String {
+        let Some(speed) = self.chunks_per_sec else {
+            return "--".to_string();
+        };
+        if speed <= 0.0 {
+            return "--".to_string();
+        }
+        let remaining_chunks = self.estimated_chunks.saturating_sub(self.processed_chunks);
+        let remaining_seconds = (remaining_chunks as f64 / speed).round() as u64;
+        format_duration(remaining_seconds)
+    }
+}
+
+fn make_progress_bar(width: usize, filled: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if filled >= width {
+        return "=".repeat(width);
+    }
+
+    let complete = "=".repeat(filled);
+    let head = ">";
+    let remaining = "-".repeat(width.saturating_sub(filled + 1));
+    format!("{complete}{head}{remaining}")
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let kept: String = value.chars().take(max_chars - 3).collect();
+    format!("{kept}...")
+}
+
+fn short_tail(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(max_chars - 3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
+}
+
+fn format_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60),
     }
 }
 
@@ -392,5 +700,52 @@ mod tests {
         tracker.adjust_estimate(1000, 5);
 
         assert_eq!(tracker.estimated_chunks, 50);
+    }
+
+    #[test]
+    fn test_render_lines_use_fixed_viewport_and_latest_active_files() {
+        let tracker_paths: Vec<PathBuf> = vec![];
+        let mut tracker = IndexProgressTracker::pre_scan(&tracker_paths);
+        tracker.total_files = 42;
+        tracker.mode_label = Some("onion".to_string());
+        tracker.dedup_enabled = true;
+        tracker.parallel_workers = Some(8);
+
+        for index in 0..13 {
+            tracker.set_message(&format!("workspace/project/deep/path/file-{index}.md"));
+        }
+
+        let lines = tracker.render_lines(96);
+
+        assert_eq!(lines.len(), VIEWPORT_LINES);
+        assert!(lines[0].contains("files"));
+        assert!(lines[1].contains("active"));
+        assert_eq!(lines[4], "");
+        assert!(!lines.iter().any(|line| line.contains("file-0.md")));
+        assert!(!lines.iter().any(|line| line.contains("file-1.md")));
+        assert!(lines.iter().any(|line| line.contains("file-2.md")));
+        assert!(lines.iter().any(|line| line.contains("file-12.md")));
+    }
+
+    #[test]
+    fn test_completed_file_leaves_active_viewport_and_records_last_event() {
+        let tracker_paths: Vec<PathBuf> = vec![];
+        let mut tracker = IndexProgressTracker::pre_scan(&tracker_paths);
+        tracker.total_files = 2;
+        tracker.mode_label = Some("flat".to_string());
+        tracker.preprocess_enabled = true;
+        tracker.parallel_workers = Some(2);
+        tracker.set_message("repo/alpha.md");
+        tracker.set_message("repo/beta.md");
+
+        tracker.file_failed_path("repo/alpha.md", "invalid utf-8");
+
+        let lines = tracker.render_lines(100);
+        let active_lines = &lines[5..];
+
+        assert!(!active_lines.iter().any(|line| line.contains("alpha.md")));
+        assert!(active_lines.iter().any(|line| line.contains("beta.md")));
+        assert!(lines[3].contains("FAILED"));
+        assert_eq!(tracker.failed_files, 1);
     }
 }
