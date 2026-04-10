@@ -56,6 +56,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
+use crate::storage::ChromaDocument;
 
 // ============================================================================
 // HTML Dashboard (embedded)
@@ -740,19 +741,10 @@ fn get_dashboard_html() -> String {
 // ============================================================================
 
 /// Namespace info for API
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NamespaceInfo {
     pub name: String,
     pub count: usize,
-}
-
-impl Clone for NamespaceInfo {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            count: self.count,
-        }
-    }
 }
 
 /// Namespaces list response
@@ -772,7 +764,7 @@ pub struct OverviewResponse {
 }
 
 /// Canonical discovery namespace entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryNamespaceInfo {
     pub id: String,
     pub count: usize,
@@ -781,7 +773,7 @@ pub struct DiscoveryNamespaceInfo {
 }
 
 /// Canonical discovery response for dashboards and HTTP clients.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryResponse {
     pub status: String,
     pub hint: String,
@@ -944,6 +936,28 @@ impl From<SearchResult> for SearchResultJson {
             parent_id: r.parent_id,
             children_ids: r.children_ids,
             keywords: r.keywords,
+            can_expand,
+            can_drill_up,
+        }
+    }
+}
+
+impl From<ChromaDocument> for SearchResultJson {
+    fn from(doc: ChromaDocument) -> Self {
+        let can_expand = !doc.children_ids.is_empty();
+        let can_drill_up = doc.parent_id.is_some();
+        let layer = doc.slice_layer().map(|layer| layer.name().to_string());
+
+        Self {
+            id: doc.id,
+            namespace: doc.namespace,
+            text: doc.document,
+            score: 0.0,
+            metadata: doc.metadata,
+            layer,
+            parent_id: doc.parent_id,
+            children_ids: doc.children_ids,
+            keywords: doc.keywords,
             can_expand,
             can_drill_up,
         }
@@ -1208,6 +1222,126 @@ async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
 // Dashboard & Browse API Handlers
 // ============================================================================
 
+#[derive(Debug, Clone)]
+struct DiscoverySnapshot {
+    cache_ready: bool,
+    hint: String,
+    namespaces: Vec<DiscoveryNamespaceInfo>,
+}
+
+async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
+    let cache = state.cached_namespaces.read().await;
+    let activity = state.namespace_activity.read().await;
+    let cache_ready = cache.is_some();
+
+    let namespaces: Vec<DiscoveryNamespaceInfo> = cache
+        .as_ref()
+        .map(|ns_list| {
+            let mut sorted = ns_list.clone();
+            sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+            sorted
+                .iter()
+                .map(|ns| DiscoveryNamespaceInfo {
+                    id: ns.name.clone(),
+                    count: ns.count,
+                    last_indexed_at: activity.get(&ns.name).cloned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    DiscoverySnapshot {
+        cache_ready,
+        hint: discovery_hint(cache_ready).to_string(),
+        namespaces,
+    }
+}
+
+async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
+    let snapshot = build_discovery_snapshot(state).await;
+    let stats = state.rag.storage_manager().stats().await.ok();
+    let total_documents = stats
+        .as_ref()
+        .map(|stats| stats.row_count)
+        .unwrap_or_else(|| snapshot.namespaces.iter().map(|ns| ns.count).sum());
+    let db_path = stats
+        .as_ref()
+        .map(|stats| stats.db_path.clone())
+        .unwrap_or_else(|| state.rag.storage_manager().lance_path().to_string());
+
+    DiscoveryResponse {
+        status: if snapshot.cache_ready {
+            "ok"
+        } else {
+            "loading"
+        }
+        .to_string(),
+        hint: snapshot.hint,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        db_path,
+        embedding_provider: state.rag.mlx_connected_to(),
+        total_documents,
+        namespace_count: snapshot.namespaces.len(),
+        namespaces: snapshot.namespaces,
+    }
+}
+
+fn namespaces_response_from_snapshot(snapshot: &DiscoverySnapshot) -> NamespacesResponse {
+    NamespacesResponse {
+        total: snapshot.namespaces.len(),
+        namespaces: snapshot
+            .namespaces
+            .iter()
+            .map(|ns| NamespaceInfo {
+                name: ns.id.clone(),
+                count: ns.count,
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+fn namespaces_response_from_discovery(discovery: &DiscoveryResponse) -> NamespacesResponse {
+    NamespacesResponse {
+        total: discovery.namespaces.len(),
+        namespaces: discovery
+            .namespaces
+            .iter()
+            .map(|ns| NamespaceInfo {
+                name: ns.id.clone(),
+                count: ns.count,
+            })
+            .collect(),
+    }
+}
+
+fn overview_response_from_discovery(discovery: &DiscoveryResponse) -> OverviewResponse {
+    OverviewResponse {
+        namespace_count: discovery.namespace_count,
+        total_documents: discovery.total_documents,
+        db_path: discovery.db_path.clone(),
+        embedding_provider: discovery.embedding_provider.clone(),
+    }
+}
+
+fn status_response_from_snapshot(snapshot: &DiscoverySnapshot) -> serde_json::Value {
+    json!({
+        "cache_ready": snapshot.cache_ready,
+        "namespace_count": snapshot.namespaces.len(),
+        "hint": snapshot.hint,
+    })
+}
+
+#[cfg(test)]
+fn status_response_from_discovery(discovery: &DiscoveryResponse) -> serde_json::Value {
+    json!({
+        "cache_ready": discovery.status == "ok",
+        "namespace_count": discovery.namespace_count,
+        "hint": discovery.hint,
+    })
+}
+
 /// Dashboard HTML endpoint (GET /)
 async fn dashboard_handler() -> Html<String> {
     debug!("Dashboard: serving HTML");
@@ -1215,77 +1349,24 @@ async fn dashboard_handler() -> Html<String> {
 }
 
 /// List all namespaces with document counts (GET /api/namespaces)
-/// Uses cached namespace list (refreshed in background every 5 minutes)
-/// Falls back to "loading" state if cache not yet populated
 async fn namespaces_handler(State(state): State<HttpState>) -> Json<NamespacesResponse> {
-    // Try to use cached namespaces first (instant response)
-    let cache = state.cached_namespaces.read().await;
-    if let Some(ref namespaces) = *cache {
-        let mut sorted = namespaces.clone();
-        sorted.sort_by(|a, b| b.count.cmp(&a.count));
-        let total = sorted.len();
-        debug!(
-            "API: /api/namespaces - returning {} cached namespaces",
-            total
-        );
-        return Json(NamespacesResponse {
-            namespaces: sorted,
-            total,
-        });
-    }
-    drop(cache);
-
-    // Cache not ready yet - return loading indicator
-    // Dashboard will show "loading" state and auto-refresh
-    info!("API: /api/namespaces - cache not ready, background task loading...");
-    Json(NamespacesResponse {
-        namespaces: vec![],
-        total: 0,
-    })
+    Json(namespaces_response_from_snapshot(
+        &build_discovery_snapshot(&state).await,
+    ))
 }
 
 /// Database overview (GET /api/overview)
-/// Uses efficient stats() which only counts rows without loading data
-async fn overview_handler(
-    State(state): State<HttpState>,
-) -> Result<Json<OverviewResponse>, (StatusCode, String)> {
-    info!("API: /api/overview - fetching stats");
-
-    // Use efficient stats() - only counts rows, doesn't load all data
-    let stats = state.rag.storage_manager().stats().await.map_err(|e| {
-        error!("API: /api/overview - stats error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-
-    info!("API: /api/overview - {} documents", stats.row_count);
-
-    // Note: namespace_count requires scanning, so we report 0 for efficiency
-    // The namespaces endpoint provides the detailed breakdown
-    Ok(Json(OverviewResponse {
-        namespace_count: 0, // Use /api/namespaces for accurate count
-        total_documents: stats.row_count,
-        db_path: stats.db_path,
-        embedding_provider: state.rag.mlx_connected_to(),
-    }))
+async fn overview_handler(State(state): State<HttpState>) -> Json<OverviewResponse> {
+    Json(overview_response_from_discovery(
+        &build_discovery_response(&state).await,
+    ))
 }
 
 /// System status including cache state (GET /api/status)
-/// Returns info about whether namespace cache is ready (for dashboard)
 async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    let cache = state.cached_namespaces.read().await;
-    let cache_ready = cache.is_some();
-    let namespace_count = cache.as_ref().map(|v| v.len()).unwrap_or(0);
-    drop(cache);
-
-    Json(json!({
-        "cache_ready": cache_ready,
-        "namespace_count": namespace_count,
-        "hint": if !cache_ready {
-            "Namespace cache loading... If this persists, run: rmcp-memex optimize"
-        } else {
-            "OK"
-        }
-    }))
+    Json(status_response_from_snapshot(
+        &build_discovery_snapshot(&state).await,
+    ))
 }
 
 /// Browse documents in namespace (GET /api/browse/:ns)
@@ -1315,30 +1396,11 @@ async fn browse_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Apply offset and convert to SearchResultJson
-    // ChromaDocument fields: id, namespace, embedding, metadata, document, layer (u8), parent_id, children_ids, keywords
     let documents: Vec<SearchResultJson> = all_docs
         .into_iter()
         .skip(params.offset)
         .take(params.limit)
-        .map(|doc| {
-            let can_expand = !doc.children_ids.is_empty();
-            let can_drill_up = doc.parent_id.is_some();
-            let layer = SliceLayer::from_u8(doc.layer);
-            SearchResultJson {
-                id: doc.id,
-                namespace: doc.namespace,
-                text: doc.document, // ChromaDocument uses 'document' not 'text'
-                score: 0.0,         // No score for browse (not a search result)
-                metadata: doc.metadata,
-                layer: layer.map(|l| l.name().to_string()),
-                parent_id: doc.parent_id,
-                children_ids: doc.children_ids,
-                keywords: doc.keywords,
-                can_expand,
-                can_drill_up,
-            }
-        })
+        .map(Into::into)
         .collect();
 
     let count = documents.len();
@@ -1374,24 +1436,7 @@ async fn browse_all_handler(
         .into_iter()
         .skip(params.offset)
         .take(params.limit)
-        .map(|doc| {
-            let can_expand = !doc.children_ids.is_empty();
-            let can_drill_up = doc.parent_id.is_some();
-            let layer = SliceLayer::from_u8(doc.layer);
-            SearchResultJson {
-                id: doc.id,
-                namespace: doc.namespace,
-                text: doc.document,
-                score: 0.0,
-                metadata: doc.metadata,
-                layer: layer.map(|l| l.name().to_string()),
-                parent_id: doc.parent_id,
-                children_ids: doc.children_ids,
-                keywords: doc.keywords,
-                can_expand,
-                can_drill_up,
-            }
-        })
+        .map(Into::into)
         .collect();
 
     let count = documents.len();
@@ -1734,47 +1779,7 @@ fn discovery_hint(cache_ready: bool) -> &'static str {
 }
 
 async fn discovery_handler(State(state): State<HttpState>) -> Json<DiscoveryResponse> {
-    let cache = state.cached_namespaces.read().await;
-    let activity = state.namespace_activity.read().await;
-    let cache_ready = cache.is_some();
-
-    let namespaces: Vec<DiscoveryNamespaceInfo> = cache
-        .as_ref()
-        .map(|ns_list| {
-            let mut sorted = ns_list.clone();
-            sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-
-            sorted
-                .iter()
-                .map(|ns| DiscoveryNamespaceInfo {
-                    id: ns.name.clone(),
-                    count: ns.count,
-                    last_indexed_at: activity.get(&ns.name).cloned(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let stats = state.rag.storage_manager().stats().await.ok();
-    let total_documents = stats
-        .as_ref()
-        .map(|stats| stats.row_count)
-        .unwrap_or_else(|| namespaces.iter().map(|ns| ns.count).sum());
-    let db_path = stats
-        .as_ref()
-        .map(|stats| stats.db_path.clone())
-        .unwrap_or_else(|| state.rag.storage_manager().lance_path().to_string());
-
-    Json(DiscoveryResponse {
-        status: if cache_ready { "ok" } else { "loading" }.to_string(),
-        hint: discovery_hint(cache_ready).to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        db_path,
-        embedding_provider: state.rag.mlx_connected_to(),
-        total_documents,
-        namespace_count: namespaces.len(),
-        namespaces,
-    })
+    Json(build_discovery_response(&state).await)
 }
 
 /// SSE streaming namespace listing with per-namespace summary
@@ -2200,6 +2205,9 @@ async fn mcp_sse_handler(
         session_id, base_url
     );
 
+    let sessions_for_cleanup = state.mcp_sessions.clone();
+    let session_id_for_cleanup = session_id.clone();
+
     let stream = async_stream::stream! {
         // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)
         let endpoint_url = format!("{}/messages/?session_id={}", base_url, session_id);
@@ -2235,6 +2243,10 @@ async fn mcp_sse_handler(
                 }
             }
         }
+
+        // Clean up session when SSE stream drops (client disconnect)
+        debug!("MCP SSE: Removing session {} on stream drop", session_id_for_cleanup);
+        sessions_for_cleanup.remove_session(&session_id_for_cleanup).await;
     };
 
     Sse::new(stream).keep_alive(
@@ -2398,6 +2410,17 @@ pub async fn start_server(
         }
     });
 
+    // Spawn background task to reap stale MCP sessions every 5 minutes
+    let bg_sessions = state.mcp_sessions.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            bg_sessions.cleanup_old_sessions().await;
+        }
+    });
+
     let app = create_router(state, &server_config);
 
     let addr = format!("{}:{}", server_config.bind_address, port);
@@ -2433,7 +2456,6 @@ mod tests {
         let req: IndexRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.slice_mode, "flat");
     }
-}
 
     #[test]
     fn test_discovery_hint_matches_cache_state() {
@@ -2449,3 +2471,70 @@ mod tests {
         assert!(!html.contains("/api/overview"));
         assert!(!html.contains("/api/namespaces"));
     }
+
+    #[test]
+    fn test_compatibility_slices_project_single_discovery_truth() {
+        let discovery = DiscoveryResponse {
+            status: "ok".to_string(),
+            hint: "OK".to_string(),
+            version: "0.4.1".to_string(),
+            db_path: "/tmp/memex".to_string(),
+            embedding_provider: "ollama-local".to_string(),
+            total_documents: 42,
+            namespace_count: 2,
+            namespaces: vec![
+                DiscoveryNamespaceInfo {
+                    id: "alpha".to_string(),
+                    count: 30,
+                    last_indexed_at: Some("2026-04-10T17:00:00Z".to_string()),
+                },
+                DiscoveryNamespaceInfo {
+                    id: "beta".to_string(),
+                    count: 12,
+                    last_indexed_at: None,
+                },
+            ],
+        };
+
+        let namespaces = namespaces_response_from_discovery(&discovery);
+        let overview = overview_response_from_discovery(&discovery);
+        let status = status_response_from_discovery(&discovery);
+
+        assert_eq!(namespaces.total, 2);
+        assert_eq!(namespaces.namespaces[0].name, "alpha");
+        assert_eq!(namespaces.namespaces[1].count, 12);
+
+        assert_eq!(overview.namespace_count, 2);
+        assert_eq!(overview.total_documents, 42);
+        assert_eq!(overview.db_path, "/tmp/memex");
+
+        assert_eq!(status["cache_ready"], true);
+        assert_eq!(status["namespace_count"], 2);
+        assert_eq!(status["hint"], "OK");
+    }
+
+    #[test]
+    fn test_chroma_document_maps_to_browse_json() {
+        let doc = ChromaDocument {
+            id: "outer-1".to_string(),
+            namespace: "memories".to_string(),
+            embedding: vec![],
+            metadata: json!({"kind": "note"}),
+            document: "hello".to_string(),
+            layer: SliceLayer::Outer.as_u8(),
+            parent_id: Some("root-1".to_string()),
+            children_ids: vec!["child-1".to_string()],
+            keywords: vec!["hello".to_string()],
+            content_hash: None,
+        };
+
+        let json_doc: SearchResultJson = doc.into();
+
+        assert_eq!(json_doc.id, "outer-1");
+        assert_eq!(json_doc.namespace, "memories");
+        assert_eq!(json_doc.text, "hello");
+        assert_eq!(json_doc.layer.as_deref(), Some(SliceLayer::Outer.name()));
+        assert!(json_doc.can_expand);
+        assert!(json_doc.can_drill_up);
+    }
+}
