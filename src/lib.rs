@@ -82,10 +82,10 @@ pub use storage::{
 // High-level engine API
 pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
 
-// Agent tools API (MCP-compatible)
+// Canonical MCP metadata plus local Rust helper API.
 pub use tools::{
-    ToolDefinition, ToolResult, memory_delete, memory_delete_by_filter, memory_get, memory_search,
-    memory_store, memory_store_batch, tool_definitions,
+    ToolDefinition, ToolResult, delete_document, delete_documents_by_filter, get_document,
+    search_documents, store_document, store_documents_batch, tool_definitions,
 };
 
 // CLI-only re-exports (require indicatif, ratatui, crossterm)

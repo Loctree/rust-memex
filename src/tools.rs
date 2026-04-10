@@ -9,15 +9,15 @@
 //!
 //! ```rust,ignore
 //! use rmcp_memex::{MemexEngine, MemexConfig};
-//! use rmcp_memex::tools::{memory_store, memory_search, tool_definitions, ToolResult};
+//! use rmcp_memex::tools::{store_document, search_documents, tool_definitions, ToolResult};
 //! use serde_json::json;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let engine = MemexEngine::for_app("my-app", "documents").await?;
 //!
-//!     // Store a document using the tool API
-//!     let result = memory_store(
+//!     // Store a document using the local helper API
+//!     let result = store_document(
 //!         &engine,
 //!         "doc-1".to_string(),
 //!         "Important patient notes about feline diabetes".to_string(),
@@ -26,7 +26,7 @@
 //!     assert!(result.success);
 //!
 //!     // Search for documents
-//!     let results = memory_search(&engine, "diabetes".to_string(), 5, None).await?;
+//!     let results = search_documents(&engine, "diabetes".to_string(), 5, None).await?;
 //!     println!("Found {} documents", results.len());
 //!
 //!     // Get the canonical MCP tool definitions exposed by rmcp-memex
@@ -109,14 +109,14 @@ impl ToolResult {
 /// # Example
 ///
 /// ```rust,ignore
-/// let result = memory_store(
+/// let result = store_document(
 ///     &engine,
 ///     "visit-123".to_string(),
 ///     "Patient presented with lethargy...".to_string(),
 ///     json!({"patient_id": "P-456", "visit_type": "checkup"}),
 /// ).await?;
 /// ```
-pub async fn memory_store(
+pub async fn store_document(
     engine: &MemexEngine,
     id: String,
     text: String,
@@ -149,13 +149,13 @@ pub async fn memory_store(
 ///
 /// ```rust,ignore
 /// // Simple search
-/// let results = memory_search(&engine, "diabetes symptoms".to_string(), 10, None).await?;
+/// let results = search_documents(&engine, "diabetes symptoms".to_string(), 10, None).await?;
 ///
 /// // Filtered search
 /// let filter = MetaFilter::for_patient("P-456");
-/// let results = memory_search(&engine, "diabetes".to_string(), 10, Some(filter)).await?;
+/// let results = search_documents(&engine, "diabetes".to_string(), 10, Some(filter)).await?;
 /// ```
-pub async fn memory_search(
+pub async fn search_documents(
     engine: &MemexEngine,
     query: String,
     limit: usize,
@@ -179,11 +179,11 @@ pub async fn memory_search(
 /// # Example
 ///
 /// ```rust,ignore
-/// if let Some(doc) = memory_get(&engine, "visit-123".to_string()).await? {
+/// if let Some(doc) = get_document(&engine, "visit-123".to_string()).await? {
 ///     println!("Found: {}", doc.text);
 /// }
 /// ```
-pub async fn memory_get(engine: &MemexEngine, id: String) -> Result<Option<SearchResult>> {
+pub async fn get_document(engine: &MemexEngine, id: String) -> Result<Option<SearchResult>> {
     engine.get(&id).await
 }
 
@@ -199,12 +199,12 @@ pub async fn memory_get(engine: &MemexEngine, id: String) -> Result<Option<Searc
 /// # Example
 ///
 /// ```rust,ignore
-/// let result = memory_delete(&engine, "visit-123".to_string()).await?;
+/// let result = delete_document(&engine, "visit-123".to_string()).await?;
 /// if result.success {
 ///     println!("Document deleted");
 /// }
 /// ```
-pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResult> {
+pub async fn delete_document(engine: &MemexEngine, id: String) -> Result<ToolResult> {
     match engine.delete(&id).await {
         Ok(true) => Ok(ToolResult::ok(format!(
             "Document '{}' deleted successfully",
@@ -223,7 +223,7 @@ pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResul
 
 /// Batch store multiple documents efficiently.
 ///
-/// More efficient than calling `memory_store()` multiple times as embeddings
+/// More efficient than calling `store_document()` multiple times as embeddings
 /// are generated in batches.
 ///
 /// # Arguments
@@ -240,10 +240,10 @@ pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResul
 ///     StoreItem::new("doc-1", "First document").with_metadata(json!({"type": "note"})),
 ///     StoreItem::new("doc-2", "Second document").with_metadata(json!({"type": "note"})),
 /// ];
-/// let result = memory_store_batch(&engine, items).await?;
+/// let result = store_documents_batch(&engine, items).await?;
 /// println!("Stored {} documents", result.success_count);
 /// ```
-pub async fn memory_store_batch(
+pub async fn store_documents_batch(
     engine: &MemexEngine,
     items: Vec<StoreItem>,
 ) -> Result<BatchResult> {
@@ -266,12 +266,12 @@ pub async fn memory_store_batch(
 /// ```rust,ignore
 /// // GDPR request - delete all patient data
 /// let filter = MetaFilter::for_patient("P-456");
-/// let result = memory_delete_by_filter(&engine, filter).await?;
+/// let result = delete_documents_by_filter(&engine, filter).await?;
 /// if let Some(data) = result.data {
 ///     println!("Deleted {} documents", data["deleted_count"]);
 /// }
 /// ```
-pub async fn memory_delete_by_filter(
+pub async fn delete_documents_by_filter(
     engine: &MemexEngine,
     filter: MetaFilter,
 ) -> Result<ToolResult> {
