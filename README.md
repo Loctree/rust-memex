@@ -213,9 +213,11 @@ let results = engine.search_with_mode("semantic concept", 10, SearchMode::Vector
 let results = engine.search_with_mode("best of both", 10, SearchMode::Hybrid).await?;
 ```
 
-### Agent Tools API
+### MCP Contract and In-Process Helpers
 
-For MCP-compatible AI agents:
+Use `tool_definitions()` when you need the exact MCP tool metadata exposed by
+the stdio and HTTP/SSE transports. The helper functions below are for in-process
+Rust callers; they are a convenience subset, not a second public MCP contract.
 
 ```rust
 use rmcp_memex::{MemexEngine, tool_definitions, memory_store, memory_search};
@@ -223,13 +225,11 @@ use serde_json::json;
 
 let engine = MemexEngine::for_app("agent", "memory").await?;
 
-// Get tool definitions for MCP registration
+// Canonical MCP tool surface exposed by rmcp-memex transports
 let tools = tool_definitions();
-for tool in &tools {
-    println!("Tool: {} - {}", tool.name, tool.description);
-}
+assert!(tools.iter().any(|tool| tool.name == "memory_upsert"));
 
-// Use tool functions
+// Local Rust helpers for in-process callers
 let result = memory_store(
     &engine,
     "mem-1".to_string(),
