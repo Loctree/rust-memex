@@ -154,7 +154,7 @@ pub struct BatchIndexConfig {
     pub slice_mode: SliceMode,
     pub dedup: bool,
     pub embedding_config: EmbeddingConfig,
-    /// Show smart progress bar with calibration-based ETA
+    /// Show progress bar with calibration-based ETA
     pub show_progress: bool,
     /// Resume from checkpoint if interrupted
     pub resume: bool,
@@ -215,15 +215,13 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         SliceMode::Flat => "flat (traditional chunks)",
     };
 
-    // Use compact progress viewport automatically on interactive terminals.
-    let use_compact_progress = std::io::stderr().is_terminal();
-    if show_progress && !use_compact_progress {
+    let use_progress_bar = show_progress && std::io::stderr().is_terminal();
+    if show_progress && !use_progress_bar {
         eprintln!("Warning: --progress requires an interactive terminal (using line logs)");
     }
 
-    let tracker = if use_compact_progress {
-        let mut t = IndexProgressTracker::pre_scan(&files);
-        t.set_run_context(mode_name, dedup, preprocess, parallel);
+    let tracker = if use_progress_bar {
+        let t = IndexProgressTracker::pre_scan(&files);
         t.display_pre_scan();
         Some(t)
     } else {
@@ -474,9 +472,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     total_chunks_count.fetch_add(chunks_indexed, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        t.lock()
-                            .await
-                            .file_indexed_path(&display_path, chunks_indexed);
+                        t.lock().await.file_indexed(chunks_indexed);
                     } else {
                         eprintln!("  -> {} done ({} chunks)", display_path, chunks_indexed);
                     }
@@ -503,7 +499,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     skipped_count.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        t.lock().await.file_skipped_path(&display_path, &reason);
+                        t.lock().await.file_skipped();
                     } else {
                         eprintln!("  -> {} SKIPPED ({})", display_path, reason);
                     }
@@ -530,8 +526,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     failed_count.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        let error_text = e.to_string();
-                        t.lock().await.file_failed_path(&display_path, &error_text);
+                        t.lock().await.file_failed();
                     } else {
                         eprintln!("  -> {} FAILED: {}", display_path, e);
                     }

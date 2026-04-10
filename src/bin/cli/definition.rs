@@ -72,6 +72,8 @@ fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, O
 use crate::cli::config::*;
 #[derive(Parser, Debug)]
 #[command(
+    name = "rmcp-memex",
+    bin_name = "rmcp-memex",
     author,
     version,
     about = "rmcp-memex: Custom Rust MCP kernel for RAG and long-term memory.\nPrimary entrypoint. Supports stdio (native MCP) & SSE/HTTP (multi-agent) transports.\n(Aliases: rust-memex, rmmx, rmemex)",
@@ -260,7 +262,7 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
-        /// Prefer compact progress output when an interactive terminal is detected.
+        /// Show progress bar with ETA when running in an interactive terminal.
         /// Non-interactive runs fall back to line logs.
         #[arg(long)]
         progress: bool,
