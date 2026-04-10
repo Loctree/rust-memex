@@ -409,11 +409,6 @@ impl StorageManager {
         Ok(deleted.version as usize)
     }
 
-    #[deprecated(note = "use delete_namespace_documents")]
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.delete_namespace_documents(namespace).await
-    }
-
     pub fn get_collection_name(&self) -> &str {
         &self.collection_name
     }
