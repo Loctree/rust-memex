@@ -245,7 +245,6 @@ pub struct MemexCfg {
     pub cache_mb: usize,
     pub log_level: String,
     pub max_request_bytes: usize,
-    pub mode: String,
     /// Current machine hostname (auto-detected)
     pub hostname: String,
     /// Database path mode (shared vs per-host)
@@ -263,7 +262,6 @@ impl Default for MemexCfg {
             cache_mb: 4096,
             log_level: "info".to_string(),
             max_request_bytes: 10 * 1024 * 1024, // 10MB
-            mode: "full".to_string(),
             hostname,
             db_path_mode: DbPathMode::Shared,
             http_port: None,
@@ -536,7 +534,7 @@ impl App {
     }
 
     fn settings_field_count(&self) -> usize {
-        7 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes, mode
+        6 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes
     }
 
     pub fn get_field_value(&self, field: usize) -> String {
@@ -553,7 +551,6 @@ impl App {
             3 => self.memex_cfg.cache_mb.to_string(),
             4 => self.memex_cfg.log_level.clone(),
             5 => self.memex_cfg.max_request_bytes.to_string(),
-            6 => self.memex_cfg.mode.clone(),
             _ => String::new(),
         }
     }
@@ -587,7 +584,6 @@ impl App {
                     self.memex_cfg.max_request_bytes = v;
                 }
             }
-            6 => self.memex_cfg.mode = value,
             _ => {}
         }
     }

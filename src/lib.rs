@@ -99,7 +99,8 @@ pub use tui::{
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Enabled features (namespaced strings). Currently informational/reserved.
+    /// Legacy informational labels preserved for compatibility.
+    /// They do not restrict the runtime MCP surface.
     pub features: Vec<String>,
 
     /// Cache size in MB for moka in-memory cache
@@ -150,8 +151,10 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Create a memory-only configuration (no filesystem access).
-    /// Suitable for pure vector memory server use cases.
+    #[deprecated(
+        note = "legacy informational label only; it does not restrict the MCP surface. Use allowed_paths, HTTP auth, or namespace security instead."
+    )]
+    /// Create a legacy memory/search feature label set.
     pub fn for_memory_only() -> Self {
         Self {
             features: vec!["memory".to_string(), "search".to_string()],
@@ -159,7 +162,10 @@ impl ServerConfig {
         }
     }
 
-    /// Create a full RAG configuration with all features enabled.
+    #[deprecated(
+        note = "legacy informational label only; ServerConfig::default() already represents the canonical runtime surface."
+    )]
+    /// Create the canonical default runtime configuration.
     pub fn for_full_rag() -> Self {
         Self::default()
     }
@@ -175,6 +181,9 @@ impl ServerConfig {
         self.with_storage_path(db_path)
     }
 
+    #[deprecated(
+        note = "legacy informational label only; it does not change the runtime MCP surface."
+    )]
     pub fn with_features(mut self, features: Vec<String>) -> Self {
         self.features = features;
         self

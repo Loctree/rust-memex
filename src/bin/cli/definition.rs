@@ -6,15 +6,6 @@ use walkdir::WalkDir;
 
 use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -87,12 +78,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Server mode: "memory" (memory-only, no filesystem) or "full" (all features)
-    #[arg(long, value_parser = ["memory", "full"], global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, value_parser = ["memory", "full"], global = true, hide = true)]
     pub mode: Option<String>,
 
-    /// Enable specific features (comma-separated). Overrides --mode if set.
-    #[arg(long, global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, global = true, hide = true)]
     pub features: Option<String>,
 
     /// Cache size in MB
@@ -830,57 +821,51 @@ impl Cli {
             eprintln!("Using config: {}", path);
         }
 
+        let legacy_mode = self.mode.clone().or_else(|| file_cfg.mode.clone());
+        let legacy_features = self.features.clone().or_else(|| file_cfg.features.clone());
+        if legacy_mode.is_some() || legacy_features.is_some() {
+            eprintln!(
+                "Warning: legacy mode/features settings are ignored. rmcp-memex now exposes one canonical MCP surface; constrain access with --allowed-paths, HTTP auth, or namespace security instead."
+            );
+        }
+
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.resolve_embedding_config();
-
-        // Determine base config from mode (CLI > file > default)
-        let mode = self.mode.as_deref().or(file_cfg.mode.as_deref());
-        let base_cfg = match mode {
-            Some("memory") => ServerConfig::for_memory_only(),
-            Some("full") => ServerConfig::for_full_rag(),
-            _ => ServerConfig::default(),
-        };
-
-        // CLI --features overrides mode-derived features
-        let features = self
-            .features
-            .or(file_cfg.features)
-            .map(|s| parse_features(&s))
-            .unwrap_or(base_cfg.features);
+        let default_cfg = ServerConfig::default();
 
         // Build security config from CLI and file settings
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
         Ok(ServerConfig {
-            features,
+            features: default_cfg.features.clone(),
             cache_mb: self
                 .cache_mb
                 .or(file_cfg.cache_mb)
-                .unwrap_or(base_cfg.cache_mb),
+                .unwrap_or(default_cfg.cache_mb),
             db_path: self
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or(base_cfg.db_path),
+                .unwrap_or(default_cfg.db_path),
             max_request_bytes: self
                 .max_request_bytes
                 .or(file_cfg.max_request_bytes)
-                .unwrap_or(base_cfg.max_request_bytes),
+                .unwrap_or(default_cfg.max_request_bytes),
             log_level: self
                 .log_level
                 .or(file_cfg.log_level)
                 .map(|s| parse_log_level(&s))
-                .unwrap_or(base_cfg.log_level),
+                .unwrap_or(default_cfg.log_level),
             allowed_paths: self
                 .allowed_paths
                 .or(file_cfg.allowed_paths)
-                .unwrap_or(base_cfg.allowed_paths),
+                .unwrap_or(default_cfg.allowed_paths),
             security: NamespaceSecurityConfig {
                 enabled: security_enabled,
                 token_store_path,
             },
             embeddings,
-            hybrid: base_cfg.hybrid,
+            hybrid: default_cfg.hybrid,
         })
     }
 }
@@ -951,4 +936,39 @@ pub fn collect_files(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_mode_and_features_flags_parse_but_do_not_change_server_shape() {
+        let tmp = tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "mode = \"memory\"\nfeatures = \"memory,search\"\n",
+        )
+        .unwrap();
+
+        let cli = Cli::parse_from([
+            "rmcp-memex",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--mode",
+            "full",
+            "--features",
+            "filesystem,memory,search",
+            "serve",
+        ]);
+        let config = cli.into_server_config().unwrap();
+        let defaults = ServerConfig::default();
+
+        assert_eq!(config.db_path, defaults.db_path);
+        assert_eq!(config.cache_mb, defaults.cache_mb);
+        assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
+        assert_eq!(config.allowed_paths, defaults.allowed_paths);
+    }
 }

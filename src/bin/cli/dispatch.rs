@@ -523,7 +523,6 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)?;
             info!("Starting RMCP Memex");
-            info!("Features (informational): {:?}", config.features);
             info!("Cache: {}MB", config.cache_mb);
             info!("DB Path: {}", config.db_path);
             let server = create_server(config).await?;

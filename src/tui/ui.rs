@@ -180,7 +180,6 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             &app.memex_cfg.max_request_bytes.to_string(),
             "JSON-RPC size limit",
         ),
-        ("Mode", &app.memex_cfg.mode, "full or memory"),
     ];
 
     let items: Vec<ListItem> = fields
@@ -672,7 +671,6 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("  Database: {}", app.memex_cfg.db_path)),
         Line::from(format!("  Cache: {} MB", app.memex_cfg.cache_mb)),
         Line::from(format!("  Log Level: {}", app.memex_cfg.log_level)),
-        Line::from(format!("  Mode: {}", app.memex_cfg.mode)),
         Line::from(""),
         Line::from(Span::styled("Selected Hosts:", Style::default().bold())),
     ];

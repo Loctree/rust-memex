@@ -502,11 +502,8 @@ cargo install --path .
 ### Running
 
 ```bash
-# Default mode (all features)
+# Canonical MCP surface
 rmcp-memex serve
-
-# Memory-only mode (no filesystem access)
-rmcp-memex serve --mode memory
 
 # With security enabled
 rmcp-memex serve --security-enabled
@@ -517,6 +514,10 @@ rmcp-memex serve --http-port 6660
 # HTTP-only daemon mode (no MCP stdio)
 rmcp-memex serve --http-port 6660 --http-only
 ```
+
+`rmcp-memex` always exposes one canonical MCP tool surface. To narrow runtime
+access, use `--allowed-paths`, HTTP auth, or namespace security rather than a
+separate "memory/full" mode switch.
 
 ## HTTP/SSE Server (Multi-Agent Access)
 
@@ -625,9 +626,8 @@ The TUI wizard auto-detects hostname and offers:
 ### Configuration (TOML)
 
 ```toml
-# ~/.rmcp-servers/config/rmcp-memex.toml
+# ~/.rmcp-servers/rmcp-memex/config.toml
 
-mode = "full"
 db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
 cache_mb = 4096
 log_level = "info"
