@@ -94,7 +94,8 @@
           <p>
             Use stdio for local MCP hosts or switch to HTTP/SSE when several agents
             need one shared memory backend. The daemon mode removes the lock-contention
-            pain of direct LanceDB access.
+            pain of direct LanceDB access, and HTTP clients can bootstrap from one
+            canonical <code>/api/discovery</code> surface.
           </p>
         </article>
         <article class="card">
@@ -134,7 +135,7 @@ rmcp-memex serve --http-port 6660 --http-only</code></pre>
         <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/HTTP_API.md">
           <span class="doc-kicker">HTTP/SSE</span>
           <h3>Daemon reference</h3>
-          <p>Endpoints, event shapes, and multi-agent transport behavior.</p>
+          <p>Start with <code>/api/discovery</code>, then drill into browse, search, and write routes.</p>
         </a>
         <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/RELEASE.md">
           <span class="doc-kicker">Release ops</span>

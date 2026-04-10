@@ -440,11 +440,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <script>
         const API = window.location.origin;
         let currentNamespace = null;
+        let latestDiscovery = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
-            await loadOverview();
-            await loadNamespaces();
+            await refreshDiscovery();
             await browse(null);
 
             // Enter key to search
@@ -467,74 +467,94 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             }
         }
 
-        async function loadOverview() {
-            try {
-                document.getElementById('stats-bar').innerHTML = '<span>Loading stats...</span>';
-                const res = await fetchWithTimeout(`${API}/api/overview`, {}, 120000);
-                const data = await res.json();
-                document.getElementById('stats-bar').innerHTML = `
-                    <span>Namespaces: <strong>${data.namespace_count || '?'}</strong></span>
-                    <span>Documents: <strong>${data.total_documents.toLocaleString()}</strong></span>
-                    <span>DB: <strong>${data.db_path}</strong></span>
-                `;
-            } catch (e) {
-                document.getElementById('stats-bar').innerHTML = '<span style="color:var(--warning)">Stats slow - run "make optimize"</span>';
+        async function fetchDiscovery() {
+            const res = await fetchWithTimeout(`${API}/api/discovery`, {}, 30000);
+            if (!res.ok) {
+                throw new Error(`Discovery failed with ${res.status}`);
             }
+            return res.json();
         }
 
-        async function loadNamespaces() {
+        function renderStats(data) {
+            const namespaceCount = typeof data.namespace_count === 'number'
+                ? data.namespace_count
+                : Array.isArray(data.namespaces) ? data.namespaces.length : 0;
+            const namespaceValue = data.status === 'ok'
+                ? namespaceCount.toLocaleString()
+                : 'loading';
+            const totalDocuments = typeof data.total_documents === 'number'
+                ? data.total_documents.toLocaleString()
+                : '0';
+            const statusBadge = data.status === 'ok'
+                ? ''
+                : ` <span style="color:var(--warning)">(${data.hint || 'cache loading'})</span>`;
+
+            document.getElementById('stats-bar').innerHTML = `
+                <span>Status: <strong>${data.status}</strong>${statusBadge}</span>
+                <span>Namespaces: <strong>${namespaceValue}</strong></span>
+                <span>Documents: <strong>${totalDocuments}</strong></span>
+                <span>DB: <strong>${data.db_path}</strong></span>
+            `;
+        }
+
+        function renderNamespaces(data) {
+            const list = document.getElementById('namespace-list');
+            const select = document.getElementById('namespace-select');
+            const namespaces = Array.isArray(data.namespaces) ? data.namespaces : [];
+
+            select.innerHTML = '<option value="">All namespaces</option>' +
+                namespaces.map(ns => `<option value="${ns.id}">${ns.id} (${ns.count})</option>`).join('');
+            select.value = currentNamespace || '';
+
+            if (data.status !== 'ok') {
+                list.innerHTML = `
+                    <li class="empty-state" style="text-align:left;padding:16px;">
+                        <h3 style="color:var(--warning)">Loading namespaces...</h3>
+                        <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">
+                            ${data.hint || 'Namespace cache is still warming up.'}
+                        </p>
+                    </li>`;
+                return;
+            }
+
+            if (namespaces.length === 0) {
+                list.innerHTML = '<li class="empty-state"><h3>No namespaces</h3></li>';
+                return;
+            }
+
+            list.innerHTML = namespaces.map(ns => `
+                <li class="namespace-item${currentNamespace === ns.id ? ' active' : ''}"
+                    onclick="selectNamespace('${ns.id}')">
+                    <span class="name">${ns.id}</span>
+                    <span class="count">${ns.count.toLocaleString()}</span>
+                </li>
+            `).join('');
+        }
+
+        async function refreshDiscovery() {
             try {
-                // First check cache status
-                const statusRes = await fetchWithTimeout(`${API}/api/status`, {}, 5000);
-                const status = await statusRes.json();
+                document.getElementById('stats-bar').innerHTML = '<span>Loading discovery...</span>';
+                latestDiscovery = await fetchDiscovery();
+                renderStats(latestDiscovery);
+                renderNamespaces(latestDiscovery);
 
-                const list = document.getElementById('namespace-list');
-                const select = document.getElementById('namespace-select');
-
-                if (!status.cache_ready) {
-                    // Cache not ready - show loading with hint
-                    list.innerHTML = `
-                        <li class="empty-state" style="text-align:left;padding:16px;">
-                            <h3 style="color:var(--warning)">⏳ Loading namespaces...</h3>
-                            <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">
-                                Background task is scanning the database.<br>
-                                If this persists, run: <code style="color:var(--accent)">rmcp-memex optimize</code>
-                            </p>
-                        </li>`;
-                    // Auto-retry in 5 seconds
-                    setTimeout(() => loadNamespaces(), 5000);
-                    return;
+                if (latestDiscovery.status !== 'ok') {
+                    setTimeout(() => refreshDiscovery(), 5000);
                 }
-
-                const res = await fetchWithTimeout(`${API}/api/namespaces`, {}, 30000);
-                const data = await res.json();
-
-                if (data.namespaces.length === 0) {
-                    list.innerHTML = '<li class="empty-state"><h3>No namespaces</h3></li>';
-                    return;
-                }
-
-                list.innerHTML = data.namespaces.map(ns => `
-                    <li class="namespace-item${currentNamespace === ns.name ? ' active' : ''}"
-                        onclick="selectNamespace('${ns.name}')">
-                        <span class="name">${ns.name}</span>
-                        <span class="count">${ns.count.toLocaleString()}</span>
-                    </li>
-                `).join('');
-
-                select.innerHTML = '<option value="">All namespaces</option>' +
-                    data.namespaces.map(ns => `<option value="${ns.name}">${ns.name} (${ns.count})</option>`).join('');
-
             } catch (e) {
+                document.getElementById('stats-bar').innerHTML =
+                    '<span style="color:var(--warning)">Discovery unavailable - check /api/discovery</span>';
                 document.getElementById('namespace-list').innerHTML =
-                    '<li style="color:var(--error)">Failed to load namespaces</li>';
+                    '<li style="color:var(--error)">Failed to load discovery</li>';
             }
         }
 
         async function selectNamespace(ns) {
             currentNamespace = ns;
             document.getElementById('namespace-select').value = ns || '';
-            await loadNamespaces();
+            if (latestDiscovery) {
+                renderNamespaces(latestDiscovery);
+            }
             await browse(ns);
         }
 
@@ -749,6 +769,28 @@ pub struct OverviewResponse {
     pub total_documents: usize,
     pub db_path: String,
     pub embedding_provider: String,
+}
+
+/// Canonical discovery namespace entry.
+#[derive(Debug, Serialize)]
+pub struct DiscoveryNamespaceInfo {
+    pub id: String,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_indexed_at: Option<String>,
+}
+
+/// Canonical discovery response for dashboards and HTTP clients.
+#[derive(Debug, Serialize)]
+pub struct DiscoveryResponse {
+    pub status: String,
+    pub hint: String,
+    pub version: String,
+    pub db_path: String,
+    pub embedding_provider: String,
+    pub total_documents: usize,
+    pub namespace_count: usize,
+    pub namespaces: Vec<DiscoveryNamespaceInfo>,
 }
 
 /// Browse query params
@@ -1683,39 +1725,56 @@ async fn sse_cross_search_handler(
 ///
 /// Returns status, db info, and all namespaces with counts and last activity.
 /// Replaces fragmented /api/namespaces + /api/overview + /api/status trio.
-async fn discovery_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
+fn discovery_hint(cache_ready: bool) -> &'static str {
+    if cache_ready {
+        "OK"
+    } else {
+        "Namespace cache loading... If this persists, run: rmcp-memex optimize"
+    }
+}
+
+async fn discovery_handler(State(state): State<HttpState>) -> Json<DiscoveryResponse> {
     let cache = state.cached_namespaces.read().await;
     let activity = state.namespace_activity.read().await;
+    let cache_ready = cache.is_some();
 
-    let namespaces: Vec<serde_json::Value> = cache
+    let namespaces: Vec<DiscoveryNamespaceInfo> = cache
         .as_ref()
         .map(|ns_list| {
-            ns_list
+            let mut sorted = ns_list.clone();
+            sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+            sorted
                 .iter()
-                .map(|ns| {
-                    json!({
-                        "id": ns.name,
-                        "count": ns.count,
-                        "last_indexed_at": activity.get(&ns.name),
-                    })
+                .map(|ns| DiscoveryNamespaceInfo {
+                    id: ns.name.clone(),
+                    count: ns.count,
+                    last_indexed_at: activity.get(&ns.name).cloned(),
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    let total_documents: usize = cache
+    let stats = state.rag.storage_manager().stats().await.ok();
+    let total_documents = stats
         .as_ref()
-        .map(|ns| ns.iter().map(|n| n.count).sum())
-        .unwrap_or(0);
+        .map(|stats| stats.row_count)
+        .unwrap_or_else(|| namespaces.iter().map(|ns| ns.count).sum());
+    let db_path = stats
+        .as_ref()
+        .map(|stats| stats.db_path.clone())
+        .unwrap_or_else(|| state.rag.storage_manager().lance_path().to_string());
 
-    Json(json!({
-        "status": if cache.is_some() { "ok" } else { "loading" },
-        "version": env!("CARGO_PKG_VERSION"),
-        "db_path": state.rag.storage_manager().lance_path(),
-        "embedding_provider": state.rag.mlx_connected_to(),
-        "total_documents": total_documents,
-        "namespaces": namespaces,
-    }))
+    Json(DiscoveryResponse {
+        status: if cache_ready { "ok" } else { "loading" }.to_string(),
+        hint: discovery_hint(cache_ready).to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        db_path,
+        embedding_provider: state.rag.mlx_connected_to(),
+        total_documents,
+        namespace_count: namespaces.len(),
+        namespaces,
+    })
 }
 
 /// SSE streaming namespace listing with per-namespace summary
@@ -2375,3 +2434,18 @@ mod tests {
         assert_eq!(req.slice_mode, "flat");
     }
 }
+
+    #[test]
+    fn test_discovery_hint_matches_cache_state() {
+        assert_eq!(discovery_hint(true), "OK");
+        assert!(discovery_hint(false).contains("rmcp-memex optimize"));
+    }
+
+    #[test]
+    fn test_dashboard_html_uses_canonical_discovery_endpoint() {
+        let html = get_dashboard_html();
+        assert!(html.contains("/api/discovery"));
+        assert!(!html.contains("/api/status"));
+        assert!(!html.contains("/api/overview"));
+        assert!(!html.contains("/api/namespaces"));
+    }
