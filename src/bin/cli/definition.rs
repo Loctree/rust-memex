@@ -838,7 +838,6 @@ impl Cli {
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
         Ok(ServerConfig {
-            features: default_cfg.features.clone(),
             cache_mb: self
                 .cache_mb
                 .or(file_cfg.cache_mb)

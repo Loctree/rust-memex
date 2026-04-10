@@ -48,7 +48,6 @@ async fn ollama_available() -> bool {
 
 fn test_config(db_path: &str) -> ServerConfig {
     ServerConfig {
-        features: vec!["memory".into(), "search".into()],
         cache_mb: 64,
         db_path: db_path.to_string(),
         max_request_bytes: 1024 * 1024,

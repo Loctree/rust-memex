@@ -99,10 +99,6 @@ pub use tui::{
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Legacy informational labels preserved for compatibility.
-    /// They do not restrict the runtime MCP surface.
-    pub features: Vec<String>,
-
     /// Cache size in MB for moka in-memory cache
     pub cache_mb: usize,
 
@@ -133,11 +129,6 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            features: vec![
-                "filesystem".to_string(),
-                "memory".to_string(),
-                "search".to_string(),
-            ],
             cache_mb: 4096,
             db_path: "~/.rmcp-servers/rmcp-memex/lancedb".to_string(),
             max_request_bytes: 5 * 1024 * 1024,
@@ -151,25 +142,6 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    #[deprecated(
-        note = "legacy informational label only; it does not restrict the MCP surface. Use allowed_paths, HTTP auth, or namespace security instead."
-    )]
-    /// Create a legacy memory/search feature label set.
-    pub fn for_memory_only() -> Self {
-        Self {
-            features: vec!["memory".to_string(), "search".to_string()],
-            ..Self::default()
-        }
-    }
-
-    #[deprecated(
-        note = "legacy informational label only; ServerConfig::default() already represents the canonical runtime surface."
-    )]
-    /// Create the canonical default runtime configuration.
-    pub fn for_full_rag() -> Self {
-        Self::default()
-    }
-
     #[doc(alias = "with_db_path")]
     pub fn with_storage_path(mut self, db_path: impl Into<String>) -> Self {
         self.db_path = db_path.into();
@@ -179,14 +151,6 @@ impl ServerConfig {
     #[deprecated(note = "use with_storage_path")]
     pub fn with_db_path(self, db_path: impl Into<String>) -> Self {
         self.with_storage_path(db_path)
-    }
-
-    #[deprecated(
-        note = "legacy informational label only; it does not change the runtime MCP surface."
-    )]
-    pub fn with_features(mut self, features: Vec<String>) -> Self {
-        self.features = features;
-        self
     }
 }
 
@@ -203,7 +167,6 @@ mod lib_tests {
     #[test]
     fn default_config_has_expected_values() {
         let cfg = ServerConfig::default();
-        assert!(cfg.features.contains(&"filesystem".to_string()));
         assert_eq!(cfg.cache_mb, 4096);
         assert_eq!(cfg.db_path, "~/.rmcp-servers/rmcp-memex/lancedb");
         assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);

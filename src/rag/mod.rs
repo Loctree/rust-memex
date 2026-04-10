@@ -1954,7 +1954,7 @@ impl RAGPipeline {
         metadata: serde_json::Value,
     ) -> Result<()> {
         // Use Flat mode to preserve the user-provided ID (no onion slicing)
-        // This ensures memory_get(id) will find the exact record
+        // This ensures lookup_memory(id) will find the exact record
         self.index_text_with_mode(Some(namespace), id, text, metadata, SliceMode::Flat)
             .await?;
         Ok(())
@@ -1978,27 +1978,12 @@ impl RAGPipeline {
         Ok(None)
     }
 
-    #[deprecated(note = "use lookup_memory")]
-    pub async fn memory_get(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
-        self.lookup_memory(namespace, id).await
-    }
-
     pub async fn remove_memory(&self, namespace: &str, id: &str) -> Result<usize> {
         self.delete_memory_from_indices(namespace, id).await
     }
 
-    #[deprecated(note = "use remove_memory")]
-    pub async fn memory_delete(&self, namespace: &str, id: &str) -> Result<usize> {
-        self.remove_memory(namespace, id).await
-    }
-
     pub async fn clear_namespace(&self, namespace: &str) -> Result<usize> {
         self.clear_namespace_from_indices(namespace).await
-    }
-
-    #[deprecated(note = "use clear_namespace")]
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.clear_namespace(namespace).await
     }
 
     pub async fn search_memory(
@@ -2009,16 +1994,6 @@ impl RAGPipeline {
     ) -> Result<Vec<SearchResult>> {
         self.search_with_options(Some(namespace), query, k, SearchOptions::default())
             .await
-    }
-
-    #[deprecated(note = "use search_memory")]
-    pub async fn memory_search(
-        &self,
-        namespace: &str,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<SearchResult>> {
-        self.search_memory(namespace, query, k).await
     }
 
     /// Search with layer filter - returns only outer slices by default (efficient context usage)
