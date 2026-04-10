@@ -217,10 +217,12 @@ let results = engine.search_with_mode("best of both", 10, SearchMode::Hybrid).aw
 
 Use `tool_definitions()` when you need the exact MCP tool metadata exposed by
 the stdio and HTTP/SSE transports. The helper functions below are for in-process
-Rust callers; they are a convenience subset, not a second public MCP contract.
+Rust callers; they are a local convenience layer, not a second public MCP
+contract. Their names intentionally differ from MCP tool names so the two
+surfaces do not drift together by accident.
 
 ```rust
-use rmcp_memex::{MemexEngine, tool_definitions, memory_store, memory_search};
+use rmcp_memex::{MemexEngine, search_documents, store_document, tool_definitions};
 use serde_json::json;
 
 let engine = MemexEngine::for_app("agent", "memory").await?;
@@ -230,7 +232,7 @@ let tools = tool_definitions();
 assert!(tools.iter().any(|tool| tool.name == "memory_upsert"));
 
 // Local Rust helpers for in-process callers
-let result = memory_store(
+let result = store_document(
     &engine,
     "mem-1".to_string(),
     "Important information to remember".to_string(),
@@ -238,7 +240,7 @@ let result = memory_store(
 ).await?;
 assert!(result.success);
 
-let results = memory_search(&engine, "important".to_string(), 5, None).await?;
+let results = search_documents(&engine, "important".to_string(), 5, None).await?;
 ```
 
 ### Feature Flags
