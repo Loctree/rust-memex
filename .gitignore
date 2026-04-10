@@ -16,8 +16,12 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 /.fastembed_cache
-/.ai-agents
-/.claude
+
+# Agent workspace directories
+/.ai-agents/
+/.claude/
+/.junie/
+
 /.lancedb/
 /.loctree
 AGENTS.md
