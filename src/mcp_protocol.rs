@@ -356,6 +356,9 @@ impl McpTool {
 }
 
 /// Shared `initialize` result used by every MCP transport.
+///
+/// rmcp-memex currently exposes a tools-only MCP surface. Do not advertise
+/// `resources` here until `resources/list` and related methods are implemented.
 pub fn shared_initialize_result() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -364,8 +367,7 @@ pub fn shared_initialize_result() -> Value {
             "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
-            "tools": {},
-            "resources": {}
+            "tools": {}
         }
     })
 }
@@ -1049,11 +1051,10 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_resources_and_tools() {
+    fn initialize_advertises_only_tools_capability() {
         let response = shared_initialize_result();
         assert_eq!(response["protocolVersion"], "2024-11-05");
-        assert!(response["capabilities"]["tools"].is_object());
-        assert!(response["capabilities"]["resources"].is_object());
+        assert_eq!(response["capabilities"], json!({ "tools": {} }));
     }
 
     #[test]

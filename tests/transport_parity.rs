@@ -127,6 +127,7 @@ async fn parity_initialize_identical_across_transports() {
     assert_eq!(stdio["jsonrpc"], "2.0");
     assert_eq!(stdio["id"], 1);
     assert!(stdio["result"]["protocolVersion"].is_string());
+    assert_eq!(stdio["result"]["capabilities"], json!({ "tools": {} }));
 }
 
 #[tokio::test]
@@ -226,7 +227,7 @@ async fn parity_namespace_security_status_identical() {
 
 #[tokio::test]
 #[ignore]
-async fn parity_unknown_method_error_identical() {
+async fn parity_resources_list_rejected_until_resources_exist() {
     if !ollama_available().await {
         eprintln!("SKIP: Ollama unavailable");
         return;
@@ -242,8 +243,12 @@ async fn parity_unknown_method_error_identical() {
 
     let stdio = stdio.expect("stdio must respond with error");
     let sse = sse.expect("sse must respond with error");
-    assert_eq!(stdio, sse, "unknown method errors must be identical");
+    assert_eq!(
+        stdio, sse,
+        "resources/list must fail identically across transports until resources are implemented"
+    );
     assert_eq!(stdio["error"]["code"], -32601);
+    assert_eq!(stdio["error"]["message"], "Unknown method: resources/list");
 }
 
 #[tokio::test]

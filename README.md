@@ -8,6 +8,8 @@ It exposes two explicit transport modes from a single canonical surface:
 2.  **`HTTP/SSE` (Multi-Agent Daemon)**: A central daemon mode allowing concurrent AI agents to access the same memory pool over the network, resolving LanceDB's exclusive lock constraints.
 
 > **Binary Name:** `rmcp-memex` is the only supported binary name. The GitHub installer also creates `rmcp_memex` as a legacy compatibility symlink for older scripts.
+>
+> **MCP Contract:** The current MCP surface is intentionally tools-only. `initialize` advertises `tools`, while `resources/*` is not implemented yet.
 
 ## Release Surface
 
