@@ -49,9 +49,16 @@ impl HostDetection {
         } else if self.has_rmcp_memex {
             "Configured"
         } else {
-            "Detected (no rmcp_memex)"
+            "Detected (no memex server entry)"
         }
     }
+}
+
+fn matches_memex_server(entry: &McpServerEntry) -> bool {
+    entry.name.contains("rmcp_memex")
+        || entry.name.contains("rmcp-memex")
+        || entry.command.contains("rmcp_memex")
+        || entry.command.contains("rmcp-memex")
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -253,9 +260,7 @@ fn detect_single_host(kind: HostKind) -> Option<HostDetection> {
                 HostFormat::Toml => parse_toml_mcp_servers(&content),
                 HostFormat::Json => parse_json_mcp_servers(&content),
             };
-            let has_rmcp = servers
-                .iter()
-                .any(|s| s.name.contains("rmcp_memex") || s.command.contains("rmcp_memex"));
+            let has_rmcp = servers.iter().any(matches_memex_server);
             (has_rmcp, servers)
         } else {
             (false, Vec::new())
@@ -361,7 +366,7 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
     Ok(safe_dst)
 }
 
-/// Merge rmcp_memex server entry into existing JSON config
+/// Merge the rmcp_memex host entry into existing JSON config.
 fn merge_json_config(existing_content: &str, binary_path: &str, db_path: &str) -> Result<String> {
     let mut config: serde_json::Value = if existing_content.trim().is_empty() {
         serde_json::json!({})
@@ -385,7 +390,7 @@ fn merge_json_config(existing_content: &str, binary_path: &str, db_path: &str) -
     serde_json::to_string_pretty(&config).with_context(|| "Failed to serialize JSON config")
 }
 
-/// Merge rmcp_memex server entry into existing TOML config
+/// Merge the rmcp_memex host entry into existing TOML config.
 fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -> Result<String> {
     let mut config: toml::Value = if existing_content.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
@@ -432,7 +437,7 @@ fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -
 ///
 /// # Arguments
 /// * `host` - The detected host to write config for
-/// * `binary_path` - Path to the rmcp_memex binary
+/// * `binary_path` - Path to the rmcp-memex binary
 /// * `db_path` - Path to the LanceDB database
 ///
 /// # Returns
@@ -550,9 +555,7 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
             let (has_rmcp_memex, servers) = if exists {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let servers = parse_json_mcp_servers(&content);
-                    let has_rmcp = servers
-                        .iter()
-                        .any(|s| s.name.contains("rmcp_memex") || s.command.contains("rmcp_memex"));
+                    let has_rmcp = servers.iter().any(matches_memex_server);
                     (has_rmcp, servers)
                 } else {
                     (false, Vec::new())
@@ -613,55 +616,70 @@ command = "other"
     }
 
     #[test]
+    fn test_matches_memex_server_accepts_canonical_binary_name() {
+        let entry = McpServerEntry {
+            name: "custom".to_string(),
+            command: "/usr/local/bin/rmcp-memex".to_string(),
+            args: vec!["serve".to_string()],
+            env: HashMap::new(),
+        };
+
+        assert!(matches_memex_server(&entry));
+    }
+
+    #[test]
     fn test_generate_toml_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Codex),
-            "/usr/bin/rmcp_memex",
+            "/usr/bin/rmcp-memex",
             "~/.rmcp/db",
         );
         assert!(snippet.contains("[mcp_servers.rmcp_memex]"));
-        assert!(snippet.contains("/usr/bin/rmcp_memex"));
+        assert!(snippet.contains("/usr/bin/rmcp-memex"));
     }
 
     #[test]
     fn test_generate_json_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Claude),
-            "/usr/bin/rmcp_memex",
+            "/usr/bin/rmcp-memex",
             "~/.rmcp/db",
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
+        assert!(snippet.contains("/usr/bin/rmcp-memex"));
     }
 
     #[test]
     fn test_generate_extended_claude_code_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::ClaudeCode,
-            "/usr/bin/rmcp_memex",
+            "/usr/bin/rmcp-memex",
             "~/.rmcp/db",
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
+        assert!(snippet.contains("/usr/bin/rmcp-memex"));
     }
 
     #[test]
     fn test_generate_extended_junie_snippet() {
         let snippet =
-            generate_extended_snippet(ExtendedHostKind::Junie, "/usr/bin/rmcp_memex", "~/.rmcp/db");
+            generate_extended_snippet(ExtendedHostKind::Junie, "/usr/bin/rmcp-memex", "~/.rmcp/db");
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
+        assert!(snippet.contains("/usr/bin/rmcp-memex"));
     }
 
     #[test]
     fn test_merge_json_config_empty() {
-        let result = merge_json_config("", "/usr/bin/rmcp_memex", "~/.rmcp/db").unwrap();
+        let result = merge_json_config("", "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
             parsed["mcpServers"]["rmcp_memex"]["command"]
                 .as_str()
                 .unwrap()
-                .contains("rmcp_memex")
+                .contains("rmcp-memex")
         );
     }
 
@@ -675,7 +693,7 @@ command = "other"
     }
   }
 }"#;
-        let result = merge_json_config(existing, "/usr/bin/rmcp_memex", "~/.rmcp/db").unwrap();
+        let result = merge_json_config(existing, "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Should preserve existing server
         assert!(
@@ -688,15 +706,15 @@ command = "other"
             parsed["mcpServers"]["rmcp_memex"]["command"]
                 .as_str()
                 .unwrap()
-                .contains("rmcp_memex")
+                .contains("rmcp-memex")
         );
     }
 
     #[test]
     fn test_merge_toml_config_empty() {
-        let result = merge_toml_config("", "/usr/bin/rmcp_memex", "~/.rmcp/db").unwrap();
+        let result = merge_toml_config("", "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
         assert!(result.contains("[mcp_servers.rmcp_memex]"));
-        assert!(result.contains("rmcp_memex"));
+        assert!(result.contains("rmcp-memex"));
     }
 
     #[test]
@@ -706,11 +724,11 @@ command = "other"
 command = "other"
 args = []
 "#;
-        let result = merge_toml_config(existing, "/usr/bin/rmcp_memex", "~/.rmcp/db").unwrap();
+        let result = merge_toml_config(existing, "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
         // Should preserve existing server
         assert!(result.contains("other_server"));
         // Should add rmcp_memex
-        assert!(result.contains("rmcp_memex"));
+        assert!(result.contains("rmcp-memex"));
     }
 
     #[test]

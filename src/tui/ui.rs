@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let title = format!(
-        " rmcp_memex wizard v{} - Step {}/{}: {} ",
+        " rmcp-memex wizard v{} - Step {}/{}: {} ",
         VERSION,
         app.step.step_number(),
         WizardStep::total_steps(),
@@ -113,13 +113,13 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "Welcome to rmcp_memex Configuration Wizard",
+            "Welcome to rmcp-memex Configuration Wizard",
             Style::default().fg(Color::Cyan).bold(),
         )),
         Line::from(""),
         Line::from("This wizard will help you:"),
         Line::from(""),
-        Line::from("  1. Configure rmcp_memex settings (database path, cache, etc.)"),
+        Line::from("  1. Configure rmcp-memex settings (database path, cache, etc.)"),
         Line::from("  2. Detect and configure MCP host integrations"),
         Line::from("  3. Generate configuration snippets for your hosts"),
         Line::from("  4. Verify your setup with a health check"),

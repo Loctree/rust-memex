@@ -125,7 +125,7 @@ async fn test_cli_indexes_folder_samples_with_chunking_and_rag_search() {
     let config_path = write_config(&server.base_url).expect("failed to write config");
 
     let index_output = run_cli(
-        env!("CARGO_BIN_EXE_rmmx"),
+        env!("CARGO_BIN_EXE_rmcp-memex"),
         [
             "--config",
             config_path.to_str().unwrap(),
@@ -216,7 +216,7 @@ async fn test_cli_indexes_folder_samples_with_chunking_and_rag_search() {
     );
 
     let search_output = run_cli(
-        env!("CARGO_BIN_EXE_rmmx"),
+        env!("CARGO_BIN_EXE_rmcp-memex"),
         [
             "--config",
             config_path.to_str().unwrap(),

@@ -7,7 +7,7 @@ It exposes two explicit transport modes from a single canonical surface:
 1.  **`stdio` (Standard MCP)**: Native MCP integration for local agents (e.g., Claude Desktop).
 2.  **`HTTP/SSE` (Multi-Agent Daemon)**: A central daemon mode allowing concurrent AI agents to access the same memory pool over the network, resolving LanceDB's exclusive lock constraints.
 
-> **Note on Aliases:** The published package and primary entrypoint is `rmcp-memex`. For operational convenience, it installs the aliases `rust-memex`, `rmmx`, and `rmemex`. These are strictly convenience links to the identical `rmcp-memex` kernel, not separate products.
+> **Binary Name:** `rmcp-memex` is the only supported binary name. The GitHub installer also creates `rmcp_memex` as a legacy compatibility symlink for older scripts.
 
 ## Release Surface
 

@@ -143,7 +143,7 @@ flowchart TB
 | **E2E Tests** | ✅ DODANE | `tests/e2e_pipeline.rs` - 5 testów |
 | **TextIntegrityMetrics** | ✅ DODANE | >90% threshold, audit command |
 | **DimensionAdapter** | ✅ DODANE | Cross-dim search 1024/2048/4096 |
-| **Audit/Purge commands** | ✅ DODANE | `rust-memex audit`, `purge-quality` |
+| **Audit/Purge commands** | ✅ DODANE | `rmcp-memex audit`, `purge-quality` |
 
 ### ⚠️ CZĘŚCIOWE (żółte)
 | Komponent | Status | Uwagi |

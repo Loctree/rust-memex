@@ -70,8 +70,8 @@
 | Config File | `~/.ai-memories/config.toml` | **NONE** | ❌ Missing |
 | **Quality Assurance** |
 | TextIntegrityMetrics | >90% threshold | **✅ compute() + recommendation()** | ✅ FIXED |
-| Audit command | Per-namespace check | **✅ rust-memex audit** | ✅ FIXED |
-| Purge command | Remove low-quality | **✅ rust-memex purge-quality** | ✅ FIXED |
+| Audit command | Per-namespace check | **✅ rmcp-memex audit** | ✅ FIXED |
+| Purge command | Remove low-quality | **✅ rmcp-memex purge-quality** | ✅ FIXED |
 | **Testing** |
 | E2E: pipeline | Required | **✅ tests/e2e_pipeline.rs (5 tests)** | ✅ FIXED |
 | E2E: MCP tools | Required | **MISSING** | ❌ |
@@ -137,7 +137,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ENTRY POINTS                             │
-│         MCP (stdio) │ HTTP (8987) │ CLI (rust-memex)            │
+│         MCP (stdio) │ HTTP (8987) │ CLI (rmcp-memex)            │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -195,7 +195,7 @@
 2. ~~**E2E Tests**~~ → ✅ `tests/e2e_pipeline.rs` (5 tests)
 3. ~~**Quality Metrics**~~ → ✅ `TextIntegrityMetrics` with >90% threshold
 4. ~~**Cross-dim Search**~~ → ✅ `DimensionAdapter` (1024/2048/4096)
-5. ~~**Audit/Purge**~~ → ✅ `rust-memex audit` + `purge-quality` commands
+5. ~~**Audit/Purge**~~ → ✅ `rmcp-memex audit` + `purge-quality` commands
 
 ### 🟠 HIGH (Data Integrity Risk)
 1. **Atomic Batch Writes** - Implement transaction wrapper

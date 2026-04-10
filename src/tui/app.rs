@@ -316,7 +316,7 @@ pub struct App {
 impl App {
     pub fn new(config: WizardConfig) -> Self {
         let hosts = detect_extended_hosts();
-        let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp_memex".to_string());
+        let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp-memex".to_string());
         let embedder_state = EmbedderState::default();
         let embedding_config = embedder_state.build_embedding_config();
 
@@ -414,7 +414,7 @@ impl App {
     pub fn run_health_check(&mut self) {
         self.health_status = Some("Checking...".to_string());
 
-        // Try to run rmcp_memex --version
+        // Prefer the canonical binary name, but allow the legacy alias when present.
         match std::process::Command::new(&self.binary_path)
             .arg("--version")
             .output()
@@ -1145,7 +1145,7 @@ impl App {
         self.messages.push(String::new());
         self.messages.push("Configuration complete!".to_string());
         self.messages
-            .push("Run 'rmcp_memex serve' to start the server.".to_string());
+            .push("Run 'rmcp-memex serve' to start the server.".to_string());
 
         Ok(())
     }
@@ -1161,12 +1161,14 @@ fn timestamp() -> String {
 }
 
 fn which_rmcp_memex() -> Option<String> {
-    std::process::Command::new("which")
-        .arg("rmcp_memex")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    ["rmcp-memex", "rmcp_memex"].into_iter().find_map(|binary| {
+        std::process::Command::new("which")
+            .arg(binary)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
 }
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;

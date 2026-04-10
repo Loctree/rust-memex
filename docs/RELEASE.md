@@ -60,7 +60,8 @@ cargo install rmcp-memex --version <version>
 Then confirm:
 
 - `rmcp-memex serve` starts cleanly
-- the aliases `rust-memex`, `rmmx`, and `rmemex` resolve after installer-based installation
+- installer-based installs expose `rmcp_memex` as a legacy compatibility symlink
+- no release artifact, README snippet, or landing-page copy refers to `rust-memex`, `rmmx`, or `rmemex`
 - `/health` responds when running with `--http-port 6660`
 - the landing page publishes via `.github/workflows/pages.yml`
 
