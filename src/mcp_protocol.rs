@@ -413,6 +413,14 @@ impl McpCore {
         self.rag.clone()
     }
 
+    pub fn hybrid_searcher(&self) -> Option<Arc<HybridSearcher>> {
+        self.hybrid_searcher.clone()
+    }
+
+    pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        self.embedding_client.lock().await.embed(query).await
+    }
+
     pub async fn handle_request(&self, request: Value, transport: McpTransport) -> Option<Value> {
         self.handle_jsonrpc_request(request, transport)
             .await

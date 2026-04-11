@@ -92,8 +92,8 @@ Example response:
 | `/get/{ns}/{id}` | GET | Fetch one document |
 | `/expand/{ns}/{id}` | GET | Expand an onion slice to children |
 | `/parent/{ns}/{id}` | GET | Fetch the parent slice |
-| `/search` | POST | Search with optional namespace, project, layer, and deep filters (`k` alias supported) |
-| `/cross-search` | GET | Search across namespaces |
+| `/search` | POST | Search with optional namespace, mode, project, layer, and deep filters (`k` alias supported) |
+| `/cross-search` | GET | Search across namespaces with `mode=vector|bm25|hybrid` |
 | `/sse/search` | GET | Streaming single-namespace search |
 | `/sse/cross-search` | GET | Streaming cross-namespace search |
 | `/sse/namespaces` | GET | Streaming namespace summary |
@@ -125,7 +125,7 @@ These remain useful for legacy clients, but new code should prefer `GET /api/dis
 ```bash
 curl -X POST http://localhost:6666/search \
   -H "Content-Type: application/json" \
-  -d '{"query":"rust async","namespace":"kodowanie","k":10,"project":"Vista","deep":true}'
+  -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Vista","deep":true}'
 ```
 
 Representative response:
@@ -149,7 +149,7 @@ Representative response:
 ### `GET /cross-search`
 
 ```bash
-curl "http://localhost:6666/cross-search?q=rust%20async&limit=5&total_limit=20"
+curl "http://localhost:6666/cross-search?q=rust%20async&limit=5&total_limit=20&mode=hybrid"
 ```
 
 ## Mutating Surfaces

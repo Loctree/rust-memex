@@ -56,6 +56,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
+use crate::search::{HybridSearchResult, SearchMode};
 use crate::storage::ChromaDocument;
 
 // ============================================================================
@@ -882,7 +883,7 @@ impl Default for McpSessionManager {
     }
 }
 
-/// Shared state for HTTP handlers - uses RAGPipeline like MCPServer
+/// Shared state for HTTP handlers - reuses the same MCP core and storage runtime as stdio/SSE.
 #[derive(Clone)]
 pub struct HttpState {
     pub rag: Arc<RAGPipeline>,
@@ -915,6 +916,8 @@ pub struct SearchRequest {
     pub deep: bool,
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 fn default_limit() -> usize {
@@ -957,6 +960,27 @@ impl From<SearchResult> for SearchResultJson {
             parent_id: r.parent_id,
             children_ids: r.children_ids,
             keywords: r.keywords,
+            can_expand,
+            can_drill_up,
+        }
+    }
+}
+
+impl From<HybridSearchResult> for SearchResultJson {
+    fn from(result: HybridSearchResult) -> Self {
+        let can_expand = !result.children_ids.is_empty();
+        let can_drill_up = result.parent_id.is_some();
+
+        Self {
+            id: result.id,
+            namespace: result.namespace,
+            text: result.document,
+            score: result.combined_score,
+            metadata: result.metadata,
+            layer: result.layer.map(|layer| layer.name().to_string()),
+            parent_id: result.parent_id,
+            children_ids: result.children_ids,
+            keywords: result.keywords,
             can_expand,
             can_drill_up,
         }
@@ -1025,7 +1049,7 @@ pub struct SseSearchParams {
     pub query: String,
     #[serde(default)]
     pub namespace: Option<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", alias = "k")]
     pub limit: usize,
     #[serde(default)]
     pub deep: bool,
@@ -1033,6 +1057,8 @@ pub struct SseSearchParams {
     pub layer: Option<u8>,
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 /// Cross-search request - search across all namespaces
@@ -1060,6 +1086,50 @@ fn default_total_limit() -> usize {
 
 fn default_mode() -> String {
     "hybrid".to_string()
+}
+
+fn http_search_mode(mode: &str) -> SearchMode {
+    match mode {
+        "vector" => SearchMode::Vector,
+        "keyword" | "bm25" => SearchMode::Keyword,
+        _ => SearchMode::Hybrid,
+    }
+}
+
+async fn search_results_with_mode(
+    state: &HttpState,
+    namespace: Option<&str>,
+    query: &str,
+    limit: usize,
+    mode: SearchMode,
+    options: SearchOptions,
+) -> anyhow::Result<Vec<SearchResultJson>> {
+    if mode != SearchMode::Vector
+        && let Some(hybrid_searcher) = state.mcp_core.hybrid_searcher()
+    {
+        let query_embedding = state.mcp_core.embed_query(query).await?;
+        let results = hybrid_searcher
+            .search(query, query_embedding, namespace, limit, options)
+            .await?;
+        return Ok(results.into_iter().map(SearchResultJson::from).collect());
+    }
+
+    let results = state
+        .rag
+        .search_with_options(namespace, query, limit, options)
+        .await?;
+    Ok(results.into_iter().map(SearchResultJson::from).collect())
+}
+
+async fn list_search_namespaces(state: &HttpState) -> anyhow::Result<Vec<String>> {
+    Ok(state
+        .rag
+        .storage_manager()
+        .list_namespaces()
+        .await?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// Cross-search query params for GET endpoint
@@ -1534,26 +1604,26 @@ async fn search_handler(
         layer_filter,
         project_filter: req.project.clone().filter(|value| !value.trim().is_empty()),
     };
+    let mode = http_search_mode(req.mode.as_str());
 
-    let results = state
-        .rag
-        .search_with_options(
-            Some(req.namespace.as_deref().unwrap_or("default")),
-            &req.query,
-            req.limit,
-            options,
-        )
-        .await
-        .map_err(|e| {
-            error!("Search error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    let results = search_results_with_mode(
+        &state,
+        Some(req.namespace.as_deref().unwrap_or("default")),
+        &req.query,
+        req.limit,
+        mode,
+        options,
+    )
+    .await
+    .map_err(|e| {
+        error!("Search error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     let count = results.len();
-    let search_results: Vec<SearchResultJson> = results.into_iter().map(Into::into).collect();
 
     Ok(Json(SearchResponse {
-        results: search_results,
+        results,
         query: req.query,
         namespace: req.namespace,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -1574,6 +1644,7 @@ async fn sse_search_handler(
                 "query": params.query,
                 "namespace": params.namespace,
                 "limit": params.limit,
+                "mode": params.mode,
                 "deep": params.deep,
                 "layer": params.layer,
                 "project": params.project
@@ -1589,18 +1660,22 @@ async fn sse_search_handler(
             layer_filter,
             project_filter: params.project.clone().filter(|value| !value.trim().is_empty()),
         };
+        let mode = http_search_mode(params.mode.as_str());
 
-        match state
-            .rag
-            .search_with_options(Some(namespace), &params.query, params.limit, options)
+        match search_results_with_mode(
+            &state,
+            Some(namespace),
+            &params.query,
+            params.limit,
+            mode,
+            options,
+        )
             .await
         {
             Ok(results) => {
                 let total = results.len();
 
-                for (i, r) in results.into_iter().enumerate() {
-                    let result: SearchResultJson = r.into();
-
+                for (i, result) in results.into_iter().enumerate() {
                     if let Ok(json) = serde_json::to_string(&result) {
                         yield Ok(Event::default()
                             .event("result")
@@ -1640,26 +1715,12 @@ async fn cross_search_handler(
     State(state): State<HttpState>,
     Query(params): Query<CrossSearchParams>,
 ) -> Result<Json<CrossSearchResponse>, (StatusCode, String)> {
-    use std::collections::HashSet;
-
     let start = std::time::Instant::now();
-
-    let all_docs = state
-        .rag
-        .storage_manager()
-        .all_documents(None, 10000)
-        .await
-        .map_err(|e| {
-            error!("Cross-search namespace lookup error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    let mut namespace_set: HashSet<String> = HashSet::new();
-    for doc in &all_docs {
-        namespace_set.insert(doc.namespace.clone());
-    }
-
-    let namespaces: Vec<String> = namespace_set.into_iter().collect();
+    let mode = http_search_mode(params.mode.as_str());
+    let namespaces = list_search_namespaces(&state).await.map_err(|e| {
+        error!("Cross-search namespace lookup error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     let namespaces_count = namespaces.len();
 
     if namespaces.is_empty() {
@@ -1677,15 +1738,20 @@ async fn cross_search_handler(
     let mut all_results: Vec<(SearchResultJson, f32)> = Vec::new();
 
     for ns in &namespaces {
-        match state
-            .rag
-            .search_memory(ns, &params.query, params.limit)
-            .await
+        match search_results_with_mode(
+            &state,
+            Some(ns),
+            &params.query,
+            params.limit,
+            mode,
+            SearchOptions::default(),
+        )
+        .await
         {
             Ok(results) => {
                 for r in results {
                     let score = r.score;
-                    all_results.push((r.into(), score));
+                    all_results.push((r, score));
                 }
             }
             Err(e) => {
@@ -1720,8 +1786,6 @@ async fn sse_cross_search_handler(
     State(state): State<HttpState>,
     Query(params): Query<CrossSearchParams>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    use std::collections::HashSet;
-
     let stream = async_stream::stream! {
         // Send start event
         yield Ok(Event::default()
@@ -1734,8 +1798,8 @@ async fn sse_cross_search_handler(
             }).to_string()));
 
         // Get all namespaces
-        let all_docs = match state.rag.storage_manager().all_documents(None, 10000).await {
-            Ok(docs) => docs,
+        let namespaces = match list_search_namespaces(&state).await {
+            Ok(namespaces) => namespaces,
             Err(e) => {
                 yield Ok(Event::default()
                     .event("error")
@@ -1743,13 +1807,7 @@ async fn sse_cross_search_handler(
                 return;
             }
         };
-
-        let mut namespace_set: HashSet<String> = HashSet::new();
-        for doc in &all_docs {
-            namespace_set.insert(doc.namespace.clone());
-        }
-
-        let namespaces: Vec<String> = namespace_set.into_iter().collect();
+        let mode = http_search_mode(params.mode.as_str());
 
         // Send namespace info
         yield Ok(Event::default()
@@ -1768,12 +1826,18 @@ async fn sse_cross_search_handler(
                 .event("searching")
                 .data(serde_json::json!({"namespace": ns}).to_string()));
 
-            match state.rag.search_memory(ns, &params.query, params.limit).await {
+            match search_results_with_mode(
+                &state,
+                Some(ns),
+                &params.query,
+                params.limit,
+                mode,
+                SearchOptions::default(),
+            ).await {
                 Ok(results) => {
                     let ns_count = results.len();
-                    for r in results {
-                        let score = r.score;
-                        let result: SearchResultJson = r.into();
+                    for result in results {
+                        let score = result.score;
                         all_results.push((result, score, ns.clone()));
                     }
 
@@ -2510,6 +2574,7 @@ mod tests {
         let json = r#"{"query": "test"}"#;
         let req: SearchRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.limit, 10);
+        assert_eq!(req.mode, "hybrid");
         assert!(req.namespace.is_none());
         assert!(req.layer.is_none());
         assert!(!req.deep);
@@ -2523,6 +2588,22 @@ mod tests {
         assert_eq!(req.limit, 7);
         assert!(req.deep);
         assert_eq!(req.project.as_deref(), Some("Vista"));
+    }
+
+    #[test]
+    fn test_search_request_accepts_bm25_mode() {
+        let json = r#"{"query":"test","mode":"bm25"}"#;
+        let req: SearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.mode, "bm25");
+    }
+
+    #[test]
+    fn test_http_search_mode_parsing() {
+        assert_eq!(http_search_mode("vector"), SearchMode::Vector);
+        assert_eq!(http_search_mode("keyword"), SearchMode::Keyword);
+        assert_eq!(http_search_mode("bm25"), SearchMode::Keyword);
+        assert_eq!(http_search_mode("hybrid"), SearchMode::Hybrid);
+        assert_eq!(http_search_mode("unknown"), SearchMode::Hybrid);
     }
 
     #[test]
