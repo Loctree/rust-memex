@@ -119,6 +119,51 @@ async fn rag_pipeline_syncs_bm25_writes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rag_pipeline_rolls_back_lance_write_when_bm25_write_fails() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let bm25 = Arc::new(BM25Index::new(
+        &BM25Config::default()
+            .with_path(bm25_path.to_string_lossy().into_owned())
+            .with_read_only(true),
+    )?);
+    let rag = RAGPipeline::new_with_bm25(mlx, storage.clone(), Some(bm25)).await?;
+
+    let err = rag
+        .index_text_with_mode(
+            Some("rollback-ns"),
+            "doc1".to_string(),
+            "This batch should never survive a failed BM25 write because rollback keeps LanceDB truthful."
+                .to_string(),
+            json!({"kind": "rollback-guard"}),
+            SliceMode::Flat,
+        )
+        .await
+        .expect_err("read-only BM25 should reject the write path");
+
+    assert!(
+        err.to_string().contains("read-only mode"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        storage
+            .get_all_in_namespace("rollback-ns")
+            .await?
+            .is_empty(),
+        "LanceDB rows should be rolled back when BM25 indexing fails"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn onion_text_index_overrides_stale_slice_mode_metadata() -> Result<()> {
     let mlx = require_mlx!(try_mlx_bridge().await);
 

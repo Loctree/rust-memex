@@ -2591,6 +2591,16 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_search_params_accept_k_alias() {
+        let json = r#"{"query":"test","k":9,"deep":true,"project":"Vista","mode":"bm25"}"#;
+        let params: SseSearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.limit, 9);
+        assert!(params.deep);
+        assert_eq!(params.project.as_deref(), Some("Vista"));
+        assert_eq!(params.mode, "bm25");
+    }
+
+    #[test]
     fn test_search_request_accepts_bm25_mode() {
         let json = r#"{"query":"test","mode":"bm25"}"#;
         let req: SearchRequest = serde_json::from_str(json).unwrap();
