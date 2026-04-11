@@ -581,6 +581,29 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
     results
 }
 
+pub fn generate_extended_snippet_mux(_kind: ExtendedHostKind, _sock_path: &str) -> String {
+    String::new()
+}
+
+pub fn write_extended_host_config_mux(
+    kind: ExtendedHostKind,
+    _sock_path: &str,
+) -> Result<WriteResult> {
+    let (path, _format) =
+        get_extended_host_config_path(kind).ok_or_else(|| anyhow::anyhow!("Unknown host kind"))?;
+
+    Ok(WriteResult {
+        host_name: kind.label().to_string(),
+        config_path: path,
+        backup_path: None,
+        created: false,
+    })
+}
+
+pub fn write_mux_service_config() -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

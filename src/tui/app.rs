@@ -12,12 +12,14 @@ use crate::tui::detection::{
 use crate::tui::health::{HealthCheckResult, HealthChecker};
 use crate::tui::host_detection::{
     ExtendedHostKind, HostDetection, detect_extended_hosts, generate_extended_snippet,
-    write_extended_host_config,
+    generate_extended_snippet_mux, write_extended_host_config, write_extended_host_config_mux,
 };
 use crate::tui::indexer::{
-    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, import_lancedb,
-    start_indexing,
+    DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
+    IndexEventSink, IndexTelemetrySnapshot, SharedIndexTelemetry, TracingSink, TuiTelemetrySink,
+    collect_indexable_files, import_lancedb, new_index_telemetry, start_indexing, validate_path,
 };
+use crate::tui::monitor::{MonitorSnapshot, spawn_monitor};
 use anyhow::{Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -27,8 +29,12 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+const DEFAULT_INDEX_PARALLELISM: usize = 4;
 
 /// Configuration for running the wizard.
 #[derive(Debug, Clone, Default)]
@@ -238,6 +244,14 @@ pub enum DbPathMode {
     PerHost,
 }
 
+/// How hosts connect to rmcp-memex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeploymentMode {
+    #[default]
+    PerHostStdio,
+    SharedMux,
+}
+
 /// Editable memex configuration.
 #[derive(Debug, Clone)]
 pub struct MemexCfg {
@@ -251,6 +265,8 @@ pub struct MemexCfg {
     pub db_path_mode: DbPathMode,
     /// HTTP/SSE server port (None = disabled, Some(port) = enabled)
     pub http_port: Option<u16>,
+    /// Whether hosts launch rmcp-memex directly or via rmcp_mux_proxy.
+    pub deployment_mode: DeploymentMode,
 }
 
 impl Default for MemexCfg {
@@ -265,6 +281,7 @@ impl Default for MemexCfg {
             hostname,
             db_path_mode: DbPathMode::Shared,
             http_port: None,
+            deployment_mode: DeploymentMode::PerHostStdio,
         }
     }
 }
@@ -305,18 +322,40 @@ pub struct App {
     pub health_running: bool,
     /// Data setup state
     pub data_setup: DataSetupState,
-    /// Progress receiver for indexing operations
-    pub index_progress_rx: Option<mpsc::Receiver<IndexProgress>>,
+    /// Latest telemetry receiver for the indexing dashboard.
+    pub telemetry_rx: Option<watch::Receiver<IndexTelemetrySnapshot>>,
+    /// Latest system monitor receiver for the dashboard.
+    pub monitor_rx: Option<watch::Receiver<MonitorSnapshot>>,
+    /// Scheduler control sender.
+    pub index_control_tx: Option<mpsc::Sender<IndexControl>>,
+    /// Running indexing task.
+    pub index_task: Option<JoinHandle<Result<()>>>,
+    /// Running monitor sampler task.
+    pub monitor_task: Option<JoinHandle<()>>,
+    /// Current requested indexer parallelism.
+    pub index_parallelism: usize,
+    /// Whether the indexer is currently paused.
+    pub index_paused: bool,
     /// Whether rmcp-memex config has been written
     pub config_written: bool,
+    /// Cached mux proxy availability.
+    pub mux_proxy_available: bool,
+}
+
+fn mux_proxy_on_path() -> bool {
+    false
 }
 
 impl App {
+    pub fn mux_proxy_on_path(&self) -> bool {
+        self.mux_proxy_available
+    }
     pub fn new(config: WizardConfig) -> Self {
         let hosts = detect_extended_hosts();
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp-memex".to_string());
         let embedder_state = EmbedderState::default();
         let embedding_config = embedder_state.build_embedding_config();
+        let mux_proxy_available = mux_proxy_on_path();
 
         Self {
             step: WizardStep::Welcome,
@@ -337,8 +376,15 @@ impl App {
             health_result: None,
             health_running: false,
             data_setup: DataSetupState::new(),
-            index_progress_rx: None,
+            telemetry_rx: None,
+            monitor_rx: None,
+            index_control_tx: None,
+            index_task: None,
+            monitor_task: None,
+            index_parallelism: DEFAULT_INDEX_PARALLELISM,
+            index_paused: false,
             config_written: false,
+            mux_proxy_available,
         }
     }
 
@@ -395,15 +441,23 @@ impl App {
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
-                let mut snippet =
-                    generate_extended_snippet(*kind, &self.binary_path, &effective_path);
-                // Add HTTP port arg if configured
-                if let Some(port) = self.memex_cfg.http_port {
-                    snippet = snippet.replace(
-                        "\"serve\"",
-                        &format!("\"serve\", \"--http-port\", \"{}\"", port),
-                    );
-                }
+                let snippet = match self.memex_cfg.deployment_mode {
+                    DeploymentMode::PerHostStdio => {
+                        let mut snippet =
+                            generate_extended_snippet(*kind, &self.binary_path, &effective_path);
+                        if let Some(port) = self.memex_cfg.http_port {
+                            snippet = snippet.replace(
+                                "\"serve\"",
+                                &format!("\"serve\", \"--http-port\", \"{}\"", port),
+                            );
+                        }
+                        snippet
+                    }
+                    DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                        *kind,
+                        "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                    ),
+                };
                 (*kind, snippet)
             })
             .collect()
@@ -466,8 +520,15 @@ impl App {
             ));
             for &idx in &self.selected_hosts.clone() {
                 if let Some((kind, detection)) = self.hosts.get(idx) {
-                    let snippet =
-                        generate_extended_snippet(*kind, &self.binary_path, &effective_path);
+                    let snippet = match self.memex_cfg.deployment_mode {
+                        DeploymentMode::PerHostStdio => {
+                            generate_extended_snippet(*kind, &self.binary_path, &effective_path)
+                        }
+                        DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                            *kind,
+                            "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                        ),
+                    };
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
                         kind.label(),
@@ -475,6 +536,12 @@ impl App {
                         snippet
                     ));
                 }
+            }
+            if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+                self.messages.push(
+                    "Would write mux service config to ~/.rmcp_servers/rmcp-memex/mux_config.toml"
+                        .to_string(),
+                );
             }
             return Ok(());
         }
@@ -484,7 +551,17 @@ impl App {
 
         for &idx in &self.selected_hosts.clone() {
             if let Some((kind, _detection)) = self.hosts.get(idx) {
-                match write_extended_host_config(*kind, &self.binary_path, &effective_path) {
+                let write_result = match self.memex_cfg.deployment_mode {
+                    DeploymentMode::PerHostStdio => {
+                        write_extended_host_config(*kind, &self.binary_path, &effective_path)
+                    }
+                    DeploymentMode::SharedMux => write_extended_host_config_mux(
+                        *kind,
+                        "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                    ),
+                };
+
+                match write_result {
                     Ok(result) => {
                         success_count += 1;
                         if let Some(backup) = result.backup_path {
@@ -534,7 +611,7 @@ impl App {
     }
 
     fn settings_field_count(&self) -> usize {
-        6 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes
+        6 + usize::from(self.mux_proxy_on_path())
     }
 
     pub fn get_field_value(&self, field: usize) -> String {
@@ -551,6 +628,10 @@ impl App {
             3 => self.memex_cfg.cache_mb.to_string(),
             4 => self.memex_cfg.log_level.clone(),
             5 => self.memex_cfg.max_request_bytes.to_string(),
+            6 => match self.memex_cfg.deployment_mode {
+                DeploymentMode::PerHostStdio => "Per-host (direct)".to_string(),
+                DeploymentMode::SharedMux => "Shared (mux)".to_string(),
+            },
             _ => String::new(),
         }
     }
@@ -584,6 +665,12 @@ impl App {
                     self.memex_cfg.max_request_bytes = v;
                 }
             }
+            6 => {
+                self.memex_cfg.deployment_mode = match self.memex_cfg.deployment_mode {
+                    DeploymentMode::PerHostStdio => DeploymentMode::SharedMux,
+                    DeploymentMode::SharedMux => DeploymentMode::PerHostStdio,
+                };
+            }
             _ => {}
         }
     }
@@ -593,6 +680,50 @@ impl App {
         if self.input_mode || self.data_setup.input_mode {
             self.handle_input_key(key);
             return;
+        }
+
+        if self.step == WizardStep::DataSetup
+            && self.data_setup.sub_step == DataSetupSubStep::Indexing
+        {
+            match key {
+                KeyCode::Char(' ') => {
+                    let next = if self.index_paused {
+                        IndexControl::Resume
+                    } else {
+                        IndexControl::Pause
+                    };
+                    if self.send_index_control(next) {
+                        self.index_paused = !self.index_paused;
+                    }
+                    return;
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.index_parallelism = self.index_parallelism.saturating_add(1);
+                    if !self
+                        .send_index_control(IndexControl::SetParallelism(self.index_parallelism))
+                    {
+                        self.index_parallelism = self.index_parallelism.saturating_sub(1).max(1);
+                    }
+                    return;
+                }
+                KeyCode::Char('-') => {
+                    let previous = self.index_parallelism;
+                    self.index_parallelism = self.index_parallelism.saturating_sub(1).max(1);
+                    if previous != self.index_parallelism
+                        && !self.send_index_control(IndexControl::SetParallelism(
+                            self.index_parallelism,
+                        ))
+                    {
+                        self.index_parallelism = previous;
+                    }
+                    return;
+                }
+                KeyCode::Char('s') => {
+                    let _ = self.send_index_control(IndexControl::Stop);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key {
@@ -857,6 +988,65 @@ impl App {
         }
     }
 
+    fn send_index_control(&mut self, control: IndexControl) -> bool {
+        let Some(tx) = self.index_control_tx.clone() else {
+            return false;
+        };
+
+        match tx.try_send(control) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.messages
+                    .push("[WARN] Index control queue is full; try again in a moment.".to_string());
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.messages
+                    .push("[WARN] Indexing controls are no longer available.".to_string());
+                self.index_control_tx = None;
+                false
+            }
+        }
+    }
+
+    pub fn current_index_telemetry(&self) -> Option<IndexTelemetrySnapshot> {
+        self.telemetry_rx
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
+
+    pub fn current_monitor_snapshot(&self) -> Option<MonitorSnapshot> {
+        self.monitor_rx
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
+
+    fn finish_indexing_from_snapshot(&mut self, snapshot: &IndexTelemetrySnapshot) {
+        if let Some(error) = &snapshot.fatal_error {
+            self.messages.push(format!(
+                "[ERR] Indexing failed after {}/{} files: {}",
+                snapshot.processed, snapshot.total, error
+            ));
+        } else if snapshot.stopped_early {
+            self.messages.push(format!(
+                "[WARN] Indexing stopped after {}/{} files ({} indexed, {} skipped, {} failed).",
+                snapshot.processed,
+                snapshot.total,
+                snapshot.indexed,
+                snapshot.skipped,
+                snapshot.failed
+            ));
+        } else {
+            self.messages.push(format!(
+                "[OK] Indexing finished: {} indexed, {} skipped, {} failed, {} chunks.",
+                snapshot.indexed, snapshot.skipped, snapshot.failed, snapshot.total_chunks
+            ));
+        }
+
+        self.data_setup.sub_step = DataSetupSubStep::Complete;
+        self.stop_indexing_tasks();
+    }
+
     /// Trigger the async health check
     pub fn trigger_health_check(&mut self) {
         self.health_running = true;
@@ -911,18 +1101,93 @@ impl App {
 
     /// Start the indexing task
     fn start_indexing_task(&mut self) {
-        if let Some(ref source_path) = self.data_setup.source_path
-            && let Some(ref namespace) = self.data_setup.namespace
-        {
-            let path = PathBuf::from(shellexpand::tilde(source_path).to_string());
-            let rx = start_indexing(
-                path,
-                namespace.clone(),
-                self.embedding_config.clone(),
-                self.memex_cfg.db_path.clone(),
-            );
-            self.index_progress_rx = Some(rx);
+        let Some(source_path) = self.data_setup.source_path.clone() else {
+            return;
+        };
+        let Some(namespace) = self.data_setup.namespace.clone() else {
+            return;
+        };
+
+        let path = match validate_path(&source_path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.data_setup.validation_error = Some(error.to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+        };
+
+        let files = match collect_indexable_files(&path) {
+            Ok(files) if !files.is_empty() => files,
+            Ok(_) => {
+                self.data_setup.validation_error =
+                    Some("No indexable files found in the selected directory.".to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+            Err(error) => {
+                self.data_setup.validation_error = Some(error.to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+        };
+
+        self.data_setup.validation_error = None;
+        self.messages.clear();
+        self.stop_indexing_tasks();
+
+        let total_files = files.len();
+        let (telemetry_tx, telemetry_rx) = new_index_telemetry();
+        let telemetry_tx: SharedIndexTelemetry = telemetry_tx;
+        let tui_sink = Arc::new(TuiTelemetrySink::new(Arc::new(telemetry_tx)));
+        let tracing_sink = Arc::new(TracingSink);
+        let sinks: Vec<Arc<dyn IndexEventSink>> = vec![tui_sink, tracing_sink];
+        let sink: Arc<dyn IndexEventSink> = Arc::new(FanOut::new(sinks));
+        let (control_tx, control_rx) =
+            mpsc::channel(crate::tui::indexer::INDEX_CONTROL_CHANNEL_CAPACITY);
+
+        self.index_task = Some(start_indexing(
+            path,
+            files,
+            namespace.clone(),
+            self.embedding_config.clone(),
+            self.memex_cfg.db_path.clone(),
+            sink,
+            control_rx,
+            self.index_parallelism,
+        ));
+
+        let (monitor_rx, monitor_task) = spawn_monitor(Duration::from_secs(1));
+
+        self.telemetry_rx = Some(telemetry_rx);
+        self.monitor_rx = Some(monitor_rx);
+        self.index_control_tx = Some(control_tx);
+        self.monitor_task = Some(monitor_task);
+        self.index_paused = false;
+        self.messages.push(format!(
+            "[INFO] Indexing {} files into namespace {}.",
+            total_files, namespace
+        ));
+    }
+
+    fn stop_indexing_tasks(&mut self) {
+        if let Some(handle) = self.index_task.take() {
+            handle.abort();
         }
+        if let Some(handle) = self.monitor_task.take() {
+            handle.abort();
+        }
+
+        self.telemetry_rx = None;
+        self.monitor_rx = None;
+        self.index_control_tx = None;
+        self.index_paused = false;
     }
 
     /// Perform LanceDB import
@@ -950,30 +1215,6 @@ impl App {
                 // Fallback for non-async context
                 self.messages
                     .push("[INFO] Import will use config path directly".to_string());
-            }
-        }
-    }
-
-    /// Check for indexing progress updates
-    pub fn poll_index_progress(&mut self) {
-        if let Some(ref mut rx) = self.index_progress_rx {
-            while let Ok(progress) = rx.try_recv() {
-                self.data_setup.progress = Some(progress.clone());
-                if progress.complete {
-                    if let Some(ref error) = progress.error {
-                        self.messages
-                            .push(format!("[ERR] Indexing failed: {}", error));
-                    } else {
-                        self.messages.push(format!(
-                            "[OK] Indexed {} files ({} skipped)",
-                            progress.processed - progress.skipped,
-                            progress.skipped
-                        ));
-                    }
-                    self.data_setup.sub_step = DataSetupSubStep::Complete;
-                    self.index_progress_rx = None;
-                    break;
-                }
             }
         }
     }
@@ -1211,10 +1452,24 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     };
 
     loop {
-        terminal.draw(|f| render(f, app))?;
+        let current_telemetry = app.current_index_telemetry();
+        if app.step == WizardStep::DataSetup
+            && app.data_setup.sub_step == DataSetupSubStep::Indexing
+            && let Some(snapshot) = current_telemetry.as_ref()
+            && snapshot.complete
+        {
+            app.finish_indexing_from_snapshot(snapshot);
+        }
+        let current_monitor = app.current_monitor_snapshot();
 
-        // Poll for index progress updates
-        app.poll_index_progress();
+        terminal.draw(|frame| {
+            render(
+                frame,
+                app,
+                current_telemetry.as_ref(),
+                current_monitor.as_ref(),
+            )
+        })?;
 
         // Handle async provider detection
         if app.embedder_state.detecting {
@@ -1244,6 +1499,7 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
 
         if app.should_quit {
+            app.stop_indexing_tasks();
             break;
         }
     }
