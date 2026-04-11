@@ -14,6 +14,7 @@ It exposes two explicit transport modes from a single canonical surface:
 ## Release Surface
 
 - Quick install: `curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh`
+- Prebuilt binary bundles: [GitHub Releases](https://github.com/VetCoders/rmcp-memex/releases) uploaded from locally built and signed artifacts
 - Release runbook: [docs/RELEASE.md](docs/RELEASE.md)
 - Configuration guide: [docs/02_configuration.md](docs/02_configuration.md)
 - HTTP/SSE reference: [docs/HTTP_API.md](docs/HTTP_API.md)
@@ -102,10 +103,10 @@ As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
 
 ```toml
 # Full library with CLI
-rmcp-memex = "0.4"
+rmcp-memex = "0.5"
 
 # Library only (no CLI dependencies)
-rmcp-memex = { version = "0.4", default-features = false }
+rmcp-memex = { version = "0.5", default-features = false }
 ```
 
 ### Basic Usage
@@ -496,7 +497,10 @@ MLX_MAX_BATCH_ITEMS=32
 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 ```
 
-**From source:**
+Prebuilt GitHub Release bundles are the canonical install path and avoid compiling
+the full LanceDB-heavy Rust dependency graph on the target machine.
+
+**From source (development only):**
 ```bash
 cargo install --path .
 ```
@@ -557,8 +561,8 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (status, db_path, embedding_provider) |
-| `/search` | POST | Vector search with optional layer filter |
-| `/sse/search` | GET | SSE streaming search (real-time results) |
+| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported) |
+| `/sse/search` | GET | SSE streaming search with optional `project`, `layer`, and `deep` filters |
 | `/upsert` | POST | Add/update document |
 | `/index` | POST | Full pipeline indexing with onion slices |
 | `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |
@@ -603,10 +607,10 @@ curl -X POST http://localhost:6660/upsert \
 # Search
 curl -X POST http://localhost:6660/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "context", "namespace": "agent1", "limit": 10}'
+  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5"
+curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
 ```
 
 ### Multi-Host Database Paths

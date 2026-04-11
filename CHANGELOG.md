@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-10
+
 ### Added
 - Regression coverage for BM25 rollback so a failed keyword-index write does not leave ghost LanceDB rows behind
 - Regression coverage for the SSE search `k` alias so transport-level top-k requests stay aligned with HTTP and MCP
