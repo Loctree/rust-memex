@@ -76,7 +76,7 @@ impl MonitorSnapshot {
     }
 }
 
-/// Spawn the system monitor sampler.
+/// Spawn the system monitor sampler with a latest-value watch channel.
 pub fn spawn_monitor(interval: Duration) -> (watch::Receiver<MonitorSnapshot>, JoinHandle<()>) {
     let (sender, receiver) = watch::channel(MonitorSnapshot::default());
     let handle = tokio::spawn(async move {

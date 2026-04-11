@@ -485,8 +485,8 @@ fn emit_stats_tick(state: &SchedulerState, sink: &Arc<dyn IndexEventSink>) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::time::Duration;
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
     use super::*;
     use crate::tui::indexer::contracts::INDEX_CONTROL_CHANNEL_CAPACITY;
