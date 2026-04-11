@@ -348,3 +348,96 @@ async fn test_has_content_hash() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn memory_upsert_replaces_onion_family_by_original_id() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage.clone()).await?;
+    let namespace = "memory-upsert-onion";
+    let initial_text = "This is a long document about indexing and embeddings. It exists to force onion slicing during the first upsert. \
+The content is intentionally verbose and repetitive so the outer and core layers both exist and can later be replaced cleanly. \
+Project Vista keeps appearing here to provide a stable metadata anchor for search filters.";
+    let updated_text = "This is an updated long document about project search filters, namespace cache invalidation, and release hardening. \
+It should fully replace the previous onion family instead of appending stale slices. \
+The text stays comfortably above the slicing threshold so onion-fast still writes both outer and core documents.";
+
+    rag.memory_upsert(
+        namespace,
+        "doc-1".to_string(),
+        initial_text.to_string(),
+        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+    )
+    .await?;
+
+    let initial_docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert_eq!(
+        initial_docs.len(),
+        2,
+        "onion-fast should create outer + core"
+    );
+    assert!(
+        initial_docs
+            .iter()
+            .all(|doc| doc.metadata["original_id"] == "doc-1")
+    );
+
+    let fetched = rag
+        .lookup_memory(namespace, "doc-1")
+        .await?
+        .ok_or_else(|| anyhow!("expected lookup by original id to resolve onion family"))?;
+    assert_eq!(fetched.layer, Some(SliceLayer::Outer));
+    assert_eq!(fetched.metadata["original_id"], "doc-1");
+
+    rag.memory_upsert(
+        namespace,
+        "doc-1".to_string(),
+        updated_text.to_string(),
+        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+    )
+    .await?;
+
+    let updated_docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert_eq!(
+        updated_docs.len(),
+        2,
+        "upsert should replace the onion family instead of duplicating it"
+    );
+    assert!(
+        updated_docs
+            .iter()
+            .all(|doc| doc.metadata["original_id"] == "doc-1")
+    );
+    assert!(
+        updated_docs
+            .iter()
+            .any(|doc| doc.document.contains("namespace cache invalidation")),
+        "updated content should be present in the stored family"
+    );
+
+    let deleted = rag.remove_memory(namespace, "doc-1").await?;
+    assert_eq!(
+        deleted, 2,
+        "remove_memory should delete the whole onion family"
+    );
+    assert!(
+        rag.storage_manager()
+            .get_all_in_namespace(namespace)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}

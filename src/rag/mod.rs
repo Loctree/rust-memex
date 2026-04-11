@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use pdf_extract;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -402,15 +402,15 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
 
     // Tokenize and count word frequencies
     let mut word_counts: HashMap<String, usize> = HashMap::new();
-    for word in text.split_whitespace() {
-        let cleaned: String = word
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-
-        if cleaned.len() >= 3 && !stop_set.contains(cleaned.as_str()) {
-            *word_counts.entry(cleaned).or_insert(0) += 1;
+    for raw in text.split_whitespace() {
+        for token in tokenize_keyword_candidates(raw) {
+            if token.len() >= 3
+                && token.len() <= 30
+                && !stop_set.contains(token.as_str())
+                && !looks_like_session_token(&token)
+            {
+                *word_counts.entry(token).or_insert(0) += 1;
+            }
         }
     }
 
@@ -423,6 +423,57 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
         .take(max_keywords)
         .map(|(word, _)| word)
         .collect()
+}
+
+fn tokenize_keyword_candidates(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    for segment in raw
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        let compact: String = segment.chars().flat_map(|ch| ch.to_lowercase()).collect();
+        let mut normalized = String::with_capacity(segment.len() * 2);
+        let mut previous_is_lowercase = false;
+
+        for ch in segment.chars() {
+            if ch.is_ascii_uppercase() && previous_is_lowercase {
+                normalized.push(' ');
+            }
+
+            normalized.push(ch.to_ascii_lowercase());
+            previous_is_lowercase = ch.is_ascii_lowercase();
+        }
+
+        let segment_tokens = normalized
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        tokens.extend(segment_tokens.iter().cloned());
+
+        if segment_tokens.len() > 1
+            && compact.len() >= 3
+            && compact.len() <= 30
+            && !tokens.iter().any(|token| token == &compact)
+        {
+            tokens.push(compact);
+        }
+    }
+
+    tokens
+}
+
+fn looks_like_session_token(token: &str) -> bool {
+    let hex_chars = token.chars().filter(|ch| ch.is_ascii_hexdigit()).count();
+    let digit_chars = token.chars().filter(|ch| ch.is_ascii_digit()).count();
+    let alpha_chars = token.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+
+    token.len() > 12 && hex_chars == token.len()
+        || digit_chars >= 6
+        || (token.len() > 20 && alpha_chars < token.len() / 3)
 }
 
 /// Create short hash for document deduplication
@@ -1140,18 +1191,101 @@ impl RAGPipeline {
             return Ok(());
         }
 
+        let mut unique_documents = Vec::with_capacity(documents.len());
+        let mut seen_ids: HashSet<(String, String)> = HashSet::new();
+        let mut seen_hashes: HashSet<(String, String)> = HashSet::new();
+
+        for mut document in documents {
+            if let Value::Object(ref mut map) = document.metadata {
+                map.entry("indexed_at".to_string())
+                    .or_insert_with(|| json!(chrono::Utc::now().to_rfc3339()));
+            }
+
+            let id_key = (document.namespace.clone(), document.id.clone());
+            if !seen_ids.insert(id_key) {
+                continue;
+            }
+
+            if let Some(hash) = document.content_hash.as_ref() {
+                let hash_key = (document.namespace.clone(), hash.clone());
+                if !seen_hashes.insert(hash_key) {
+                    continue;
+                }
+            }
+
+            unique_documents.push(document);
+        }
+
+        let documents = self
+            .filter_documents_against_store(unique_documents)
+            .await?;
+        if documents.is_empty() {
+            return Ok(());
+        }
+
         let bm25_documents: Vec<(String, String, String)> = documents
             .iter()
             .map(|doc| (doc.id.clone(), doc.namespace.clone(), doc.document.clone()))
             .collect();
+        let inserted_ids: Vec<(String, String)> = documents
+            .iter()
+            .map(|doc| (doc.namespace.clone(), doc.id.clone()))
+            .collect();
 
         self.storage.add_to_store(documents).await?;
 
-        if let Some(bm25_writer) = &self.bm25_writer {
-            bm25_writer.add_documents(&bm25_documents).await?;
+        if let Some(bm25_writer) = &self.bm25_writer
+            && let Err(error) = bm25_writer.add_documents(&bm25_documents).await
+        {
+            for (namespace, id) in &inserted_ids {
+                let _ = self.storage.delete_document(namespace, id).await;
+            }
+            return Err(error);
         }
 
         Ok(())
+    }
+
+    async fn filter_documents_against_store(
+        &self,
+        documents: Vec<ChromaDocument>,
+    ) -> Result<Vec<ChromaDocument>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut hashes_by_namespace: HashMap<String, Vec<String>> = HashMap::new();
+        for document in &documents {
+            if let Some(hash) = document.content_hash.as_ref() {
+                hashes_by_namespace
+                    .entry(document.namespace.clone())
+                    .or_default()
+                    .push(hash.clone());
+            }
+        }
+
+        let mut allowed_hashes: HashMap<String, HashSet<String>> = HashMap::new();
+        for (namespace, hashes) in hashes_by_namespace {
+            let hashes = self
+                .storage
+                .filter_existing_hashes(&namespace, &hashes)
+                .await?;
+            allowed_hashes.insert(
+                namespace,
+                hashes.into_iter().cloned().collect::<HashSet<_>>(),
+            );
+        }
+
+        Ok(documents
+            .into_iter()
+            .filter(|document| match document.content_hash.as_ref() {
+                None => true,
+                Some(hash) => allowed_hashes
+                    .get(&document.namespace)
+                    .map(|hashes| hashes.contains(hash))
+                    .unwrap_or(true),
+            })
+            .collect())
     }
 
     async fn clear_namespace_from_indices(&self, namespace: &str) -> Result<usize> {
@@ -1164,14 +1298,71 @@ impl RAGPipeline {
         Ok(deleted)
     }
 
-    async fn delete_memory_from_indices(&self, namespace: &str, id: &str) -> Result<usize> {
-        let deleted = self.storage.delete_document(namespace, id).await?;
+    async fn load_memory_family(&self, namespace: &str, id: &str) -> Result<Vec<ChromaDocument>> {
+        let docs = self.storage.get_all_in_namespace(namespace).await?;
+        Ok(docs
+            .into_iter()
+            .filter(|doc| {
+                doc.id == id
+                    || doc
+                        .metadata
+                        .get("original_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|original_id| original_id == id)
+            })
+            .collect())
+    }
 
-        if let Some(bm25_writer) = &self.bm25_writer {
-            bm25_writer.delete_documents(&[id.to_string()]).await?;
+    async fn delete_memory_family(&self, namespace: &str, id: &str) -> Result<usize> {
+        let family = self.load_memory_family(namespace, id).await?;
+        if family.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted = 0usize;
+        let mut ids = Vec::with_capacity(family.len());
+
+        for document in family {
+            deleted += self
+                .storage
+                .delete_document(namespace, &document.id)
+                .await?
+                .min(1);
+            ids.push(document.id);
+        }
+
+        if let Some(bm25_writer) = &self.bm25_writer
+            && !ids.is_empty()
+        {
+            bm25_writer.delete_documents(&ids).await?;
         }
 
         Ok(deleted)
+    }
+
+    fn preferred_memory_family_document(
+        mut family: Vec<ChromaDocument>,
+        requested_id: &str,
+    ) -> Option<ChromaDocument> {
+        fn rank(layer: Option<SliceLayer>) -> u8 {
+            match layer {
+                None => 0,
+                Some(SliceLayer::Outer) => 1,
+                Some(SliceLayer::Middle) => 2,
+                Some(SliceLayer::Inner) => 3,
+                Some(SliceLayer::Core) => 4,
+            }
+        }
+
+        family.sort_by_key(|document| {
+            if document.id == requested_id {
+                (0_u8, 0_u8)
+            } else {
+                (1_u8, rank(document.slice_layer()))
+            }
+        });
+
+        family.into_iter().next()
     }
 
     /// Get which MLX server we're connected to (for health/status reporting)
@@ -1953,9 +2144,25 @@ impl RAGPipeline {
         text: String,
         metadata: serde_json::Value,
     ) -> Result<()> {
-        // Use Flat mode to preserve the user-provided ID (no onion slicing)
-        // This ensures lookup_memory(id) will find the exact record
-        self.index_text_with_mode(Some(namespace), id, text, metadata, SliceMode::Flat)
+        let slice_mode = match metadata
+            .get("slice_mode")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("onion") => SliceMode::Onion,
+            Some("onion-fast") | Some("onion_fast") | Some("fast") => SliceMode::OnionFast,
+            Some("flat") | None => SliceMode::Flat,
+            Some(other) => {
+                return Err(anyhow!(
+                    "Unsupported metadata.slice_mode '{}'. Use 'flat', 'onion', or 'onion-fast'.",
+                    other
+                ));
+            }
+        };
+
+        self.delete_memory_family(namespace, &id).await?;
+        self.index_text_with_mode(Some(namespace), id, text, metadata, slice_mode)
             .await?;
         Ok(())
     }
@@ -1975,11 +2182,30 @@ impl RAGPipeline {
                 keywords: doc.keywords,
             }));
         }
+
+        if let Some(doc) = Self::preferred_memory_family_document(
+            self.load_memory_family(namespace, id).await?,
+            id,
+        ) {
+            let layer = doc.slice_layer();
+            return Ok(Some(SearchResult {
+                id: doc.id,
+                namespace: doc.namespace,
+                text: doc.document,
+                score: 1.0,
+                metadata: doc.metadata,
+                layer,
+                parent_id: doc.parent_id,
+                children_ids: doc.children_ids,
+                keywords: doc.keywords,
+            }));
+        }
+
         Ok(None)
     }
 
     pub async fn remove_memory(&self, namespace: &str, id: &str) -> Result<usize> {
-        self.delete_memory_from_indices(namespace, id).await
+        self.delete_memory_family(namespace, id).await
     }
 
     pub async fn clear_namespace(&self, namespace: &str) -> Result<usize> {
@@ -2010,6 +2236,7 @@ impl RAGPipeline {
             k,
             SearchOptions {
                 layer_filter: layer,
+                project_filter: None,
             },
         )
         .await
@@ -2039,16 +2266,25 @@ impl RAGPipeline {
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         let query_embedding = self.embed_query(query).await?;
+        let candidate_multiplier = if options.project_filter.is_some() {
+            8
+        } else {
+            3
+        };
 
-        let candidates = self
+        let mut candidates = self
             .storage
             .search_store_with_layer(
                 namespace,
                 query_embedding.clone(),
-                k * 3,
+                k * candidate_multiplier,
                 options.layer_filter,
             )
             .await?;
+
+        if let Some(project) = options.project_filter.as_deref() {
+            candidates.retain(|candidate| metadata_matches_project(&candidate.metadata, project));
+        }
 
         // Rerank if we have candidates
         if !candidates.is_empty() {
@@ -2763,10 +2999,12 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 }
 
 /// Options for search operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     /// Filter by onion slice layer (None = all layers)
     pub layer_filter: Option<SliceLayer>,
+    /// Optional project identifier from metadata (e.g. project / project_id)
+    pub project_filter: Option<String>,
 }
 
 impl SearchOptions {
@@ -2774,12 +3012,21 @@ impl SearchOptions {
     pub fn outer_only() -> Self {
         Self {
             layer_filter: Some(SliceLayer::Outer),
+            project_filter: None,
         }
     }
 
     /// Deep search - include all layers including Core
     pub fn deep() -> Self {
-        Self { layer_filter: None }
+        Self {
+            layer_filter: None,
+            project_filter: None,
+        }
+    }
+
+    pub fn with_project(mut self, project: Option<String>) -> Self {
+        self.project_filter = project.filter(|value| !value.trim().is_empty());
+        self
     }
 }
 
@@ -2787,6 +3034,21 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self::outer_only()
     }
+}
+
+fn metadata_matches_project(metadata: &Value, project: &str) -> bool {
+    let needle = project.trim();
+    if needle.is_empty() {
+        return true;
+    }
+
+    metadata.as_object().is_some_and(|object| {
+        ["project", "project_id", "source_project"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .filter_map(|value| value.as_str())
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2860,7 +3122,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::hash_content;
+    use super::{
+        SearchOptions, SliceLayer, extract_keywords, hash_content, metadata_matches_project,
+    };
+    use serde_json::json;
 
     #[test]
     fn short_hash_uses_sha256_prefix_with_minimum_length() {
@@ -2868,5 +3133,44 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(hash, hash_content("same content"));
+    }
+
+    #[test]
+    fn keyword_extraction_splits_paths_and_filters_session_tokens() {
+        let keywords = extract_keywords(
+            "/Users/silver/Git/tools/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            10,
+        );
+
+        assert!(keywords.contains(&"users".to_string()));
+        assert!(keywords.contains(&"twinsweep".to_string()));
+        assert!(!keywords.iter().any(|keyword| keyword.contains("2ff4de8b")));
+    }
+
+    #[test]
+    fn search_options_can_carry_project_filter() {
+        let options = SearchOptions::deep().with_project(Some("Vista".to_string()));
+        assert_eq!(options.layer_filter, None);
+        assert_eq!(options.project_filter.as_deref(), Some("Vista"));
+    }
+
+    #[test]
+    fn project_match_uses_metadata_fields() {
+        assert!(metadata_matches_project(
+            &json!({"project": "Vista"}),
+            "vista"
+        ));
+        assert!(metadata_matches_project(
+            &json!({"project_id": "VetCoders"}),
+            "vetcoders"
+        ));
+        assert!(!metadata_matches_project(
+            &json!({"project": "rmcp-memex"}),
+            "vista"
+        ));
+        assert_eq!(
+            SearchOptions::default().layer_filter,
+            Some(SliceLayer::Outer)
+        );
     }
 }

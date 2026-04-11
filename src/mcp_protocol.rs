@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     embeddings::EmbeddingClient,
     query::{QueryRouter, SearchModeRecommendation},
-    rag::{RAGPipeline, SliceLayer},
+    rag::{RAGPipeline, SearchOptions, SliceLayer},
     search::{HybridSearcher, SearchMode},
     security::NamespaceAccessManager,
 };
@@ -219,6 +219,7 @@ impl McpTool {
                         "query": {"type": "string"},
                         "k": {"type": "integer", "default": 10},
                         "namespace": {"type": "string"},
+                        "project": {"type": "string", "description": "Filter to documents whose metadata project/project_id matches this value"},
                         "deep": {"type": "boolean", "default": false, "description": "Include all onion layers instead of only outer summaries"},
                         "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
                         "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
@@ -263,6 +264,7 @@ impl McpTool {
                         "namespace": {"type": "string"},
                         "query": {"type": "string"},
                         "k": {"type": "integer", "default": 5},
+                        "project": {"type": "string", "description": "Filter to documents whose metadata project/project_id matches this value"},
                         "deep": {"type": "boolean", "default": false, "description": "Include all onion layers instead of only outer summaries"},
                         "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
                         "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."},
@@ -538,14 +540,14 @@ impl McpCore {
                 let limit = requested_limit(args, 10);
                 let namespace = args["namespace"].as_str();
                 let mode = requested_search_mode(query, args);
-                let layer_filter = requested_layer_filter(args);
+                let options = requested_search_options(args);
 
                 if let Some(hybrid_result) = self
                     .try_hybrid_search(
                         query,
                         namespace,
                         limit,
-                        (mode, layer_filter),
+                        (mode, options.clone()),
                         id,
                         SearchShape::Rag,
                     )
@@ -554,7 +556,11 @@ impl McpCore {
                     return Ok(hybrid_result);
                 }
 
-                match self.rag.search_inner(namespace, query, limit).await {
+                match self
+                    .rag
+                    .search_with_options(namespace, query, limit, options)
+                    .await
+                {
                     Ok(results) => Ok(text_result_from_json(&results)),
                     Err(e) => Ok(tool_error(e)),
                 }
@@ -609,14 +615,14 @@ impl McpCore {
                 let query = args["query"].as_str().unwrap_or("");
                 let limit = requested_limit(args, 5);
                 let mode = requested_search_mode(query, args);
-                let layer_filter = requested_layer_filter(args);
+                let options = requested_search_options(args);
 
                 if let Some(hybrid_result) = self
                     .try_hybrid_search(
                         query,
                         Some(namespace),
                         limit,
-                        (mode, layer_filter),
+                        (mode, options.clone()),
                         id,
                         SearchShape::Memory,
                     )
@@ -625,7 +631,11 @@ impl McpCore {
                     return Ok(hybrid_result);
                 }
 
-                match self.rag.search_memory(namespace, query, limit).await {
+                match self
+                    .rag
+                    .search_with_options(Some(namespace), query, limit, options)
+                    .await
+                {
                     Ok(results) => Ok(text_result_from_json(&results)),
                     Err(e) => Ok(tool_error(e)),
                 }
@@ -818,11 +828,11 @@ impl McpCore {
         query: &str,
         namespace: Option<&str>,
         limit: usize,
-        search: (SearchMode, Option<SliceLayer>),
+        search: (SearchMode, SearchOptions),
         id: &Value,
         shape: SearchShape,
     ) -> std::result::Result<Option<Value>, Value> {
-        let (mode, layer_filter) = search;
+        let (mode, options) = search;
         if mode == SearchMode::Vector {
             return Ok(None);
         }
@@ -840,7 +850,7 @@ impl McpCore {
             .map_err(|e| jsonrpc_error(Some(id), -32603, format!("Embedding failed: {}", e)))?;
 
         let results = hybrid_searcher
-            .search(query, query_embedding, namespace, limit, layer_filter)
+            .search(query, query_embedding, namespace, limit, options)
             .await
             .map_err(|e| jsonrpc_error(Some(id), -32603, format!("Hybrid search failed: {}", e)))?;
 
@@ -913,9 +923,20 @@ fn requested_layer_filter(args: &Value) -> Option<SliceLayer> {
     }
 }
 
+fn requested_search_options(args: &Value) -> SearchOptions {
+    SearchOptions {
+        layer_filter: requested_layer_filter(args),
+        project_filter: args["project"]
+            .as_str()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
+}
+
 fn requested_limit(args: &Value, default: usize) -> usize {
     args["k"]
         .as_u64()
+        .or_else(|| args["limit"].as_u64())
         .map(|value| value as usize)
         .unwrap_or(default)
 }
@@ -1029,9 +1050,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 mod tests {
     use super::{
         jsonrpc_error, jsonrpc_success, parse_jsonrpc_payload, requested_layer_filter,
-        requested_limit, shared_initialize_result, shared_tools_list_result,
+        requested_limit, requested_search_options, shared_initialize_result,
+        shared_tools_list_result,
     };
-    use crate::rag::SliceLayer;
+    use crate::rag::{SearchOptions, SliceLayer};
     use serde_json::{Value, json};
 
     #[test]
@@ -1117,6 +1139,11 @@ mod tests {
     }
 
     #[test]
+    fn requested_limit_accepts_limit_alias() {
+        assert_eq!(requested_limit(&json!({"limit": 11}), 5), 11);
+    }
+
+    #[test]
     fn requested_layer_filter_defaults_to_outer_only() {
         assert_eq!(requested_layer_filter(&json!({})), Some(SliceLayer::Outer));
     }
@@ -1124,5 +1151,16 @@ mod tests {
     #[test]
     fn requested_layer_filter_allows_deep_search() {
         assert_eq!(requested_layer_filter(&json!({"deep": true})), None);
+    }
+
+    #[test]
+    fn requested_search_options_captures_project_filter() {
+        assert_eq!(
+            requested_search_options(&json!({"project": "Vista"})),
+            SearchOptions {
+                layer_filter: Some(SliceLayer::Outer),
+                project_filter: Some("Vista".to_string()),
+            }
+        );
     }
 }

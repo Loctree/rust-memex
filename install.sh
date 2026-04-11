@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# rmcp-memex installer
+# rmcp-memex installer for prebuilt GitHub Release bundles
 # curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 # or with a specific release tag:
-# RMCP_MEMEX_VERSION=v0.4.1 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+# RMCP_MEMEX_VERSION=v0.5.0 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 
 set -euo pipefail
 

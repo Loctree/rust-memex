@@ -42,7 +42,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, EmbeddingClient, EmbeddingConfig};
-use crate::rag::{SearchResult, SliceLayer};
+use crate::rag::{SearchOptions, SearchResult, SliceLayer};
 use crate::search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
 };
@@ -698,7 +698,13 @@ impl MemexEngine {
 
         // Perform hybrid search
         let results = hybrid
-            .search(query, query_embedding, Some(&self.namespace), limit, None)
+            .search(
+                query,
+                query_embedding,
+                Some(&self.namespace),
+                limit,
+                SearchOptions::default(),
+            )
             .await?;
 
         debug!("Hybrid search returned {} results", results.len());

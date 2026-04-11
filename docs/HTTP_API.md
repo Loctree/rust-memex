@@ -51,7 +51,7 @@ Example response:
 {
   "status": "ok",
   "hint": "OK",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "db_path": "/Users/you/.rmcp-servers/rmcp-memex/lancedb",
   "embedding_provider": "ollama-local",
   "total_documents": 27455,
@@ -92,7 +92,7 @@ Example response:
 | `/get/{ns}/{id}` | GET | Fetch one document |
 | `/expand/{ns}/{id}` | GET | Expand an onion slice to children |
 | `/parent/{ns}/{id}` | GET | Fetch the parent slice |
-| `/search` | POST | Search with optional namespace filter |
+| `/search` | POST | Search with optional namespace, project, layer, and deep filters (`k` alias supported) |
 | `/cross-search` | GET | Search across namespaces |
 | `/sse/search` | GET | Streaming single-namespace search |
 | `/sse/cross-search` | GET | Streaming cross-namespace search |
@@ -125,7 +125,7 @@ These remain useful for legacy clients, but new code should prefer `GET /api/dis
 ```bash
 curl -X POST http://localhost:6666/search \
   -H "Content-Type: application/json" \
-  -d '{"query":"rust async","namespace":"kodowanie","limit":10}'
+  -d '{"query":"rust async","namespace":"kodowanie","k":10,"project":"Vista","deep":true}'
 ```
 
 Representative response:

@@ -55,7 +55,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
-use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
+use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
 use crate::storage::ChromaDocument;
 
 // ============================================================================
@@ -398,8 +398,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
         <div class="search-box">
             <input type="text" id="search-input" placeholder="Search memories..." autocomplete="off">
+            <input type="text" id="project-input" placeholder="Project filter (optional)" autocomplete="off">
             <select id="namespace-select">
                 <option value="">All namespaces</option>
+            </select>
+            <select id="layer-select">
+                <option value="">Outer Only</option>
+                <option value="deep">All Layers</option>
+                <option value="1">Outer</option>
+                <option value="2">Middle</option>
+                <option value="3">Inner</option>
+                <option value="4">Core</option>
             </select>
             <button onclick="doSearch()">Search</button>
         </div>
@@ -603,12 +612,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             list.innerHTML = '<div class="loading">Searching...</div>';
 
             const namespace = document.getElementById('namespace-select').value || null;
+            const project = document.getElementById('project-input').value.trim() || null;
+            const layerValue = document.getElementById('layer-select').value;
+            const body = { query, namespace, limit: 20, project };
+            if (layerValue === 'deep') {
+                body.deep = true;
+            } else if (layerValue) {
+                body.layer = Number(layerValue);
+            }
 
             try {
                 const res = await fetch(`${API}/search`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query, namespace, limit: 20 })
+                    body: JSON.stringify(body)
                 });
                 const data = await res.json();
 
@@ -889,11 +906,15 @@ pub struct SearchRequest {
     pub query: String,
     #[serde(default)]
     pub namespace: Option<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", alias = "k")]
     pub limit: usize,
     /// Optional layer filter for onion slices
     #[serde(default)]
     pub layer: Option<u8>,
+    #[serde(default)]
+    pub deep: bool,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -1006,6 +1027,12 @@ pub struct SseSearchParams {
     pub namespace: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub deep: bool,
+    #[serde(default)]
+    pub layer: Option<u8>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Cross-search request - search across all namespaces
@@ -1287,6 +1314,30 @@ async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
     }
 }
 
+async fn refresh_namespace_cache(state: &HttpState) {
+    match state.rag.storage_manager().list_namespaces().await {
+        Ok(ns_list) => {
+            let namespaces: Vec<NamespaceInfo> = ns_list
+                .into_iter()
+                .map(|(name, count)| NamespaceInfo { name, count })
+                .collect();
+            *state.cached_namespaces.write().await = Some(namespaces);
+        }
+        Err(error) => {
+            warn!("Namespace cache refresh failed: {}", error);
+        }
+    }
+}
+
+async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
+    state
+        .namespace_activity
+        .write()
+        .await
+        .insert(namespace.to_string(), chrono::Utc::now().to_rfc3339());
+    refresh_namespace_cache(state).await;
+}
+
 fn namespaces_response_from_snapshot(snapshot: &DiscoverySnapshot) -> NamespacesResponse {
     NamespacesResponse {
         total: snapshot.namespaces.len(),
@@ -1458,6 +1509,7 @@ async fn refresh_handler(
             format!("Refresh failed: {}", e),
         )
     })?;
+    refresh_namespace_cache(&state).await;
 
     Ok(Json(serde_json::json!({
         "status": "refreshed",
@@ -1471,34 +1523,31 @@ async fn search_handler(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let start = std::time::Instant::now();
-
-    let results = if let Some(layer_u8) = req.layer {
-        // Search with layer filter
-        let layer = SliceLayer::from_u8(layer_u8);
-        state
-            .rag
-            .memory_search_with_layer(
-                req.namespace.as_deref().unwrap_or("default"),
-                &req.query,
-                req.limit,
-                layer,
-            )
-            .await
+    let layer_filter = if req.deep {
+        None
     } else {
-        // Regular search
-        state
-            .rag
-            .search_memory(
-                req.namespace.as_deref().unwrap_or("default"),
-                &req.query,
-                req.limit,
-            )
-            .await
-    }
-    .map_err(|e| {
-        error!("Search error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+        req.layer
+            .and_then(SliceLayer::from_u8)
+            .or(Some(SliceLayer::Outer))
+    };
+    let options = SearchOptions {
+        layer_filter,
+        project_filter: req.project.clone().filter(|value| !value.trim().is_empty()),
+    };
+
+    let results = state
+        .rag
+        .search_with_options(
+            Some(req.namespace.as_deref().unwrap_or("default")),
+            &req.query,
+            req.limit,
+            options,
+        )
+        .await
+        .map_err(|e| {
+            error!("Search error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     let count = results.len();
     let search_results: Vec<SearchResultJson> = results.into_iter().map(Into::into).collect();
@@ -1524,12 +1573,28 @@ async fn sse_search_handler(
             .data(serde_json::json!({
                 "query": params.query,
                 "namespace": params.namespace,
-                "limit": params.limit
+                "limit": params.limit,
+                "deep": params.deep,
+                "layer": params.layer,
+                "project": params.project
             }).to_string()));
 
         let namespace = params.namespace.as_deref().unwrap_or("default");
+        let layer_filter = if params.deep {
+            None
+        } else {
+            params.layer.and_then(SliceLayer::from_u8).or(Some(SliceLayer::Outer))
+        };
+        let options = SearchOptions {
+            layer_filter,
+            project_filter: params.project.clone().filter(|value| !value.trim().is_empty()),
+        };
 
-        match state.rag.search_memory(namespace, &params.query, params.limit).await {
+        match state
+            .rag
+            .search_with_options(Some(namespace), &params.query, params.limit, options)
+            .await
+        {
             Ok(results) => {
                 let total = results.len();
 
@@ -2004,12 +2069,7 @@ async fn upsert_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Track namespace activity for discovery endpoint
-    state
-        .namespace_activity
-        .write()
-        .await
-        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
+    mark_namespace_activity(&state, &req.namespace).await;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -2056,12 +2116,7 @@ async fn index_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Track namespace activity for discovery endpoint
-    state
-        .namespace_activity
-        .write()
-        .await
-        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
+    mark_namespace_activity(&state, &req.namespace).await;
 
     Ok(Json(serde_json::json!({
         "status": "indexed",
@@ -2140,11 +2195,16 @@ async fn delete_handler(
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.remove_memory(&ns, &id).await {
-        Ok(deleted) => Ok(Json(serde_json::json!({
-            "status": if deleted > 0 { "deleted" } else { "not_found" },
-            "id": id,
-            "namespace": ns
-        }))),
+        Ok(deleted) => {
+            if deleted > 0 {
+                refresh_namespace_cache(&state).await;
+            }
+            Ok(Json(serde_json::json!({
+                "status": if deleted > 0 { "deleted" } else { "not_found" },
+                "id": id,
+                "namespace": ns
+            })))
+        }
         Err(e) => {
             error!("Delete error: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -2158,11 +2218,15 @@ async fn purge_namespace_handler(
     Path(namespace): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.clear_namespace(&namespace).await {
-        Ok(deleted) => Ok(Json(serde_json::json!({
-            "status": "purged",
-            "namespace": namespace,
-            "deleted_count": deleted
-        }))),
+        Ok(deleted) => {
+            state.namespace_activity.write().await.remove(&namespace);
+            refresh_namespace_cache(&state).await;
+            Ok(Json(serde_json::json!({
+                "status": "purged",
+                "namespace": namespace,
+                "deleted_count": deleted
+            })))
+        }
         Err(e) => {
             error!("Purge error: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -2448,6 +2512,17 @@ mod tests {
         assert_eq!(req.limit, 10);
         assert!(req.namespace.is_none());
         assert!(req.layer.is_none());
+        assert!(!req.deep);
+        assert!(req.project.is_none());
+    }
+
+    #[test]
+    fn test_search_request_accepts_k_alias() {
+        let json = r#"{"query": "test", "k": 7, "deep": true, "project": "Vista"}"#;
+        let req: SearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.limit, 7);
+        assert!(req.deep);
+        assert_eq!(req.project.as_deref(), Some("Vista"));
     }
 
     #[test]
