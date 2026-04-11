@@ -259,7 +259,7 @@ pub enum Commands {
         progress: bool,
 
         /// Resume from last checkpoint if interrupted.
-        /// Saves progress after each file to .index-checkpoint.json.
+        /// Saves progress after each committed file to .index-checkpoint-<namespace>.json.
         /// On restart, skips already indexed files and continues.
         #[arg(long)]
         resume: bool,
@@ -267,7 +267,7 @@ pub enum Commands {
         /// Enable async pipeline mode for concurrent indexing.
         /// Runs file reading, chunking, embedding, and storage in parallel
         /// using tokio channels. Can significantly speed up large batch operations.
-        /// Note: Pipeline mode ignores --progress and --resume flags.
+        /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
 

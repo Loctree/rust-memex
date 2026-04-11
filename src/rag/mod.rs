@@ -20,7 +20,8 @@ use crate::{
 // Async pipeline module for concurrent indexing
 pub mod pipeline;
 pub use pipeline::{
-    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineResult, PipelineStats, run_pipeline,
+    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineResult,
+    PipelineSnapshot, PipelineStats, run_pipeline,
 };
 
 const DEFAULT_NAMESPACE: &str = "rag";

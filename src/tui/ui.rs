@@ -5,13 +5,19 @@
 use crate::tui::app::{App, WizardStep};
 use crate::tui::detection::ProviderStatus;
 use crate::tui::health::CheckStatus;
-use crate::tui::indexer::{DataSetupOption, DataSetupSubStep, ImportMode};
+use crate::tui::indexer::{DataSetupOption, DataSetupSubStep, ImportMode, IndexTelemetrySnapshot};
+use crate::tui::monitor::{GpuStatus, MonitorSnapshot};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(
+    frame: &mut Frame,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -22,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     render_header(frame, chunks[0], app);
-    render_main(frame, chunks[1], app);
+    render_main(frame, chunks[1], app, telemetry, monitor);
     render_footer(frame, chunks[2], app);
 }
 
@@ -77,7 +83,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 DataSetupSubStep::SelectImportMode => {
                     " [Up/Down] Select | [Enter] Choose | [<-] Back "
                 }
-                DataSetupSubStep::Indexing => " Indexing in progress... ",
+                DataSetupSubStep::Indexing => {
+                    let telemetry = app.telemetry_rx.as_ref().map(|rx| rx.borrow().clone());
+                    if telemetry.as_ref().map(|s| s.complete).unwrap_or(false) {
+                        " [->] Next | [<-] Back | [q] Quit "
+                    } else if telemetry
+                        .as_ref()
+                        .map(|s| s.paused)
+                        .unwrap_or(app.index_paused)
+                    {
+                        " [Space] Resume | [+] Par+ | [-] Par- | [s] Stop | [q] Quit "
+                    } else {
+                        " [Space] Pause | [+] Par+ | [-] Par- | [s] Stop | [q] Quit "
+                    }
+                }
                 DataSetupSubStep::Complete => " [->] Next | [<-] Back | [q] Quit ",
             },
             WizardStep::Summary => " [Enter] Write Configs | [<-] Back | [q] Quit ",
@@ -96,7 +115,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(help, area);
 }
 
-fn render_main(frame: &mut Frame, area: Rect, app: &App) {
+fn render_main(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
     match app.step {
         WizardStep::Welcome => render_welcome(frame, area, app),
         WizardStep::EmbedderSetup => render_embedder_setup(frame, area, app),
@@ -104,7 +129,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         WizardStep::HostSelection => render_host_selection(frame, area, app),
         WizardStep::SnippetPreview => render_snippet_preview(frame, area, app),
         WizardStep::HealthCheck => render_health_check(frame, area, app),
-        WizardStep::DataSetup => render_data_setup(frame, area, app),
+        WizardStep::DataSetup => render_data_setup(frame, area, app, telemetry, monitor),
         WizardStep::Summary => render_summary(frame, area, app),
     }
 }
@@ -525,7 +550,18 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
+fn render_data_setup(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
+    if app.data_setup.sub_step == DataSetupSubStep::Indexing {
+        render_indexing_dashboard(frame, area, telemetry, monitor);
+        return;
+    }
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Data Setup",
@@ -568,6 +604,13 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 format!("> {}|", app.data_setup.input_buffer),
                 Style::default().fg(Color::Yellow),
             )));
+            if let Some(error) = &app.data_setup.validation_error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
         DataSetupSubStep::EnterNamespace => {
             lines.push(Line::from("Enter namespace for indexed documents:"));
@@ -581,6 +624,13 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 "(Leave empty for default 'rag' namespace)",
                 Style::default().fg(Color::DarkGray),
             )));
+            if let Some(error) = &app.data_setup.validation_error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
         DataSetupSubStep::SelectImportMode => {
             lines.push(Line::from("Select import mode:"));
@@ -601,33 +651,7 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
         }
-        DataSetupSubStep::Indexing => {
-            lines.push(Line::from(Span::styled(
-                "Indexing in progress...",
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(""));
-
-            if let Some(ref progress) = app.data_setup.progress {
-                let percentage = if progress.total > 0 {
-                    (progress.processed as f64 / progress.total as f64 * 100.0) as u16
-                } else {
-                    0
-                };
-
-                lines.push(Line::from(format!(
-                    "Progress: {}/{} files ({:.1}%)",
-                    progress.processed, progress.total, percentage as f64
-                )));
-
-                if !progress.current_file.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("Current: {}", progress.current_file),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-        }
+        DataSetupSubStep::Indexing => {}
         DataSetupSubStep::Complete => {
             lines.push(Line::from(Span::styled(
                 "Data setup complete!",
@@ -640,6 +664,8 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Green)
                 } else if msg.starts_with("[ERR]") {
                     Style::default().fg(Color::Red)
+                } else if msg.starts_with("[WARN]") {
+                    Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
                 };
@@ -658,6 +684,210 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_indexing_dashboard(
+    frame: &mut Frame,
+    area: Rect,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(4)])
+        .split(area);
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(outer[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(6)])
+        .split(main[0]);
+
+    let ratio = telemetry
+        .map(|snapshot| {
+            if snapshot.total == 0 {
+                0.0
+            } else {
+                snapshot.processed as f64 / snapshot.total as f64
+            }
+        })
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+
+    let progress_label = telemetry
+        .map(|snapshot| format!("{}/{}", snapshot.processed, snapshot.total))
+        .unwrap_or_else(|| "waiting".to_string());
+    let progress_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Index Progress "),
+        )
+        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(progress_label);
+    frame.render_widget(progress_gauge, left[0]);
+
+    let left_lines = if let Some(snapshot) = telemetry {
+        let status = if snapshot.complete {
+            "complete"
+        } else if snapshot.stopping {
+            "stopping"
+        } else if snapshot.paused {
+            "paused"
+        } else {
+            "running"
+        };
+        vec![
+            Line::from(format!("Rate: {:.2} files/sec", snapshot.files_per_sec)),
+            Line::from(format!("ETA: {}", format_eta(snapshot.eta_secs))),
+            Line::from(format!("State: {}", status)),
+            Line::from(format!(
+                "Parallelism: {} | Inflight: {}",
+                snapshot.parallelism, snapshot.in_flight
+            )),
+            Line::from(format!(
+                "Indexed: {} | Skipped: {} | Failed: {}",
+                snapshot.indexed, snapshot.skipped, snapshot.failed
+            )),
+            Line::from(format!("Current file: {}", current_file_label(snapshot))),
+        ]
+    } else {
+        vec![
+            Line::from("Waiting for indexing telemetry..."),
+            Line::from(""),
+            Line::from("The scheduler will publish live stats here."),
+        ]
+    };
+    let left_stats = Paragraph::new(left_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Operator Stats "),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(left_stats, left[1]);
+
+    let right_lines = if let Some(snapshot) = monitor {
+        let gpu_status = match &snapshot.gpu_status {
+            GpuStatus::Available { class_name } => format!("available ({class_name})"),
+            GpuStatus::Unavailable { reason } => format!("unavailable ({reason})"),
+        };
+        vec![
+            Line::from(format!("System CPU: {:.1}%", snapshot.system_cpu_percent)),
+            Line::from(format!(
+                "System RAM: {} / {}",
+                MonitorSnapshot::format_bytes(snapshot.system_ram_used),
+                MonitorSnapshot::format_bytes(snapshot.system_ram_total)
+            )),
+            Line::from(format!("rmcp-memex CPU: {:.1}%", snapshot.rmcp_memex_cpu)),
+            Line::from(format!(
+                "rmcp-memex RSS: {}",
+                MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss)
+            )),
+            Line::from(format!(
+                "Embedder CPU: {:.1}%",
+                snapshot.embedder_cpu_aggregate
+            )),
+            Line::from(format!(
+                "Embedder RSS: {}",
+                MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate)
+            )),
+            Line::from(format!(
+                "GPU util: {}",
+                snapshot
+                    .gpu_util_percent
+                    .map(|value| format!("{value:.1}%"))
+                    .unwrap_or_else(|| "--".to_string())
+            )),
+            Line::from(format!(
+                "GPU memory: {} / {}",
+                snapshot
+                    .gpu_memory_used
+                    .map(MonitorSnapshot::format_bytes)
+                    .unwrap_or_else(|| "--".to_string()),
+                snapshot
+                    .gpu_memory_total
+                    .map(MonitorSnapshot::format_bytes)
+                    .unwrap_or_else(|| "--".to_string())
+            )),
+            Line::from(format!("GPU status: {gpu_status}")),
+        ]
+    } else {
+        vec![
+            Line::from("Waiting for system telemetry..."),
+            Line::from(""),
+            Line::from("CPU, RAM, process, and GPU stats will stream here."),
+        ]
+    };
+    let right_stats = Paragraph::new(right_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" System Telemetry "),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(right_stats, main[1]);
+
+    let warning_lines = if let Some(snapshot) = telemetry {
+        let lines: Vec<Line> = snapshot
+            .recent_warnings
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|warning| {
+                Line::from(Span::styled(
+                    format!("[{}] {}", warning.code, warning.message),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .collect();
+        if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "No warnings.",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            lines
+        }
+    } else {
+        vec![Line::from(Span::styled(
+            "Waiting for warnings...",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+    let warnings = Paragraph::new(warning_lines).wrap(Wrap { trim: false });
+    frame.render_widget(warnings, outer[1]);
+}
+
+fn current_file_label(snapshot: &IndexTelemetrySnapshot) -> String {
+    snapshot
+        .current_file
+        .clone()
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_eta(eta_secs: Option<f64>) -> String {
+    let Some(eta_secs) = eta_secs else {
+        return "--".to_string();
+    };
+
+    let eta_secs = eta_secs.max(0.0).round() as u64;
+    let minutes = eta_secs / 60;
+    let seconds = eta_secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
