@@ -496,6 +496,13 @@ enum TranscriptRole {
     Reasoning,
 }
 
+#[derive(Debug, Clone)]
+struct StructuredDialogEntry {
+    time: Option<String>,
+    role: TranscriptRole,
+    text: String,
+}
+
 #[derive(Debug, Default, Clone)]
 struct MarkdownTranscriptTurn {
     start_time: Option<String>,
@@ -513,10 +520,12 @@ impl MarkdownTranscriptTurn {
     }
 
     fn push(&mut self, role: TranscriptRole, time: &str, text: String) {
-        if self.start_time.is_none() {
-            self.start_time = Some(time.to_string());
+        if !time.is_empty() {
+            if self.start_time.is_none() {
+                self.start_time = Some(time.to_string());
+            }
+            self.end_time = Some(time.to_string());
         }
-        self.end_time = Some(time.to_string());
 
         let target = match role {
             TranscriptRole::User => &mut self.user_segments,
@@ -532,11 +541,7 @@ impl MarkdownTranscriptTurn {
 }
 
 fn parse_transcript_header(line: &str) -> Option<HashMap<String, String>> {
-    let inner = line
-        .trim()
-        .strip_prefix('[')?
-        .strip_suffix(']')?
-        .trim();
+    let inner = line.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
 
     if !inner.starts_with("project:") {
         return None;
@@ -549,6 +554,15 @@ fn parse_transcript_header(line: &str) -> Option<HashMap<String, String>> {
     }
 
     Some(fields)
+}
+
+fn parse_transcript_role(role: &str) -> Option<TranscriptRole> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "user" | "human" => Some(TranscriptRole::User),
+        "assistant" | "bot" | "model" => Some(TranscriptRole::Assistant),
+        "reasoning" | "analysis" | "thinking" | "tool" => Some(TranscriptRole::Reasoning),
+        _ => None,
+    }
 }
 
 fn parse_transcript_entry_line(line: &str) -> Option<(String, TranscriptRole, String)> {
@@ -565,12 +579,7 @@ fn parse_transcript_entry_line(line: &str) -> Option<(String, TranscriptRole, St
     }
 
     let (role, body) = rest.trim_start().split_once(':')?;
-    let role = match role.trim() {
-        "user" => TranscriptRole::User,
-        "assistant" => TranscriptRole::Assistant,
-        "reasoning" => TranscriptRole::Reasoning,
-        _ => return None,
-    };
+    let role = parse_transcript_role(role)?;
 
     Some((time.to_string(), role, body.trim_start().to_string()))
 }
@@ -579,10 +588,7 @@ fn normalize_role_aware_turn(turn: &MarkdownTranscriptTurn) -> Option<String> {
     let mut sections = Vec::new();
 
     if !turn.user_segments.is_empty() {
-        sections.push(format!(
-            "User request:\n{}",
-            turn.user_segments.join("\n")
-        ));
+        sections.push(format!("User request:\n{}", turn.user_segments.join("\n")));
     }
     if !turn.assistant_segments.is_empty() {
         sections.push(format!(
@@ -602,6 +608,61 @@ fn normalize_role_aware_turn(turn: &MarkdownTranscriptTurn) -> Option<String> {
     }
 
     Some(sections.join("\n\n"))
+}
+
+fn build_role_aware_turn_documents(
+    entries: Vec<StructuredDialogEntry>,
+    doc_prefix: &str,
+    base_metadata: serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String, serde_json::Value)> {
+    let mut turns = Vec::new();
+    let mut current_turn = MarkdownTranscriptTurn::default();
+
+    for entry in entries {
+        let text = entry.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        if matches!(entry.role, TranscriptRole::User) && !current_turn.is_empty() {
+            turns.push(current_turn);
+            current_turn = MarkdownTranscriptTurn::default();
+        }
+
+        current_turn.push(
+            entry.role,
+            entry.time.as_deref().unwrap_or_default(),
+            text.to_string(),
+        );
+    }
+
+    if !current_turn.is_empty() {
+        turns.push(current_turn);
+    }
+
+    let mut docs = Vec::new();
+    for (idx, turn) in turns.into_iter().enumerate() {
+        let Some(content) = normalize_role_aware_turn(&turn) else {
+            continue;
+        };
+
+        if content.len() < 20 {
+            continue;
+        }
+
+        let doc_id = format!("{doc_prefix}-{idx:04}-{}", hash_content(&content));
+        let mut metadata = serde_json::Value::Object(base_metadata.clone());
+
+        if let serde_json::Value::Object(ref mut map) = metadata {
+            map.insert("turn_index".to_string(), json!(idx));
+            map.insert("start_time".to_string(), json!(turn.start_time));
+            map.insert("end_time".to_string(), json!(turn.end_time));
+        }
+
+        docs.push((doc_id, content, metadata));
+    }
+
+    docs
 }
 
 fn extract_markdown_transcript_documents(
@@ -688,71 +749,36 @@ fn extract_markdown_transcript_documents(
         Some(signal_lines.join("\n"))
     };
 
-    let mut turns = Vec::new();
-    let mut current_turn = MarkdownTranscriptTurn::default();
+    let entries = entries
+        .into_iter()
+        .map(|(time, role, text)| StructuredDialogEntry {
+            time: Some(time),
+            role,
+            text,
+        })
+        .collect();
 
-    for (time, role, text) in entries {
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("project".to_string(), json!(project));
+    metadata.insert("agent".to_string(), json!(agent));
+    metadata.insert("date".to_string(), json!(date));
+    metadata.insert("source".to_string(), json!(source_name));
+    metadata.insert("path".to_string(), json!(source_path.to_str()));
+    metadata.insert("type".to_string(), json!("transcript_turn"));
+    metadata.insert("format".to_string(), json!("markdown_transcript"));
 
-        if matches!(role, TranscriptRole::User) && !current_turn.is_empty() {
-            turns.push(current_turn);
-            current_turn = MarkdownTranscriptTurn::default();
-        }
-
-        current_turn.push(role, &time, text.to_string());
+    if let Some(summary) = signals_summary.as_ref() {
+        metadata.insert("signals".to_string(), json!(summary));
     }
 
-    if !current_turn.is_empty() {
-        turns.push(current_turn);
-    }
-
-    let mut docs = Vec::new();
-    for (idx, turn) in turns.into_iter().enumerate() {
-        let Some(content) = normalize_role_aware_turn(&turn) else {
-            continue;
-        };
-
-        if content.len() < 50 {
-            continue;
-        }
-
-        let doc_id = format!(
-            "mdturn-{}-{:04}-{}",
-            transcript_id,
-            idx,
-            hash_content(&content)
-        );
-
-        let mut metadata = json!({
-            "project": project,
-            "agent": agent,
-            "date": date,
-            "source": source_name,
-            "path": source_path.to_str(),
-            "turn_index": idx,
-            "type": "transcript_turn",
-            "format": "markdown_transcript",
-            "start_time": turn.start_time,
-            "end_time": turn.end_time,
-        });
-
-        if let Some(summary) = signals_summary.as_ref()
-            && let serde_json::Value::Object(ref mut map) = metadata
-        {
-            map.insert("signals".to_string(), json!(summary));
-        }
-
-        docs.push((doc_id, content, metadata));
-    }
+    let docs =
+        build_role_aware_turn_documents(entries, &format!("mdturn-{transcript_id}"), metadata);
 
     if docs.is_empty() { None } else { Some(docs) }
 }
 
 /// Extract conversation documents from JSON with smart format detection.
-/// Returns individual messages as separate documents with proper metadata.
+/// Returns role-aware turn documents with proper metadata.
 /// Handles: sessions format, ChatGPT export, generic messages array.
 fn extract_conversation_documents(
     value: &serde_json::Value,
@@ -763,6 +789,25 @@ fn extract_conversation_documents(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+
+    fn extract_text_blocks(msg_obj: &serde_json::Map<String, serde_json::Value>) -> String {
+        if let Some(text) = msg_obj.get("text").and_then(serde_json::Value::as_str) {
+            return text.to_string();
+        }
+        if let Some(content) = msg_obj.get("content") {
+            if let Some(text) = content.as_str() {
+                return text.to_string();
+            }
+            if let Some(blocks) = content.as_array() {
+                return blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+        String::new()
+    }
 
     // Pattern 1: {sessions: [{info: {}, messages: [{role, text, timestamp}]}]}
     // From extract_session_essence.py output
@@ -782,50 +827,62 @@ fn extract_conversation_documents(
                 .unwrap_or("unknown");
             let session_short = &session_id[..session_id.len().min(8)];
 
+            let mut entries = Vec::new();
             if let Some(serde_json::Value::Array(messages)) = session_obj.get("messages") {
-                for (idx, msg) in messages.iter().enumerate() {
+                for msg in messages {
                     let msg_obj = match msg.as_object() {
                         Some(o) => o,
                         None => continue,
                     };
-
-                    let role = msg_obj
+                    let Some(role) = msg_obj
                         .get("role")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let timestamp = msg_obj
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                        .and_then(parse_transcript_role)
+                    else {
+                        continue;
+                    };
 
-                    // Skip empty or too short messages
-                    let text = text.trim();
+                    let text = msg_obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     if text.len() < 20 {
                         continue;
                     }
 
-                    let content_hash = hash_content(text);
-                    let doc_id = format!("msg-{}-{:04}-{}", session_short, idx, content_hash);
+                    let timestamp = msg_obj
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
 
-                    let metadata = json!({
-                        "role": role,
-                        "session": session_short,
-                        "project": project,
-                        "timestamp": timestamp,
-                        "source": source_name,
-                        "type": "conversation",
-                        "format": "sessions"
+                    entries.push(StructuredDialogEntry {
+                        time: timestamp,
+                        role,
+                        text,
                     });
-
-                    docs.push((doc_id, text.to_string(), metadata));
                 }
             }
+
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("session".to_string(), json!(session_short));
+            metadata.insert("project".to_string(), json!(project));
+            metadata.insert("source".to_string(), json!(source_name));
+            metadata.insert("type".to_string(), json!("conversation"));
+            metadata.insert("format".to_string(), json!("sessions"));
+
+            let mut session_docs = build_role_aware_turn_documents(
+                entries,
+                &format!("sess-{session_short}"),
+                metadata,
+            );
+            docs.append(&mut session_docs);
         }
 
         if !docs.is_empty() {
             tracing::info!(
-                "Sessions format detected: {} -> {} messages",
+                "Sessions format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -833,7 +890,7 @@ fn extract_conversation_documents(
         }
     }
 
-    // Pattern 2: [{uuid, name, messages: [{sender, text, created_at}]}]
+    // Pattern 2: {uuid, name, messages: [{sender, text, created_at}]}
     // Claude.ai conversations export (conversations-merged.json)
     // This is handled at array level in extract_json_documents, but check for single conversation
     if let Some(serde_json::Value::Array(messages)) = obj.get("messages") {
@@ -849,97 +906,59 @@ fn extract_conversation_documents(
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Check if it looks like a conversation (messages with sender/role)
         let looks_like_conversation = messages.iter().any(|m| {
             m.get("sender").is_some() || m.get("role").is_some() || m.get("author").is_some()
         });
 
         if looks_like_conversation {
-            let mut docs = Vec::new();
-            for (idx, msg) in messages.iter().enumerate() {
+            let mut entries = Vec::new();
+            for msg in messages {
                 let msg_obj = match msg.as_object() {
                     Some(o) => o,
                     None => continue,
                 };
 
-                let role = msg_obj
+                let Some(role) = msg_obj
                     .get("sender")
                     .or_else(|| msg_obj.get("role"))
                     .or_else(|| msg_obj.get("author").and_then(|a| a.get("role")))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-
-                // Normalize role names
-                let role = match role {
-                    "human" => "user",
-                    "assistant" | "bot" => "assistant",
-                    other => other,
+                    .and_then(parse_transcript_role)
+                else {
+                    continue;
                 };
 
-                // Extract text from various formats
-                let text = msg_obj
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        // Handle content array (Claude format)
-                        msg_obj.get("content").and_then(|c| {
-                            if let Some(s) = c.as_str() {
-                                Some(s)
-                            } else if let Some(_arr) = c.as_array() {
-                                // Collect text from content blocks
-                                None // Handle below
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or("");
-
-                // Handle content blocks array
-                let text = if text.is_empty() {
-                    if let Some(serde_json::Value::Array(content)) = msg_obj.get("content") {
-                        content
-                            .iter()
-                            .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    text.to_string()
-                };
+                let text = extract_text_blocks(msg_obj).trim().to_string();
+                if text.len() < 20 {
+                    continue;
+                }
 
                 let timestamp = msg_obj
                     .get("created_at")
                     .or_else(|| msg_obj.get("timestamp"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                    .map(ToOwned::to_owned);
 
-                let text = text.trim();
-                if text.len() < 20 {
-                    continue;
-                }
-
-                let content_hash = hash_content(text);
-                let doc_id = format!("conv-{}-{:04}-{}", conv_short, idx, content_hash);
-
-                let metadata = json!({
-                    "role": role,
-                    "conversation": conv_short,
-                    "title": title,
-                    "timestamp": timestamp,
-                    "source": source_name,
-                    "type": "conversation",
-                    "format": "claude_web"
+                entries.push(StructuredDialogEntry {
+                    time: timestamp,
+                    role,
+                    text,
                 });
-
-                docs.push((doc_id, text.to_string(), metadata));
             }
+
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("conversation".to_string(), json!(conv_short));
+            metadata.insert("title".to_string(), json!(title));
+            metadata.insert("source".to_string(), json!(source_name));
+            metadata.insert("type".to_string(), json!("conversation"));
+            metadata.insert("format".to_string(), json!("claude_web"));
+
+            let docs =
+                build_role_aware_turn_documents(entries, &format!("conv-{conv_short}"), metadata);
 
             if !docs.is_empty() {
                 tracing::info!(
-                    "Conversation format detected: {} -> {} messages",
+                    "Conversation format detected: {} -> {} turn documents",
                     source_path.display(),
                     docs.len()
                 );
@@ -958,56 +977,56 @@ fn extract_conversation_documents(
         let conv_short = &conv_id[..conv_id.len().min(8)];
         let title = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut docs = Vec::new();
-        for (idx, msg) in messages.iter().enumerate() {
+        let mut entries = Vec::new();
+        for msg in messages {
             let msg_obj = match msg.as_object() {
                 Some(o) => o,
                 None => continue,
             };
 
-            let role = msg_obj
+            let Some(role) = msg_obj
                 .get("sender")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            // Normalize role names
-            let role = match role {
-                "human" => "user",
-                "assistant" | "bot" => "assistant",
-                other => other,
+                .and_then(parse_transcript_role)
+            else {
+                continue;
             };
 
-            let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-            let timestamp = msg_obj
-                .get("created_at")
+            let text = msg_obj
+                .get("text")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let text = text.trim();
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if text.len() < 20 {
                 continue;
             }
 
-            let content_hash = hash_content(text);
-            let doc_id = format!("chat-{}-{:04}-{}", conv_short, idx, content_hash);
+            let timestamp = msg_obj
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
 
-            let metadata = json!({
-                "role": role,
-                "conversation": conv_short,
-                "title": title,
-                "timestamp": timestamp,
-                "source": source_name,
-                "type": "conversation",
-                "format": "claude_web"
+            entries.push(StructuredDialogEntry {
+                time: timestamp,
+                role,
+                text,
             });
-
-            docs.push((doc_id, text.to_string(), metadata));
         }
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("conversation".to_string(), json!(conv_short));
+        metadata.insert("title".to_string(), json!(title));
+        metadata.insert("source".to_string(), json!(source_name));
+        metadata.insert("type".to_string(), json!("conversation"));
+        metadata.insert("format".to_string(), json!("claude_web"));
+
+        let docs =
+            build_role_aware_turn_documents(entries, &format!("chat-{conv_short}"), metadata);
 
         if !docs.is_empty() {
             tracing::info!(
-                "Claude.ai chat_messages format detected: {} -> {} messages",
+                "Claude.ai chat_messages format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -1026,9 +1045,7 @@ fn extract_conversation_documents(
         let conv_short = &conv_id[..conv_id.len().min(8)];
         let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut docs = Vec::new();
         let mut entries: Vec<_> = mapping.iter().collect();
-        // Try to sort by create_time if available
         entries.sort_by(|a, b| {
             let time_a =
                 a.1.get("message")
@@ -1045,22 +1062,21 @@ fn extract_conversation_documents(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        for (idx, (_node_id, node)) in entries.iter().enumerate() {
+        let mut dialog_entries = Vec::new();
+        for (_node_id, node) in entries {
             let message = match node.get("message") {
                 Some(m) => m,
                 None => continue,
             };
 
-            let role = message
+            let Some(role) = message
                 .get("author")
                 .and_then(|a| a.get("role"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            // Skip system messages
-            if role == "system" {
+                .and_then(parse_transcript_role)
+            else {
                 continue;
-            }
+            };
 
             let text = message
                 .get("content")
@@ -1073,42 +1089,39 @@ fn extract_conversation_documents(
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
-                .unwrap_or_default();
-
-            let timestamp = message
-                .get("create_time")
-                .and_then(|t| t.as_f64())
-                .map(|ts| {
-                    chrono::DateTime::from_timestamp(ts as i64, 0)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            let text = text.trim();
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if text.len() < 20 {
                 continue;
             }
 
-            let content_hash = hash_content(text);
-            let doc_id = format!("gpt-{}-{:04}-{}", conv_short, idx, content_hash);
+            let timestamp = message
+                .get("create_time")
+                .and_then(|t| t.as_f64())
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+                .map(|dt| dt.to_rfc3339());
 
-            let metadata = json!({
-                "role": role,
-                "conversation": conv_short,
-                "title": title,
-                "timestamp": timestamp,
-                "source": source_name,
-                "type": "conversation",
-                "format": "chatgpt"
+            dialog_entries.push(StructuredDialogEntry {
+                time: timestamp,
+                role,
+                text,
             });
-
-            docs.push((doc_id, text.to_string(), metadata));
         }
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("conversation".to_string(), json!(conv_short));
+        metadata.insert("title".to_string(), json!(title));
+        metadata.insert("source".to_string(), json!(source_name));
+        metadata.insert("type".to_string(), json!("conversation"));
+        metadata.insert("format".to_string(), json!("chatgpt"));
+
+        let docs =
+            build_role_aware_turn_documents(dialog_entries, &format!("gpt-{conv_short}"), metadata);
 
         if !docs.is_empty() {
             tracing::info!(
-                "ChatGPT format detected: {} -> {} messages",
+                "ChatGPT format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -2625,7 +2638,7 @@ impl RAGPipeline {
     /// For non-array JSON or other file types, returns a single document.
     ///
     /// This enables proper onion slicing for conversation/session files where
-    /// each array element (message, conversation) should be indexed separately.
+    /// dialog-like content should be normalized into turn documents before slicing.
     ///
     /// Returns: Vec of (doc_id, content, metadata) tuples
     async fn extract_json_documents(
@@ -2690,7 +2703,7 @@ impl RAGPipeline {
             // If smart extraction found conversations, use those
             if used_smart_extraction && !docs.is_empty() {
                 tracing::info!(
-                    "Conversation array detected: {} -> {} messages",
+                    "Conversation array detected: {} -> {} turn documents",
                     path.display(),
                     docs.len()
                 );
@@ -3351,8 +3364,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OnionSliceConfig, SearchOptions, SliceLayer, create_onion_slices,
-        create_onion_slices_fast, extract_keywords, extract_markdown_transcript_documents,
+        OnionSliceConfig, SearchOptions, SliceLayer, create_onion_slices, create_onion_slices_fast,
+        extract_conversation_documents, extract_keywords, extract_markdown_transcript_documents,
         hash_content, metadata_matches_project,
     };
     use serde_json::json;
@@ -3453,5 +3466,126 @@ Results:
 
         assert_eq!(full_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
         assert_eq!(fast_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
+    }
+
+    #[test]
+    fn structured_markdown_outer_becomes_semantic_card() {
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript",
+            "project": "VetCoders/rmcp-memex",
+            "agent": "codex"
+        });
+        let config = OnionSliceConfig {
+            outer_target: 220,
+            ..OnionSliceConfig::default()
+        };
+        let content = "User request:\nMake outer retrieval useful for transcript search.\n\nAssistant response:\nDecision: build semantic cards instead of keyword prefixes.\nNext action: add JSON slicing coverage.\n\nReasoning focus:\nOuter-only is the default search path, so weak outer text hides short turns.";
+
+        let slices = create_onion_slices(content, &metadata, &config);
+        let outer = &slices[0].content;
+        let middle = &slices[1].content;
+        let inner = &slices[2].content;
+
+        assert!(outer.contains("Request:"));
+        assert!(outer.contains("Response:"));
+        assert!(outer.contains("Decision:"));
+        assert!(!outer.starts_with('['));
+        assert!(middle.contains("Decision:"));
+        assert!(middle.contains("Next:"));
+        assert!(inner.contains("Assistant response:"));
+        assert!(inner.contains("Entities:"));
+    }
+
+    #[test]
+    fn json_conversation_docs_flow_through_structured_semantic_slices() {
+        let conversation = json!({
+            "project": "VetCoders/rmcp-memex",
+            "sessions": [
+                {
+                    "info": {
+                        "sessionId": "session-1234567890"
+                    },
+                    "messages": [
+                        {
+                            "role": "user",
+                            "text": "Please replace the keyword-prefixed outer summary with something that reads like a semantic card for search.",
+                            "timestamp": "2026-04-12T04:00:00Z"
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Decision: we will use semantic cards for outer retrieval. Next action: add JSON regression coverage and preserve the plain text fallback.",
+                            "timestamp": "2026-04-12T04:01:00Z"
+                        },
+                        {
+                            "role": "user",
+                            "text": "Keep the generic plain text path as a safe fallback.",
+                            "timestamp": "2026-04-12T04:02:00Z"
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Reasoning: default search prefers outer-only, so the semantic card needs to surface the exchange even for short turns.",
+                            "timestamp": "2026-04-12T04:03:00Z"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let docs = extract_conversation_documents(&conversation, Path::new("conversation.json"))
+            .expect("expected conversation docs");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[0].2.get("format").and_then(|value| value.as_str()),
+            Some("sessions")
+        );
+        assert_eq!(
+            docs[0].2.get("turn_index").and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert!(docs[0].1.contains("User request:"));
+        assert!(docs[0].1.contains("Assistant response:"));
+
+        let config = OnionSliceConfig {
+            outer_target: 220,
+            ..OnionSliceConfig::default()
+        };
+        let slices = create_onion_slices(&docs[0].1, &docs[0].2, &config);
+        let outer = &slices[0].content;
+        let middle = &slices[1].content;
+        let inner = &slices[2].content;
+
+        assert!(outer.contains("Request:"));
+        assert!(outer.contains("Response:"));
+        assert!(outer.contains("Decision:"));
+        assert!(!outer.starts_with('['));
+        assert!(middle.contains("Decision:"));
+        assert!(middle.contains("Next:"));
+        assert!(inner.contains("Assistant response:"));
+    }
+
+    #[test]
+    fn plain_text_still_uses_generic_fallback_path() {
+        let metadata = json!({
+            "type": "note",
+            "format": "markdown"
+        });
+        let config = OnionSliceConfig::default();
+        let content = "The release workflow still needs a truthful browse surface. We should preserve the plain text fallback while improving structured conversation retrieval with semantic cards and regression tests so the generic path does not regress.";
+
+        let slices = create_onion_slices(content, &metadata, &config);
+        let outer = &slices[0].content;
+
+        assert_eq!(
+            slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(),
+            vec![
+                SliceLayer::Outer,
+                SliceLayer::Middle,
+                SliceLayer::Inner,
+                SliceLayer::Core
+            ]
+        );
+        assert!(!outer.contains("Request:"));
+        assert!(!outer.contains("Response:"));
     }
 }
