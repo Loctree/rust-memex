@@ -74,7 +74,7 @@ Then confirm:
 - installer-based installs expose `rmcp_memex` as a legacy compatibility symlink
 - the direct release bundle installs cleanly without requiring a local Rust toolchain build
 - no release artifact, README snippet, or landing-page copy refers to `rust-memex`, `rmmx`, or `rmemex`
-- `/health` responds when running with `--http-port 6660`
+- `/health` responds when running with `--http-port 8997`
 - the landing page publishes via `.github/workflows/pages.yml`
 
 ## Public Surface

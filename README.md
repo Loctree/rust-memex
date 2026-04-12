@@ -29,8 +29,11 @@ curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.s
 # Start the MCP server
 rmcp-memex serve
 
+# Open the local dashboard in your browser
+rmcp-memex dashboard
+
 # Or run the multi-agent HTTP/SSE daemon
-rmcp-memex serve --http-port 6660 --http-only
+rmcp-memex sse
 ```
 
 ## Overview
@@ -515,10 +518,10 @@ rmcp-memex serve
 rmcp-memex serve --security-enabled
 
 # With HTTP/SSE server for multi-agent access
-rmcp-memex serve --http-port 6660
+rmcp-memex serve --http-port 8997
 
 # HTTP-only daemon mode (no MCP stdio)
-rmcp-memex serve --http-port 6660 --http-only
+rmcp-memex serve --http-port 8997 --http-only
 ```
 
 `rmcp-memex` always exposes one canonical MCP tool surface. To narrow runtime
@@ -537,7 +540,7 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 │                     rmcp-memex daemon                        │
 │  ┌─────────────────┐    ┌─────────────────┐                 │
 │  │   MCP Server    │    │   HTTP/SSE      │                 │
-│  │   (stdio)       │    │   (port 6660)   │                 │
+│  │   (stdio)       │    │   (port 8997)   │                 │
 │  └────────┬────────┘    └────────┬────────┘                 │
 │           │                      │                          │
 │           └──────────┬───────────┘                          │
@@ -584,7 +587,7 @@ Configure in `~/.claude.json`:
   "mcpServers": {
     "rmcp-memex": {
       "type": "sse",
-      "url": "http://localhost:6660/sse/"
+      "url": "http://localhost:8997/sse/"
     }
   }
 }
@@ -593,24 +596,27 @@ Configure in `~/.claude.json`:
 ### Usage Examples
 
 ```bash
+# Open the local dashboard
+rmcp-memex dashboard --db-path ~/.ai-memories/lancedb
+
 # Start daemon
-rmcp-memex serve --http-port 6660 --http-only --db-path ~/.ai-memories/lancedb &
+rmcp-memex sse --db-path ~/.ai-memories/lancedb &
 
 # Health check
-curl http://localhost:6660/health
+curl http://localhost:8997/health
 
 # Store document
-curl -X POST http://localhost:6660/upsert \
+curl -X POST http://localhost:8997/upsert \
   -H "Content-Type: application/json" \
   -d '{"namespace": "agent1", "id": "mem1", "content": "Important context..."}'
 
 # Search
-curl -X POST http://localhost:6660/search \
+curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
   -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
+curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
 ```
 
 ### Multi-Host Database Paths
