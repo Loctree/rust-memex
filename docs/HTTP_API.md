@@ -4,9 +4,10 @@ Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 ## Overview
 
-`rmcp-memex` exposes an HTTP/SSE daemon for clients that cannot use MCP over
-stdio directly. The dashboard at `/` and new HTTP clients should start with
-`GET /api/discovery`.
+`rmcp-memex` exposes the same HTTP surface in two ergonomic entrypoints:
+`rmcp-memex dashboard` for local browsing on port `8987`, and `rmcp-memex sse`
+for the agent-facing daemon on port `8997`. In both cases, the dashboard at `/`
+and new HTTP clients should start with `GET /api/discovery`.
 
 `/api/discovery` is the canonical read surface because it bundles:
 
@@ -23,19 +24,22 @@ clients.
 
 ```bash
 # Standard dual transport mode (stdio + HTTP)
-rmcp-memex serve --http-port 6666
+rmcp-memex serve --http-port 8997
 
 # HTTP-only daemon mode
-rmcp-memex serve --http-port 6666 --http-only
+rmcp-memex sse
 
 # Protect mutating routes
-rmcp-memex serve --http-port 6666 --auth-token "$MEMEX_AUTH_TOKEN"
+rmcp-memex serve --http-port 8997 --auth-token "$MEMEX_AUTH_TOKEN"
+
+# Open the local dashboard in a browser
+rmcp-memex dashboard
 ```
 
 Default dashboard URL:
 
 ```text
-http://localhost:6666/
+http://localhost:8987/
 ```
 
 ## Canonical Discovery
@@ -123,7 +127,7 @@ These remain useful for legacy clients, but new code should prefer `GET /api/dis
 ### `POST /search`
 
 ```bash
-curl -X POST http://localhost:6666/search \
+curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
   -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Vista","deep":true}'
 ```
@@ -149,7 +153,7 @@ Representative response:
 ### `GET /cross-search`
 
 ```bash
-curl "http://localhost:6666/cross-search?q=rust%20async&limit=5&total_limit=20&mode=hybrid"
+curl "http://localhost:8997/cross-search?q=rust%20async&limit=5&total_limit=20&mode=hybrid"
 ```
 
 ## Mutating Surfaces
@@ -176,7 +180,7 @@ when the daemon is started with `--auth-token` or `MEMEX_AUTH_TOKEN`.
 ### `POST /upsert`
 
 ```bash
-curl -X POST http://localhost:6666/upsert \
+curl -X POST http://localhost:8997/upsert \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $MEMEX_AUTH_TOKEN" \
   -d '{
@@ -190,7 +194,7 @@ curl -X POST http://localhost:6666/upsert \
 ### `POST /index`
 
 ```bash
-curl -X POST http://localhost:6666/index \
+curl -X POST http://localhost:8997/index \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $MEMEX_AUTH_TOKEN" \
   -d '{
@@ -211,7 +215,7 @@ The embedded dashboard now boots from `/api/discovery`, then drills into:
 If the dashboard shows a loading state for a long time, inspect discovery directly:
 
 ```bash
-curl http://localhost:6666/api/discovery
+curl http://localhost:8987/api/discovery
 ```
 
 If discovery stays in `status = "loading"`, run:
@@ -224,8 +228,8 @@ rmcp-memex optimize
 
 ### Dashboard Stuck In Loading
 
-1. Check liveness: `curl http://localhost:6666/health`
-2. Check discovery: `curl http://localhost:6666/api/discovery`
+1. Check liveness: `curl http://localhost:8997/health`
+2. Check discovery: `curl http://localhost:8987/api/discovery`
 3. If `status` remains `"loading"`, run `rmcp-memex optimize`
 
 ### Port Conflict
@@ -234,7 +238,7 @@ Change the port in your config and restart:
 
 ```toml
 # ~/.rmcp-servers/rmcp-memex/config.toml
-http_port = 6666
+http_port = 8997
 ```
 
 ### Network Exposure

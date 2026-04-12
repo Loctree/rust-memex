@@ -22,7 +22,7 @@
 |-----------|----------|--------|--------|
 | **Entry Points** |
 | MCP Tools | JSON-RPC over stdio | JSON-RPC over stdio | ✅ |
-| HTTP API | REST + SSE on 8987 | REST + SSE on 8987 | ✅ |
+| HTTP API | REST + SSE on 8997 | REST + SSE on 8997 | ✅ |
 | CLI | index/search/optimize | index/search/optimize | ✅ |
 | **Security** |
 | Path Validation | expand ~ / detect .. / canonicalize | expand ~ / detect .. / canonicalize | ✅ |
@@ -64,7 +64,7 @@
 | **LaunchD** |
 | memex-ramdisk | Create 50GB | Create 50GB | ✅ |
 | mlx-embedding | Port 8765 | Port 12345 | ❌ Mismatch |
-| rmcp-memex | Port 8987, uses RAM | Port 8987, uses RAM | ✅ |
+| rmcp-memex | Port 8997, uses RAM | Port 8997, uses RAM | ✅ |
 | memex-snapshot | Periodic sync | Periodic sync | ✅ |
 | **Config** |
 | Config File | `~/.ai-memories/config.toml` | **NONE** | ❌ Missing |
@@ -86,7 +86,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ENTRY POINTS                             │
-│         MCP (stdio) │ HTTP (8987) │ CLI                         │
+│         MCP (stdio) │ HTTP (8997) │ CLI                         │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -137,7 +137,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ENTRY POINTS                             │
-│         MCP (stdio) │ HTTP (8987) │ CLI (rmcp-memex)            │
+│         MCP (stdio) │ HTTP (8997) │ CLI (rmcp-memex)            │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼

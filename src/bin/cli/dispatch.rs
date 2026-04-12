@@ -1,5 +1,8 @@
 use anyhow::Result;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
@@ -16,8 +19,128 @@ use crate::cli::inspection::*;
 use crate::cli::maintenance::*;
 use crate::cli::search::*;
 
+fn resolve_http_server_config(
+    cli: &Cli,
+    file_cfg: &FileConfig,
+) -> rmcp_memex::http::HttpServerConfig {
+    let auth_token = cli
+        .auth_token
+        .clone()
+        .or_else(|| std::env::var("MEMEX_AUTH_TOKEN").ok())
+        .or_else(|| file_cfg.auth_token.clone());
+    let bind_addr_str = cli
+        .bind_address
+        .clone()
+        .or_else(|| file_cfg.bind_address.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_address: IpAddr = bind_addr_str.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "Invalid bind address '{}', falling back to 127.0.0.1",
+            bind_addr_str
+        );
+        Ipv4Addr::LOCALHOST.into()
+    });
+    let cors_origins: Vec<String> = cli
+        .cors_origins
+        .clone()
+        .or_else(|| file_cfg.cors_origins.clone())
+        .map(|s| {
+            s.split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    rmcp_memex::http::HttpServerConfig {
+        auth_token,
+        cors_origins,
+        bind_address,
+    }
+}
+
+fn dashboard_browser_url(bind_address: IpAddr, port: u16) -> String {
+    let host = match bind_address {
+        IpAddr::V4(addr) if addr.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) if addr.is_unspecified() => format!("[{}]", Ipv6Addr::LOCALHOST),
+        IpAddr::V6(addr) => format!("[{addr}]"),
+    };
+
+    format!("http://{host}:{port}/")
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ProcessCommand::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        ProcessCommand::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "Automatic browser open is not supported on this platform"
+    ))
+}
+
+async fn run_http_only_command(cli: Cli, port: u16, auto_open_browser: bool) -> Result<()> {
+    let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
+    let http_server_config = resolve_http_server_config(&cli, &file_cfg);
+    let dashboard_url = dashboard_browser_url(http_server_config.bind_address, port);
+
+    let mut config = cli.into_server_config()?;
+    config.hybrid.bm25.read_only = true;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(config.log_level)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    info!("Starting RMCP Memex");
+    info!("Cache: {}MB", config.cache_mb);
+    info!("DB Path: {}", config.db_path);
+
+    let server = create_server(config).await?;
+    let mcp_core = server.mcp_core();
+
+    if auto_open_browser {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            if let Err(err) = open_browser(&dashboard_url) {
+                eprintln!("Warning: failed to open dashboard browser: {}", err);
+            }
+        });
+    }
+
+    rmcp_memex::http::start_server(mcp_core, port, http_server_config).await
+}
+
 pub async fn run_command(cli: Cli) -> Result<()> {
     match cli.command {
+        Some(Commands::Dashboard { port, no_open }) => {
+            let port = port.or(cli.http_port).unwrap_or(DEFAULT_DASHBOARD_PORT);
+            run_http_only_command(cli, port, !no_open).await
+        }
+        Some(Commands::Sse { port }) => {
+            let port = port.or(cli.http_port).unwrap_or(DEFAULT_SSE_PORT);
+            run_http_only_command(cli, port, false).await
+        }
         Some(Commands::Wizard { dry_run }) => {
             let wizard_config = WizardConfig {
                 config_path: cli.config,
@@ -543,39 +666,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 ));
             }
             let (file_cfg_ref, _) = load_or_discover_config(cli.config.as_deref())?;
-            let auth_token = cli
-                .auth_token
-                .clone()
-                .or_else(|| std::env::var("MEMEX_AUTH_TOKEN").ok())
-                .or_else(|| file_cfg_ref.auth_token.clone());
-            let bind_addr_str = cli
-                .bind_address
-                .clone()
-                .or_else(|| file_cfg_ref.bind_address.clone())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let bind_address: std::net::IpAddr = bind_addr_str.parse().unwrap_or_else(|_| {
-                eprintln!(
-                    "Invalid bind address '{}', falling back to 127.0.0.1",
-                    bind_addr_str
-                );
-                std::net::Ipv4Addr::LOCALHOST.into()
-            });
-            let cors_origins: Vec<String> = cli
-                .cors_origins
-                .clone()
-                .or_else(|| file_cfg_ref.cors_origins.clone())
-                .map(|s| {
-                    s.split(',')
-                        .map(|o| o.trim().to_string())
-                        .filter(|o| !o.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let http_server_config = rmcp_memex::http::HttpServerConfig {
-                auth_token,
-                cors_origins,
-                bind_address,
-            };
+            let http_server_config = resolve_http_server_config(&cli, &file_cfg_ref);
             let mut config = cli.into_server_config()?;
             if http_only {
                 config.hybrid.bm25.read_only = true;

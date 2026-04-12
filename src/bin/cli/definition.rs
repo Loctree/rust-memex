@@ -6,6 +6,9 @@ use walkdir::WalkDir;
 
 use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
+pub const DEFAULT_SSE_PORT: u16 = 8997;
+
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -121,7 +124,7 @@ pub struct Cli {
     /// HTTP/SSE server port for multi-agent access.
     /// When set, starts an HTTP server alongside MCP stdio.
     /// Agents can query via HTTP instead of holding LanceDB lock directly.
-    /// Example: --http-port 6660
+    /// Example: --http-port 8997
     #[arg(long, global = true)]
     pub http_port: Option<u16>,
 
@@ -151,6 +154,24 @@ pub struct Cli {
 pub enum Commands {
     /// Run the MCP server (default if no subcommand specified)
     Serve,
+
+    /// Run the local dashboard server and open it in the default browser.
+    Dashboard {
+        /// Dashboard HTTP port (default: 8987)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+
+        /// Do not open the dashboard in a browser after startup
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Run the HTTP/SSE daemon on the agent-facing port.
+    Sse {
+        /// HTTP/SSE port (default: 8997)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+    },
 
     /// Launch interactive configuration wizard
     #[command(alias = "config")]
@@ -1051,5 +1072,28 @@ mod tests {
         assert_eq!(config.cache_mb, defaults.cache_mb);
         assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
         assert_eq!(config.allowed_paths, defaults.allowed_paths);
+    }
+
+    #[test]
+    fn dashboard_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "dashboard"]);
+
+        match cli.command {
+            Some(Commands::Dashboard { port, no_open }) => {
+                assert_eq!(port, None);
+                assert!(!no_open);
+            }
+            other => panic!("expected dashboard command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sse_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "sse"]);
+
+        match cli.command {
+            Some(Commands::Sse { port }) => assert_eq!(port, None),
+            other => panic!("expected sse command, got {:?}", other),
+        }
     }
 }
