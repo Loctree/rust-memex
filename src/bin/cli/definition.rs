@@ -801,6 +801,47 @@ pub enum Commands {
         db_path: Option<String>,
     },
 
+    /// Reindex an existing rmcp-memex namespace into '<namespace>-reindexed'
+    ///
+    /// This is the in-database equivalent of 'export -> reprocess' for namespaced
+    /// rmcp-memex stores. It reads the existing namespace, collapses onion families
+    /// back to canonical documents, and writes a rebuilt namespace without touching
+    /// the source data.
+    ///
+    /// Examples:
+    ///   rmcp-memex reindex -n kodowanie
+    ///   rmcp-memex reindex -n kodowanie --dry-run
+    ///   rmcp-memex reindex -n kodowanie --target-namespace kodowanie-v2 --slice-mode onion-fast
+    Reindex {
+        /// Source namespace to rebuild
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Target namespace override (default: '<namespace>-reindexed')
+        #[arg(long)]
+        target_namespace: Option<String>,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
     /// Audit database quality and text integrity
     ///
     /// Analyzes namespaces for embedding quality, text integrity (>90% target),

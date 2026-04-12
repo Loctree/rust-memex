@@ -1507,20 +1507,16 @@ async fn browse_handler(
         Some(ns.as_str())
     };
 
-    let all_docs = state
+    let documents: Vec<SearchResultJson> = state
         .rag
         .storage_manager()
-        .all_documents(namespace, params.limit + params.offset)
+        .all_documents_page(namespace, params.offset, params.limit)
         .await
         .map_err(|e| {
             error!("API: /api/browse/{} - error: {}", ns, e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    let documents: Vec<SearchResultJson> = all_docs
+        })?
         .into_iter()
-        .skip(params.offset)
-        .take(params.limit)
         .map(Into::into)
         .collect();
 
@@ -1543,20 +1539,16 @@ async fn browse_all_handler(
         params.limit, params.offset
     );
 
-    let all_docs = state
+    let documents: Vec<SearchResultJson> = state
         .rag
         .storage_manager()
-        .all_documents(None, params.limit + params.offset)
+        .all_documents_page(None, params.offset, params.limit)
         .await
         .map_err(|e| {
             error!("API: /api/browse (all) - error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    let documents: Vec<SearchResultJson> = all_docs
+        })?
         .into_iter()
-        .skip(params.offset)
-        .take(params.limit)
         .map(Into::into)
         .collect();
 

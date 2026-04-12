@@ -332,12 +332,15 @@ impl StorageManager {
         Ok(results)
     }
 
-    /// Return documents without running a vector search.
-    /// Used by admin/reporting paths that need a full table scan without
-    /// assuming any embedding dimension or creating a table on read.
-    pub async fn all_documents(
+    /// Return a single page of documents without running a vector search.
+    ///
+    /// Used by admin/reporting paths that need deterministic limit/offset
+    /// behavior without assuming any embedding dimension or creating a table on
+    /// read.
+    pub async fn all_documents_page(
         &self,
         namespace: Option<&str>,
+        offset: usize,
         limit: usize,
     ) -> Result<Vec<ChromaDocument>> {
         let table = match self.ensure_table(0).await {
@@ -345,7 +348,7 @@ impl StorageManager {
             Err(_) => return Ok(vec![]),
         };
 
-        let mut query = table.query().limit(limit);
+        let mut query = table.query().limit(limit).offset(offset);
         if let Some(ns) = namespace {
             query = query.only_if(self.namespace_filter(ns).as_str());
         }
@@ -358,6 +361,17 @@ impl StorageManager {
         }
 
         Ok(results)
+    }
+
+    /// Return documents without running a vector search.
+    /// Used by admin/reporting paths that need a bounded full-table scan
+    /// starting from the first row.
+    pub async fn all_documents(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ChromaDocument>> {
+        self.all_documents_page(namespace, 0, limit).await
     }
 
     pub async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>> {

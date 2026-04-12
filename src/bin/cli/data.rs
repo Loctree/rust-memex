@@ -96,6 +96,19 @@ struct ReprocessDocument {
     collapsed_records: usize,
 }
 
+struct RebuildPlan {
+    namespace: String,
+    db_path: String,
+    source_label: String,
+    source_records: usize,
+    docs: Vec<ReprocessDocument>,
+    slice_mode: SliceMode,
+    preprocess: bool,
+    skip_existing: bool,
+    dry_run: bool,
+    parse_errors: usize,
+}
+
 pub struct ReprocessConfig {
     pub namespace: String,
     pub input: PathBuf,
@@ -104,6 +117,20 @@ pub struct ReprocessConfig {
     pub skip_existing: bool,
     pub dry_run: bool,
     pub db_path: String,
+}
+
+pub struct ReindexConfig {
+    pub source_namespace: String,
+    pub target_namespace: String,
+    pub slice_mode: SliceMode,
+    pub preprocess: bool,
+    pub skip_existing: bool,
+    pub dry_run: bool,
+    pub db_path: String,
+}
+
+pub fn default_reindexed_namespace(namespace: &str) -> String {
+    format!("{namespace}-reindexed")
 }
 
 fn preferred_reprocess_id(record: &ExportRecord) -> String {
@@ -237,6 +264,156 @@ fn prepare_reprocess_metadata(
     }
 
     Value::Object(map)
+}
+
+fn parse_export_records(content: &str) -> (Vec<ExportRecord>, usize) {
+    let mut parse_errors = 0usize;
+    let mut records = Vec::new();
+
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<ExportRecord>(trimmed) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                parse_errors += 1;
+                eprintln!("  Line {}: parse error - {}", line_num + 1, err);
+            }
+        }
+    }
+
+    (records, parse_errors)
+}
+
+async fn run_reprocess_documents(
+    plan: RebuildPlan,
+    embedding_config: &EmbeddingConfig,
+) -> Result<()> {
+    let RebuildPlan {
+        namespace,
+        db_path,
+        source_label,
+        source_records,
+        docs,
+        slice_mode,
+        preprocess,
+        skip_existing,
+        dry_run,
+        parse_errors,
+    } = plan;
+
+    if docs.is_empty() {
+        eprintln!("No non-empty documents found after collapsing export records");
+        return Ok(());
+    }
+
+    let collapsed_records = source_records.saturating_sub(docs.len());
+
+    eprintln!(
+        "Reprocessing {} source records into {} canonical documents for namespace '{}'...",
+        source_records,
+        docs.len(),
+        namespace
+    );
+    eprintln!("  Source:       {}", source_label);
+    eprintln!("  Slice mode:   {}", reprocess_slice_mode_name(slice_mode));
+    eprintln!(
+        "  Preprocess:   {}",
+        if preprocess { "enabled" } else { "disabled" }
+    );
+    eprintln!(
+        "  Collapsed:    {} duplicate slice records",
+        collapsed_records
+    );
+    if parse_errors > 0 {
+        eprintln!("  Parse errors: {}", parse_errors);
+    }
+
+    if dry_run {
+        eprintln!();
+        eprintln!("Dry run only: no documents were written.");
+        return Ok(());
+    }
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+    let rag = RAGPipeline::new(embedding_client, storage).await?;
+    let preprocessor = preprocess.then(|| Preprocessor::new(PreprocessingConfig::default()));
+    let min_length = PreprocessingConfig::default().min_content_length;
+
+    let mut indexed = 0usize;
+    let mut replaced = 0usize;
+    let mut skipped_existing_count = 0usize;
+    let mut skipped_empty_count = 0usize;
+
+    for (idx, doc) in docs.iter().enumerate() {
+        let existing = rag.lookup_memory(&namespace, &doc.canonical_id).await?;
+        if let Some(existing_doc) = existing.as_ref()
+            && skip_existing
+            && existing_doc
+                .metadata
+                .get("reprocess_source_hash")
+                .and_then(Value::as_str)
+                == Some(doc.source_text_hash.as_str())
+        {
+            skipped_existing_count += 1;
+            continue;
+        }
+
+        let text = if let Some(preprocessor) = &preprocessor {
+            preprocessor.extract_semantic_content(&doc.text)
+        } else {
+            doc.text.clone()
+        };
+
+        if text.trim().is_empty() || (preprocess && text.trim().len() < min_length) {
+            skipped_empty_count += 1;
+            continue;
+        }
+
+        let metadata = prepare_reprocess_metadata(
+            &doc.metadata,
+            &doc.source_record_id,
+            &doc.source_text_hash,
+            doc.collapsed_records,
+            slice_mode,
+            &source_label,
+            preprocess,
+        );
+
+        if existing.is_some() {
+            replaced += 1;
+        }
+
+        rag.memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata)
+            .await?;
+        indexed += 1;
+
+        if (idx + 1) % 250 == 0 {
+            eprintln!("  Progress: {}/{} canonical documents", idx + 1, docs.len());
+        }
+    }
+
+    eprintln!();
+    eprintln!("Reprocess complete:");
+    eprintln!("  Indexed:         {}", indexed);
+    if replaced > 0 {
+        eprintln!("  Replaced:        {}", replaced);
+    }
+    if skipped_existing_count > 0 {
+        eprintln!("  Skipped existing: {}", skipped_existing_count);
+    }
+    if skipped_empty_count > 0 {
+        eprintln!("  Skipped empty:   {}", skipped_empty_count);
+    }
+    if parse_errors > 0 {
+        eprintln!("  Parse errors:    {}", parse_errors);
+    }
+
+    Ok(())
 }
 
 /// Export a namespace to JSONL file for portable backup
@@ -456,23 +633,7 @@ pub async fn run_reprocess(
     } = config;
 
     let (_validated_input, content) = path_utils::safe_read_to_string_async(&input).await?;
-    let mut parse_errors = 0usize;
-    let mut records = Vec::new();
-
-    for (line_num, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<ExportRecord>(trimmed) {
-            Ok(record) => records.push(record),
-            Err(err) => {
-                parse_errors += 1;
-                eprintln!("  Line {}: parse error - {}", line_num + 1, err);
-            }
-        }
-    }
+    let (records, parse_errors) = parse_export_records(&content);
 
     if records.is_empty() {
         eprintln!("No valid export records found in {:?}", input);
@@ -481,115 +642,77 @@ pub async fn run_reprocess(
 
     let source_records = records.len();
     let docs = collapse_export_records(records);
-    if docs.is_empty() {
-        eprintln!("No non-empty documents found after collapsing export records");
-        return Ok(());
-    }
-
-    let collapsed_records = source_records.saturating_sub(docs.len());
     let source_label = input.display().to_string();
 
-    eprintln!(
-        "Reprocessing {} source records into {} canonical documents for namespace '{}'...",
-        source_records,
-        docs.len(),
-        namespace
-    );
-    eprintln!("  Slice mode:   {}", reprocess_slice_mode_name(slice_mode));
-    eprintln!(
-        "  Preprocess:   {}",
-        if preprocess { "enabled" } else { "disabled" }
-    );
-    eprintln!(
-        "  Collapsed:    {} duplicate slice records",
-        collapsed_records
-    );
-    if parse_errors > 0 {
-        eprintln!("  Parse errors: {}", parse_errors);
-    }
+    run_reprocess_documents(
+        RebuildPlan {
+            namespace,
+            db_path,
+            source_label,
+            source_records,
+            docs,
+            slice_mode,
+            preprocess,
+            skip_existing,
+            dry_run,
+            parse_errors,
+        },
+        embedding_config,
+    )
+    .await
+}
 
-    if dry_run {
-        eprintln!();
-        eprintln!("Dry run only: no documents were written.");
+pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConfig) -> Result<()> {
+    let ReindexConfig {
+        source_namespace,
+        target_namespace,
+        slice_mode,
+        preprocess,
+        skip_existing,
+        dry_run,
+        db_path,
+    } = config;
+
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+    let docs = storage
+        .all_documents(Some(&source_namespace), 1_000_000)
+        .await?;
+    if docs.is_empty() {
+        eprintln!("No documents found in namespace '{}'", source_namespace);
         return Ok(());
     }
 
-    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
-    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
-    let rag = RAGPipeline::new(embedding_client, storage).await?;
-    let preprocessor = preprocess.then(|| Preprocessor::new(PreprocessingConfig::default()));
-    let min_length = PreprocessingConfig::default().min_content_length;
+    let records = docs
+        .into_iter()
+        .map(|doc| ExportRecord {
+            id: doc.id,
+            text: doc.document,
+            metadata: doc.metadata,
+            content_hash: doc.content_hash,
+            embeddings: None,
+        })
+        .collect::<Vec<_>>();
 
-    let mut indexed = 0usize;
-    let mut replaced = 0usize;
-    let mut skipped_existing_count = 0usize;
-    let mut skipped_empty_count = 0usize;
+    let source_records = records.len();
+    let collapsed = collapse_export_records(records);
+    let source_label = format!("namespace:{}@{}", source_namespace, db_path);
 
-    for (idx, doc) in docs.iter().enumerate() {
-        let existing = rag.lookup_memory(&namespace, &doc.canonical_id).await?;
-        if let Some(existing_doc) = existing.as_ref()
-            && skip_existing
-            && existing_doc
-                .metadata
-                .get("reprocess_source_hash")
-                .and_then(Value::as_str)
-                == Some(doc.source_text_hash.as_str())
-        {
-            skipped_existing_count += 1;
-            continue;
-        }
-
-        let text = if let Some(preprocessor) = &preprocessor {
-            preprocessor.extract_semantic_content(&doc.text)
-        } else {
-            doc.text.clone()
-        };
-
-        if text.trim().is_empty() || (preprocess && text.trim().len() < min_length) {
-            skipped_empty_count += 1;
-            continue;
-        }
-
-        let metadata = prepare_reprocess_metadata(
-            &doc.metadata,
-            &doc.source_record_id,
-            &doc.source_text_hash,
-            doc.collapsed_records,
+    run_reprocess_documents(
+        RebuildPlan {
+            namespace: target_namespace,
+            db_path,
+            source_label,
+            source_records,
+            docs: collapsed,
             slice_mode,
-            &source_label,
             preprocess,
-        );
-
-        if existing.is_some() {
-            replaced += 1;
-        }
-
-        rag.memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata)
-            .await?;
-        indexed += 1;
-
-        if (idx + 1) % 250 == 0 {
-            eprintln!("  Progress: {}/{} canonical documents", idx + 1, docs.len());
-        }
-    }
-
-    eprintln!();
-    eprintln!("Reprocess complete:");
-    eprintln!("  Indexed:         {}", indexed);
-    if replaced > 0 {
-        eprintln!("  Replaced:        {}", replaced);
-    }
-    if skipped_existing_count > 0 {
-        eprintln!("  Skipped existing: {}", skipped_existing_count);
-    }
-    if skipped_empty_count > 0 {
-        eprintln!("  Skipped empty:   {}", skipped_empty_count);
-    }
-    if parse_errors > 0 {
-        eprintln!("  Parse errors:    {}", parse_errors);
-    }
-
-    Ok(())
+            skip_existing,
+            dry_run,
+            parse_errors: 0,
+        },
+        embedding_config,
+    )
+    .await
 }
 
 // =============================================================================
@@ -1014,5 +1137,13 @@ mod tests {
         assert!(prepared.get("layer").is_none());
         assert!(prepared.get("original_id").is_none());
         assert!(prepared.get("content_hash").is_none());
+    }
+
+    #[test]
+    fn default_reindexed_namespace_appends_suffix() {
+        assert_eq!(
+            default_reindexed_namespace("kodowanie"),
+            "kodowanie-reindexed"
+        );
     }
 }
