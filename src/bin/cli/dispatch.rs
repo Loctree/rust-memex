@@ -453,6 +453,37 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = shellexpand::tilde(&db_path).to_string();
             run_import(namespace, input, skip_existing, db_path, &embedding_config).await
         }
+        Some(Commands::Reprocess {
+            namespace,
+            input,
+            slice_mode,
+            preprocess,
+            skip_existing,
+            dry_run,
+            db_path: cmd_db_path,
+        }) => {
+            let file_cfg = load_or_discover_config(cli.config.as_deref())?.0;
+            let embedding_config = file_cfg.resolve_embedding_config();
+            let db_path = cmd_db_path
+                .or(cli.db_path)
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+            let slice_mode = slice_mode.parse().unwrap_or_default();
+            run_reprocess(
+                ReprocessConfig {
+                    namespace,
+                    input,
+                    slice_mode,
+                    preprocess,
+                    skip_existing,
+                    dry_run,
+                    db_path,
+                },
+                &embedding_config,
+            )
+            .await
+        }
         Some(Commands::Audit {
             namespace,
             threshold,

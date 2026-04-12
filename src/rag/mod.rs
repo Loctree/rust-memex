@@ -2362,6 +2362,59 @@ impl RAGPipeline {
         }
     }
 
+    async fn index_text_memory_family_with_hash(
+        &self,
+        namespace: &str,
+        id: &str,
+        text: &str,
+        metadata: serde_json::Value,
+        slice_mode: SliceMode,
+    ) -> Result<()> {
+        let slice_mode_name = match slice_mode {
+            SliceMode::Onion => "onion",
+            SliceMode::OnionFast => "onion-fast",
+            SliceMode::Flat => "flat",
+        };
+        let content_hash = compute_content_hash(text);
+        let mut metadata = metadata;
+
+        if let serde_json::Value::Object(ref mut map) = metadata {
+            map.insert("slice_mode".to_string(), json!(slice_mode_name));
+            if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
+                map.insert("original_id".to_string(), json!(id));
+            }
+        }
+
+        match slice_mode {
+            SliceMode::Onion => {
+                self.index_with_onion_slicing_and_hash(text, namespace, metadata, &content_hash)
+                    .await?;
+            }
+            SliceMode::OnionFast => {
+                self.index_with_onion_slicing_fast_and_hash(
+                    text,
+                    namespace,
+                    metadata,
+                    &content_hash,
+                )
+                .await?;
+            }
+            SliceMode::Flat => {
+                let synthetic_path = Path::new(id);
+                self.index_with_flat_chunking_and_hash(
+                    text,
+                    namespace,
+                    synthetic_path,
+                    metadata,
+                    &content_hash,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn memory_upsert(
         &self,
         namespace: &str,
@@ -2387,7 +2440,7 @@ impl RAGPipeline {
         };
 
         self.delete_memory_family(namespace, &id).await?;
-        self.index_text_with_mode(Some(namespace), id, text, metadata, slice_mode)
+        self.index_text_memory_family_with_hash(namespace, &id, &text, metadata, slice_mode)
             .await?;
         Ok(())
     }

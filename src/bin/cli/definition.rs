@@ -760,6 +760,47 @@ pub enum Commands {
         db_path: Option<String>,
     },
 
+    /// Reprocess exported JSONL into a fresh namespace using the current chunker
+    ///
+    /// Useful when the original source files are gone but the namespace export is valuable.
+    /// The command collapses onion families back to a single canonical document, optionally
+    /// preprocesses the text, and re-indexes it with the requested slice mode.
+    ///
+    /// Examples:
+    ///   rmcp-memex export -n kodowanie -o kodowanie.jsonl
+    ///   rmcp-memex reprocess -i kodowanie.jsonl -n kodowanie-v2 --slice-mode onion-fast
+    ///   rmcp-memex reprocess -i memories.jsonl -n memories-v2 --preprocess --dry-run
+    #[command(alias = "reindex-export")]
+    Reprocess {
+        /// Target namespace for rebuilt documents
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Input JSONL file produced by 'export'
+        #[arg(long, short = 'i', required = true)]
+        input: PathBuf,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
     /// Audit database quality and text integrity
     ///
     /// Analyzes namespaces for embedding quality, text integrity (>90% target),
