@@ -51,7 +51,7 @@ Example response:
 {
   "status": "ok",
   "hint": "OK",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "db_path": "/Users/you/.rmcp-servers/rmcp-memex/lancedb",
   "embedding_provider": "ollama-local",
   "total_documents": 27455,

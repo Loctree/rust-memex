@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-memex"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
