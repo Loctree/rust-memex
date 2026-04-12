@@ -19,6 +19,7 @@ use crate::{
 
 // Async pipeline module for concurrent indexing
 pub mod pipeline;
+pub mod structured;
 pub use pipeline::{
     Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineResult,
     PipelineSnapshot, PipelineStats, run_pipeline,
@@ -234,6 +235,19 @@ impl Default for OnionSliceConfig {
     }
 }
 
+fn create_core_only_slice(content: &str) -> Vec<OnionSlice> {
+    let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
+    let keywords = extract_keywords(content, 5);
+    vec![OnionSlice {
+        id: core_id,
+        layer: SliceLayer::Core,
+        content: content.to_string(),
+        parent_id: None,
+        children_ids: vec![],
+        keywords,
+    }]
+}
+
 /// Create onion slices from content
 ///
 /// Algorithm:
@@ -243,23 +257,19 @@ impl Default for OnionSliceConfig {
 /// 4. Extract keywords/topic -> OUTER slice (~100 chars)
 pub fn create_onion_slices(
     content: &str,
-    _metadata: &serde_json::Value,
+    metadata: &serde_json::Value,
     config: &OnionSliceConfig,
 ) -> Vec<OnionSlice> {
+    if structured::is_structured_conversation(metadata) {
+        return structured::create_structured_onion_slices(content, metadata, config);
+    }
+
     let content = content.trim();
 
-    // For very short content, just create a single Core slice
+    // For very short content, keep at least Outer+Core for structured dialog turns
+    // so outer-only search can still see short but meaningful conversational units.
     if content.len() < config.min_content_for_slicing {
-        let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
-        let keywords = extract_keywords(content, 5);
-        return vec![OnionSlice {
-            id: core_id,
-            layer: SliceLayer::Core,
-            content: content.to_string(),
-            parent_id: None,
-            children_ids: vec![],
-            keywords,
-        }];
+        return create_core_only_slice(content);
     }
 
     let mut slices = Vec::with_capacity(4);
@@ -329,23 +339,18 @@ pub fn create_onion_slices(
 /// Outer layer enables fast keyword-style search, Core provides full content.
 pub fn create_onion_slices_fast(
     content: &str,
-    _metadata: &serde_json::Value,
+    metadata: &serde_json::Value,
     config: &OnionSliceConfig,
 ) -> Vec<OnionSlice> {
+    if structured::is_structured_conversation(metadata) {
+        return structured::create_structured_onion_slices_fast(content, metadata, config);
+    }
+
     let content = content.trim();
 
-    // For very short content, just create a single Core slice
+    // Fast mode keeps the same structured short-content behavior as full onion mode.
     if content.len() < config.min_content_for_slicing {
-        let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
-        let keywords = extract_keywords(content, 5);
-        return vec![OnionSlice {
-            id: core_id,
-            layer: SliceLayer::Core,
-            content: content.to_string(),
-            parent_id: None,
-            children_ids: vec![],
-            keywords,
-        }];
+        return create_core_only_slice(content);
     }
 
     let mut slices = Vec::with_capacity(2);
@@ -482,6 +487,268 @@ fn hash_content(text: &str) -> String {
     let mut hash = compute_content_hash(text);
     hash.truncate(16);
     hash
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRole {
+    User,
+    Assistant,
+    Reasoning,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MarkdownTranscriptTurn {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    user_segments: Vec<String>,
+    assistant_segments: Vec<String>,
+    reasoning_segments: Vec<String>,
+}
+
+impl MarkdownTranscriptTurn {
+    fn is_empty(&self) -> bool {
+        self.user_segments.is_empty()
+            && self.assistant_segments.is_empty()
+            && self.reasoning_segments.is_empty()
+    }
+
+    fn push(&mut self, role: TranscriptRole, time: &str, text: String) {
+        if self.start_time.is_none() {
+            self.start_time = Some(time.to_string());
+        }
+        self.end_time = Some(time.to_string());
+
+        let target = match role {
+            TranscriptRole::User => &mut self.user_segments,
+            TranscriptRole::Assistant => &mut self.assistant_segments,
+            TranscriptRole::Reasoning => &mut self.reasoning_segments,
+        };
+
+        if target.last().is_some_and(|existing| existing == &text) {
+            return;
+        }
+        target.push(text);
+    }
+}
+
+fn parse_transcript_header(line: &str) -> Option<HashMap<String, String>> {
+    let inner = line
+        .trim()
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .trim();
+
+    if !inner.starts_with("project:") {
+        return None;
+    }
+
+    let mut fields = HashMap::new();
+    for segment in inner.split(" | ") {
+        let (key, value) = segment.split_once(':')?;
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+
+    Some(fields)
+}
+
+fn parse_transcript_entry_line(line: &str) -> Option<(String, TranscriptRole, String)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let (time, rest) = rest.split_once(']')?;
+    let is_timestamp = time.len() == 8
+        && time.chars().enumerate().all(|(idx, ch)| match idx {
+            2 | 5 => ch == ':',
+            _ => ch.is_ascii_digit(),
+        });
+    if !is_timestamp {
+        return None;
+    }
+
+    let (role, body) = rest.trim_start().split_once(':')?;
+    let role = match role.trim() {
+        "user" => TranscriptRole::User,
+        "assistant" => TranscriptRole::Assistant,
+        "reasoning" => TranscriptRole::Reasoning,
+        _ => return None,
+    };
+
+    Some((time.to_string(), role, body.trim_start().to_string()))
+}
+
+fn normalize_role_aware_turn(turn: &MarkdownTranscriptTurn) -> Option<String> {
+    let mut sections = Vec::new();
+
+    if !turn.user_segments.is_empty() {
+        sections.push(format!(
+            "User request:\n{}",
+            turn.user_segments.join("\n")
+        ));
+    }
+    if !turn.assistant_segments.is_empty() {
+        sections.push(format!(
+            "Assistant response:\n{}",
+            turn.assistant_segments.join("\n")
+        ));
+    }
+    if !turn.reasoning_segments.is_empty() {
+        sections.push(format!(
+            "Reasoning focus:\n{}",
+            turn.reasoning_segments.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(sections.join("\n\n"))
+}
+
+fn extract_markdown_transcript_documents(
+    raw: &str,
+    source_path: &std::path::Path,
+) -> Option<Vec<(String, String, serde_json::Value)>> {
+    let mut header = HashMap::new();
+    let mut current_entry: Option<(String, TranscriptRole, String)> = None;
+    let mut entries = Vec::new();
+    let mut in_signals = false;
+    let mut signal_lines = Vec::new();
+
+    for line in raw.lines() {
+        if header.is_empty()
+            && let Some(parsed) = parse_transcript_header(line)
+        {
+            header = parsed;
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed == "[signals]" {
+            in_signals = true;
+            continue;
+        }
+        if trimmed == "[/signals]" {
+            in_signals = false;
+            continue;
+        }
+
+        if let Some((time, role, body)) = parse_transcript_entry_line(line) {
+            if let Some(entry) = current_entry.take() {
+                entries.push(entry);
+            }
+            current_entry = Some((time, role, body));
+            continue;
+        }
+
+        if in_signals {
+            if !trimmed.is_empty() {
+                signal_lines.push(trimmed.to_string());
+            }
+            continue;
+        }
+
+        if let Some((_, _, ref mut text)) = current_entry
+            && !trimmed.is_empty()
+        {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(trimmed);
+        }
+    }
+
+    if let Some(entry) = current_entry.take() {
+        entries.push(entry);
+    }
+
+    if header.is_empty() || entries.is_empty() {
+        return None;
+    }
+
+    let project = header
+        .get("project")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let agent = header
+        .get("agent")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let date = header
+        .get("date")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let source_name = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let transcript_id = hash_content(&source_path.to_string_lossy());
+    let signals_summary = if signal_lines.is_empty() {
+        None
+    } else {
+        Some(signal_lines.join("\n"))
+    };
+
+    let mut turns = Vec::new();
+    let mut current_turn = MarkdownTranscriptTurn::default();
+
+    for (time, role, text) in entries {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        if matches!(role, TranscriptRole::User) && !current_turn.is_empty() {
+            turns.push(current_turn);
+            current_turn = MarkdownTranscriptTurn::default();
+        }
+
+        current_turn.push(role, &time, text.to_string());
+    }
+
+    if !current_turn.is_empty() {
+        turns.push(current_turn);
+    }
+
+    let mut docs = Vec::new();
+    for (idx, turn) in turns.into_iter().enumerate() {
+        let Some(content) = normalize_role_aware_turn(&turn) else {
+            continue;
+        };
+
+        if content.len() < 50 {
+            continue;
+        }
+
+        let doc_id = format!(
+            "mdturn-{}-{:04}-{}",
+            transcript_id,
+            idx,
+            hash_content(&content)
+        );
+
+        let mut metadata = json!({
+            "project": project,
+            "agent": agent,
+            "date": date,
+            "source": source_name,
+            "path": source_path.to_str(),
+            "turn_index": idx,
+            "type": "transcript_turn",
+            "format": "markdown_transcript",
+            "start_time": turn.start_time,
+            "end_time": turn.end_time,
+        });
+
+        if let Some(summary) = signals_summary.as_ref()
+            && let serde_json::Value::Object(ref mut map) = metadata
+        {
+            map.insert("signals".to_string(), json!(summary));
+        }
+
+        docs.push((doc_id, content, metadata));
+    }
+
+    if docs.is_empty() { None } else { Some(docs) }
 }
 
 /// Extract conversation documents from JSON with smart format detection.
@@ -1516,54 +1783,34 @@ impl RAGPipeline {
                 );
             }
 
-            // Check if this is a conversation message - store directly without chunking
-            let is_conversation = doc_metadata
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t == "conversation")
-                .unwrap_or(false);
-
-            let chunks = if is_conversation {
-                // Store conversation message as single document (no chunking!)
-                self.index_conversation_message_direct(
-                    &doc_id,
-                    &content,
-                    namespace,
-                    doc_metadata,
-                    &doc_hash,
-                )
-                .await?
-            } else {
-                // Index with onion/flat slicing for non-conversation content
-                match slice_mode {
-                    SliceMode::Onion => {
-                        self.index_with_onion_slicing_and_hash(
-                            &content,
-                            namespace,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
-                    SliceMode::OnionFast => {
-                        self.index_with_onion_slicing_fast_and_hash(
-                            &content,
-                            namespace,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
-                    SliceMode::Flat => {
-                        self.index_with_flat_chunking_and_hash(
-                            &content,
-                            namespace,
-                            path,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
+            let chunks = match slice_mode {
+                SliceMode::Onion => {
+                    self.index_with_onion_slicing_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::OnionFast => {
+                    self.index_with_onion_slicing_fast_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::Flat => {
+                    self.index_with_flat_chunking_and_hash(
+                        &content,
+                        namespace,
+                        path,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
                 }
             };
 
@@ -1958,42 +2205,6 @@ impl RAGPipeline {
         }
 
         Ok(())
-    }
-
-    /// Index a conversation message directly without chunking.
-    /// Each message is stored as a single document with its own embedding.
-    /// Used for smart-extracted conversation messages where chunking would lose context.
-    async fn index_conversation_message_direct(
-        &self,
-        doc_id: &str,
-        text: &str,
-        namespace: &str,
-        metadata: serde_json::Value,
-        content_hash: &str,
-    ) -> Result<usize> {
-        // Embed the entire message as one unit
-        let embedding = self.embed_query(text).await?;
-
-        // Create document with the smart-extracted ID (msg-XXX-NNNN-HASH)
-        let doc = ChromaDocument::new_flat_with_hash(
-            doc_id.to_string(),
-            namespace.to_string(),
-            embedding,
-            metadata,
-            text.to_string(),
-            content_hash.to_string(),
-        );
-
-        // Store directly
-        self.persist_documents(vec![doc]).await?;
-
-        tracing::debug!(
-            "Conversation message stored directly: {} ({} chars)",
-            doc_id,
-            text.len()
-        );
-
-        Ok(1) // One document stored
     }
 
     /// Index using traditional flat chunking with content hash for deduplication
@@ -2426,6 +2637,22 @@ impl RAGPipeline {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+
+        if matches!(ext.as_str(), "md" | "markdown") {
+            let (_p, raw) = crate::path_utils::safe_read_to_string_async(path).await?;
+            if let Some(docs) = extract_markdown_transcript_documents(&raw, path) {
+                tracing::info!(
+                    "Markdown transcript detected: {} -> {} turn documents",
+                    path.display(),
+                    docs.len()
+                );
+                return Ok(docs);
+            }
+
+            let doc_id = format!("{}:0", path.display());
+            let metadata = json!({ "path": path.to_str(), "index": 0 });
+            return Ok(vec![(doc_id, raw, metadata)]);
+        }
 
         // Only process JSON files specially
         if ext != "json" {
@@ -3124,9 +3351,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SearchOptions, SliceLayer, extract_keywords, hash_content, metadata_matches_project,
+        OnionSliceConfig, SearchOptions, SliceLayer, create_onion_slices,
+        create_onion_slices_fast, extract_keywords, extract_markdown_transcript_documents,
+        hash_content, metadata_matches_project,
     };
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn short_hash_uses_sha256_prefix_with_minimum_length() {
@@ -3173,5 +3403,55 @@ mod tests {
             SearchOptions::default().layer_filter,
             Some(SliceLayer::Outer)
         );
+    }
+
+    #[test]
+    fn markdown_transcript_extraction_builds_role_aware_turn_docs() {
+        let raw = r#"[project: VetCoders/vibecrafted | agent: codex | date: 2026-03-30]
+
+[signals]
+Results:
+- AICX lookup działa
+[/signals]
+
+[09:14:00] assistant: Tak, i to właśnie jest sedno: `aicx-dragon` to żywy endpoint MCP.
+[09:15:33] user: ziom ale ty sobie sam skonfigurowałeś ~/.codex/config.toml
+[09:15:47] assistant: Sprawdzam teraz lokalny kontrakt konfiguracji MCP dla Codexa.
+[09:15:55] reasoning: **Checking config contract**
+[09:16:06] assistant: Składnia configu wygląda już poprawnie według samego Codexa.
+"#;
+
+        let docs = extract_markdown_transcript_documents(raw, Path::new("sample.md"))
+            .expect("expected transcript docs");
+
+        assert_eq!(docs.len(), 2);
+        assert!(docs[0].1.contains("Assistant response:"));
+        assert!(docs[1].1.contains("User request:"));
+        assert!(docs[1].1.contains("Reasoning focus:"));
+        assert_eq!(docs[1].2["format"], "markdown_transcript");
+        assert_eq!(docs[1].2["type"], "transcript_turn");
+        assert_eq!(docs[1].2["project"], "VetCoders/vibecrafted");
+    }
+
+    #[test]
+    fn short_structured_transcript_turns_keep_outer_slice_in_full_and_fast_modes() {
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript"
+        });
+        let config = OnionSliceConfig::default();
+        let content = "User request:\nDodaj progress do pipeline.\n\nAssistant response:\nPodepnę licznik etapów.";
+
+        let full_layers: Vec<SliceLayer> = create_onion_slices(content, &metadata, &config)
+            .into_iter()
+            .map(|slice| slice.layer)
+            .collect();
+        let fast_layers: Vec<SliceLayer> = create_onion_slices_fast(content, &metadata, &config)
+            .into_iter()
+            .map(|slice| slice.layer)
+            .collect();
+
+        assert_eq!(full_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
+        assert_eq!(fast_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
     }
 }
