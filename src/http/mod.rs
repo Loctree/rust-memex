@@ -1327,9 +1327,10 @@ struct DiscoverySnapshot {
 }
 
 async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
+    let refresh_error = refresh_namespace_cache(state).await.err();
     let cache = state.cached_namespaces.read().await;
     let activity = state.namespace_activity.read().await;
-    let cache_ready = cache.is_some();
+    let cache_ready = refresh_error.is_none();
 
     let namespaces: Vec<DiscoveryNamespaceInfo> = cache
         .as_ref()
@@ -1350,7 +1351,9 @@ async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
 
     DiscoverySnapshot {
         cache_ready,
-        hint: discovery_hint(cache_ready).to_string(),
+        hint: refresh_error
+            .map(|error| format!("{}: {}", discovery_hint(false), error))
+            .unwrap_or_else(|| discovery_hint(true).to_string()),
         namespaces,
     }
 }
@@ -1370,8 +1373,10 @@ async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
     DiscoveryResponse {
         status: if snapshot.cache_ready {
             "ok"
+        } else if snapshot.namespaces.is_empty() {
+            "error"
         } else {
-            "loading"
+            "stale"
         }
         .to_string(),
         hint: snapshot.hint,
@@ -1384,19 +1389,14 @@ async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
     }
 }
 
-async fn refresh_namespace_cache(state: &HttpState) {
-    match state.rag.storage_manager().list_namespaces().await {
-        Ok(ns_list) => {
-            let namespaces: Vec<NamespaceInfo> = ns_list
-                .into_iter()
-                .map(|(name, count)| NamespaceInfo { name, count })
-                .collect();
-            *state.cached_namespaces.write().await = Some(namespaces);
-        }
-        Err(error) => {
-            warn!("Namespace cache refresh failed: {}", error);
-        }
-    }
+async fn refresh_namespace_cache(state: &HttpState) -> anyhow::Result<()> {
+    let ns_list = state.rag.storage_manager().list_namespaces().await?;
+    let namespaces: Vec<NamespaceInfo> = ns_list
+        .into_iter()
+        .map(|(name, count)| NamespaceInfo { name, count })
+        .collect();
+    *state.cached_namespaces.write().await = Some(namespaces);
+    Ok(())
 }
 
 async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
@@ -1405,24 +1405,14 @@ async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
         .write()
         .await
         .insert(namespace.to_string(), chrono::Utc::now().to_rfc3339());
-    refresh_namespace_cache(state).await;
-}
-
-fn namespaces_response_from_snapshot(snapshot: &DiscoverySnapshot) -> NamespacesResponse {
-    NamespacesResponse {
-        total: snapshot.namespaces.len(),
-        namespaces: snapshot
-            .namespaces
-            .iter()
-            .map(|ns| NamespaceInfo {
-                name: ns.id.clone(),
-                count: ns.count,
-            })
-            .collect(),
+    if let Err(error) = refresh_namespace_cache(state).await {
+        warn!(
+            "Namespace cache refresh failed after activity update: {}",
+            error
+        );
     }
 }
 
-#[cfg(test)]
 fn namespaces_response_from_discovery(discovery: &DiscoveryResponse) -> NamespacesResponse {
     NamespacesResponse {
         total: discovery.namespaces.len(),
@@ -1446,15 +1436,6 @@ fn overview_response_from_discovery(discovery: &DiscoveryResponse) -> OverviewRe
     }
 }
 
-fn status_response_from_snapshot(snapshot: &DiscoverySnapshot) -> serde_json::Value {
-    json!({
-        "cache_ready": snapshot.cache_ready,
-        "namespace_count": snapshot.namespaces.len(),
-        "hint": snapshot.hint,
-    })
-}
-
-#[cfg(test)]
 fn status_response_from_discovery(discovery: &DiscoveryResponse) -> serde_json::Value {
     json!({
         "cache_ready": discovery.status == "ok",
@@ -1471,8 +1452,8 @@ async fn dashboard_handler() -> Html<String> {
 
 /// List all namespaces with document counts (GET /api/namespaces)
 async fn namespaces_handler(State(state): State<HttpState>) -> Json<NamespacesResponse> {
-    Json(namespaces_response_from_snapshot(
-        &build_discovery_snapshot(&state).await,
+    Json(namespaces_response_from_discovery(
+        &build_discovery_response(&state).await,
     ))
 }
 
@@ -1485,8 +1466,8 @@ async fn overview_handler(State(state): State<HttpState>) -> Json<OverviewRespon
 
 /// System status including cache state (GET /api/status)
 async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    Json(status_response_from_snapshot(
-        &build_discovery_snapshot(&state).await,
+    Json(status_response_from_discovery(
+        &build_discovery_response(&state).await,
     ))
 }
 
@@ -1565,13 +1546,12 @@ async fn browse_all_handler(
 async fn refresh_handler(
     State(state): State<HttpState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state.rag.refresh().await.map_err(|e| {
+    refresh_namespace_cache(&state).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Refresh failed: {}", e),
         )
     })?;
-    refresh_namespace_cache(&state).await;
 
     Ok(Json(serde_json::json!({
         "status": "refreshed",
@@ -2252,8 +2232,10 @@ async fn delete_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.remove_memory(&ns, &id).await {
         Ok(deleted) => {
-            if deleted > 0 {
-                refresh_namespace_cache(&state).await;
+            if deleted > 0
+                && let Err(error) = refresh_namespace_cache(&state).await
+            {
+                warn!("Namespace cache refresh failed after delete: {}", error);
             }
             Ok(Json(serde_json::json!({
                 "status": if deleted > 0 { "deleted" } else { "not_found" },
@@ -2276,7 +2258,9 @@ async fn purge_namespace_handler(
     match state.rag.clear_namespace(&namespace).await {
         Ok(deleted) => {
             state.namespace_activity.write().await.remove(&namespace);
-            refresh_namespace_cache(&state).await;
+            if let Err(error) = refresh_namespace_cache(&state).await {
+                warn!("Namespace cache refresh failed after purge: {}", error);
+            }
             Ok(Json(serde_json::json!({
                 "status": "purged",
                 "namespace": namespace,
@@ -2560,6 +2544,56 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        embeddings::EmbeddingClient,
+        security::{NamespaceAccessManager, NamespaceSecurityConfig},
+        storage::StorageManager,
+    };
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn build_test_http_state(db_path: &str) -> HttpState {
+        let embedding_client = Arc::new(Mutex::new(EmbeddingClient::stub_for_tests()));
+        let storage = Arc::new(StorageManager::new(db_path).await.expect("storage"));
+        let rag = Arc::new(
+            RAGPipeline::new(embedding_client.clone(), storage)
+                .await
+                .expect("rag"),
+        );
+        let access_manager = Arc::new(NamespaceAccessManager::new(
+            NamespaceSecurityConfig::default(),
+        ));
+
+        HttpState {
+            rag: rag.clone(),
+            mcp_core: Arc::new(McpCore::new(
+                rag,
+                None,
+                embedding_client,
+                1024 * 1024,
+                vec![],
+                access_manager,
+            )),
+            mcp_sessions: Arc::new(McpSessionManager::new()),
+            mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
+            cached_namespaces: Arc::new(RwLock::new(None)),
+            namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            auth_token: None,
+        }
+    }
+
+    async fn write_namespace_doc(storage: &StorageManager, namespace: &str, id: &str) {
+        storage
+            .add_to_store(vec![ChromaDocument::new_flat(
+                id.to_string(),
+                namespace.to_string(),
+                vec![0.5, 0.25],
+                json!({"source": "external-test"}),
+                format!("document for {namespace}"),
+            )])
+            .await
+            .expect("external write");
+    }
 
     #[test]
     fn test_search_request_defaults() {
@@ -2669,6 +2703,31 @@ mod tests {
         assert_eq!(status["cache_ready"], true);
         assert_eq!(status["namespace_count"], 2);
         assert_eq!(status["hint"], "OK");
+    }
+
+    #[tokio::test]
+    async fn test_discovery_refreshes_namespace_inventory_after_external_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+        let external_storage = StorageManager::new(&db_path_str)
+            .await
+            .expect("external storage");
+
+        write_namespace_doc(&external_storage, "alpha", "alpha-1").await;
+        let first = build_discovery_response(&state).await;
+        assert_eq!(first.status, "ok");
+        assert_eq!(first.namespace_count, 1);
+        assert_eq!(first.namespaces[0].id, "alpha");
+
+        write_namespace_doc(&external_storage, "beta", "beta-1").await;
+        let second = build_discovery_response(&state).await;
+        let namespace_ids: Vec<_> = second.namespaces.iter().map(|ns| ns.id.as_str()).collect();
+
+        assert_eq!(second.status, "ok");
+        assert_eq!(second.namespace_count, 2);
+        assert_eq!(namespace_ids, vec!["alpha", "beta"]);
     }
 
     #[test]
