@@ -236,7 +236,7 @@ impl EmbedderState {
             return match self.dimension_truth {
                 DimensionTruth::Inferred => format!(
                     "Inferred from the model name and now verifying against the live provider. {}",
-                    dimension_explanation(self.dimension)
+                    dimension_explanation(self.dimension, self.selected_model().as_deref())
                 ),
                 _ => "No reliable heuristic for this model yet; probing the provider for the actual vector size.".to_string(),
             };
@@ -262,26 +262,26 @@ impl EmbedderState {
                 if let Some(model) = self.selected_model() {
                     format!(
                         "No trustworthy dimension has been established for `{model}` yet. {}",
-                        dimension_explanation(self.dimension)
+                        dimension_explanation(self.dimension, self.selected_model().as_deref())
                     )
                 } else {
                     format!(
                         "Select an embedding model or enter one manually. {}",
-                        dimension_explanation(self.dimension)
+                        dimension_explanation(self.dimension, self.selected_model().as_deref())
                     )
                 }
             }
             DimensionTruth::Inferred => format!(
                 "Derived from the model name. Health Check can still verify it live. {}",
-                dimension_explanation(self.dimension)
+                dimension_explanation(self.dimension, self.selected_model().as_deref())
             ),
             DimensionTruth::Probed => format!(
                 "Verified live against the provider response. {}",
-                dimension_explanation(self.dimension)
+                dimension_explanation(self.dimension, self.selected_model().as_deref())
             ),
             DimensionTruth::Manual => format!(
                 "Set manually by the operator. {}",
-                dimension_explanation(self.dimension)
+                dimension_explanation(self.dimension, self.selected_model().as_deref())
             ),
         }
     }
@@ -609,6 +609,23 @@ impl App {
             )
         })
     }
+
+    fn toggle_deployment_mode(&mut self) {
+        self.memex_cfg.deployment_mode = match self.memex_cfg.deployment_mode {
+            DeploymentMode::PerHostStdio => {
+                if self.mux_proxy_on_path() {
+                    DeploymentMode::SharedMux
+                } else {
+                    self.messages.push(
+                        "[WARN] Shared mux mode is unavailable until `rmcp_mux_proxy` or `rmcp-mux-proxy` is on PATH.".to_string(),
+                    );
+                    DeploymentMode::PerHostStdio
+                }
+            }
+            DeploymentMode::SharedMux => DeploymentMode::PerHostStdio,
+        };
+    }
+
     pub fn new(config: WizardConfig) -> Self {
         let WizardConfig {
             config_path,
@@ -943,7 +960,7 @@ impl App {
     }
 
     pub(crate) fn settings_field_count(&self) -> usize {
-        6 + usize::from(self.mux_proxy_on_path())
+        7
     }
 
     pub fn get_field_value(&self, field: usize) -> String {
@@ -961,8 +978,20 @@ impl App {
             4 => self.memex_cfg.log_level.clone(),
             5 => self.memex_cfg.max_request_bytes.to_string(),
             6 => match self.memex_cfg.deployment_mode {
-                DeploymentMode::PerHostStdio => "Per-host (direct)".to_string(),
-                DeploymentMode::SharedMux => "Shared (mux)".to_string(),
+                DeploymentMode::PerHostStdio => {
+                    if self.mux_proxy_on_path() {
+                        "Per-host (direct)".to_string()
+                    } else {
+                        "Per-host (shared unavailable)".to_string()
+                    }
+                }
+                DeploymentMode::SharedMux => {
+                    if self.mux_proxy_on_path() {
+                        "Shared (mux)".to_string()
+                    } else {
+                        "Shared (blocked: proxy missing)".to_string()
+                    }
+                }
             },
             _ => String::new(),
         }
@@ -1082,12 +1111,7 @@ impl App {
                     self.memex_cfg.max_request_bytes = v;
                 }
             }
-            6 => {
-                self.memex_cfg.deployment_mode = match self.memex_cfg.deployment_mode {
-                    DeploymentMode::PerHostStdio => DeploymentMode::SharedMux,
-                    DeploymentMode::SharedMux => DeploymentMode::PerHostStdio,
-                };
-            }
+            6 => self.toggle_deployment_mode(),
             _ => {}
         }
     }
@@ -2046,5 +2070,36 @@ mod tests {
                 .to_string()
                 .contains("Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH")
         );
+    }
+
+    #[test]
+    fn deployment_mode_toggle_without_proxy_stays_direct_and_warns() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = None;
+
+        app.set_field_value(6, String::new());
+
+        assert_eq!(app.memex_cfg.deployment_mode, DeploymentMode::PerHostStdio);
+        assert_eq!(
+            app.get_field_value(6),
+            "Per-host (shared unavailable)".to_string()
+        );
+        assert!(
+            app.messages
+                .last()
+                .expect("warning message")
+                .contains("Shared mux mode is unavailable")
+        );
+    }
+
+    #[test]
+    fn deployment_mode_toggle_with_proxy_enables_shared_mux() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = Some("/usr/local/bin/rmcp-mux-proxy".to_string());
+
+        app.set_field_value(6, String::new());
+
+        assert_eq!(app.memex_cfg.deployment_mode, DeploymentMode::SharedMux);
+        assert_eq!(app.get_field_value(6), "Shared (mux)".to_string());
     }
 }

@@ -410,15 +410,22 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
 }
 
 /// Get dimension explanation for UI
-pub fn dimension_explanation(dim: usize) -> &'static str {
+pub fn dimension_explanation(dim: usize, model_name: Option<&str>) -> String {
+    let model = model_name.unwrap_or("").to_ascii_lowercase();
+    let is_qwen = model.contains("qwen");
+
     match dim {
-        2560 => "Qwen3-Embedding 4B (2560 dims) - balanced default",
-        4096 => "Large Qwen3 embedding models (4096 dims)",
-        2048 => "Qwen3-VL embedding models (2048 dims) - compact and accurate",
-        1024 => "BGE-M3/mxbai-embed (1024 dims) - good balance",
-        768 => "nomic-embed (768 dims) - fast and lightweight",
-        384 => "all-minilm (384 dims) - fastest, lowest quality",
-        _ => "Custom dimension - ensure all providers match",
+        4096 if is_qwen => "Qwen3 Embedding 8B natively (4096 dims)".to_string(),
+        2560 if is_qwen => "Qwen3 Embedding 4B or MRL-truncated 8B (2560 dims)".to_string(),
+        1024 if is_qwen => "Qwen3 Embedding 0.6B or MRL-truncated (1024 dims)".to_string(),
+        2048 if is_qwen => "Qwen3-VL Embedding (2048 dims)".to_string(),
+        2560 => "Default baseline dimension (2560 dims)".to_string(),
+        4096 => "Large embedding models (4096 dims)".to_string(),
+        2048 => "Compact and accurate embedding models (2048 dims)".to_string(),
+        1024 => "BGE-M3/mxbai-embed or MRL (1024 dims) - good balance".to_string(),
+        768 => "nomic-embed (768 dims) - fast and lightweight".to_string(),
+        384 => "all-minilm (384 dims) - fastest, lowest quality".to_string(),
+        _ => "Custom dimension - ensure all providers match".to_string(),
     }
 }
 

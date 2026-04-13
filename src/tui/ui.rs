@@ -215,15 +215,16 @@ fn settings_fields(app: &App) -> Vec<(&'static str, String, &'static str)> {
             app.get_field_value(5),
             "JSON-RPC size limit",
         ),
-    ];
-
-    if app.mux_proxy_on_path() {
-        fields.push((
+        (
             "Deployment Mode",
             app.get_field_value(6),
-            "direct stdio or shared mux",
-        ));
-    }
+            if app.mux_proxy_on_path() {
+                "direct stdio or shared mux"
+            } else {
+                "shared mux requires rmcp_mux_proxy on PATH"
+            },
+        ),
+    ];
 
     fields
 }
@@ -1108,5 +1109,16 @@ mod tests {
     fn settings_fields_track_live_app_field_count() {
         let app = App::new(WizardConfig::default());
         assert_eq!(settings_fields(&app).len(), app.settings_field_count());
+    }
+
+    #[test]
+    fn settings_fields_keep_deployment_mode_visible_without_mux_proxy() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = None;
+
+        let fields = settings_fields(&app);
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[6].0, "Deployment Mode");
+        assert_eq!(fields[6].1, "Per-host (shared unavailable)".to_string());
     }
 }
