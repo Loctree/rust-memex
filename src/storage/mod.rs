@@ -10,11 +10,13 @@ use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::rag::SliceLayer;
 
@@ -170,6 +172,49 @@ pub struct StorageManager {
     lance_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossStoreRecoveryStatus {
+    #[default]
+    Pending,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossStoreRecoveryDocumentRef {
+    pub namespace: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossStoreRecoveryBatch {
+    pub batch_id: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub status: CrossStoreRecoveryStatus,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub documents: Vec<CrossStoreRecoveryDocumentRef>,
+}
+
+impl CrossStoreRecoveryBatch {
+    pub fn from_documents(documents: &[ChromaDocument]) -> Self {
+        Self {
+            batch_id: Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: CrossStoreRecoveryStatus::Pending,
+            last_error: None,
+            documents: documents
+                .iter()
+                .map(|document| CrossStoreRecoveryDocumentRef {
+                    namespace: document.namespace.clone(),
+                    id: document.id.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 type BatchIter =
     RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>;
 
@@ -209,6 +254,81 @@ impl StorageManager {
 
     pub fn lance_path(&self) -> &str {
         &self.lance_path
+    }
+
+    pub fn cross_store_recovery_dir(&self) -> PathBuf {
+        let db_path = Path::new(&self.lance_path);
+        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lancedb");
+        parent.join(format!(".{stem}-cross-store-recovery"))
+    }
+
+    fn cross_store_recovery_batch_path(&self, batch_id: &str) -> PathBuf {
+        self.cross_store_recovery_dir()
+            .join(format!("{batch_id}.json"))
+    }
+
+    fn write_cross_store_recovery_batch(&self, batch: &CrossStoreRecoveryBatch) -> Result<PathBuf> {
+        let dir = self.cross_store_recovery_dir();
+        std::fs::create_dir_all(&dir)?;
+
+        let path = self.cross_store_recovery_batch_path(&batch.batch_id);
+        let tmp_path = path.with_extension("json.tmp");
+        let payload = serde_json::to_vec_pretty(batch)?;
+
+        std::fs::write(&tmp_path, payload)?;
+        std::fs::rename(&tmp_path, &path)?;
+
+        Ok(path)
+    }
+
+    pub fn persist_cross_store_recovery_batch(
+        &self,
+        batch: &CrossStoreRecoveryBatch,
+    ) -> Result<PathBuf> {
+        self.write_cross_store_recovery_batch(batch)
+    }
+
+    pub fn update_cross_store_recovery_batch(
+        &self,
+        batch: &CrossStoreRecoveryBatch,
+    ) -> Result<PathBuf> {
+        self.write_cross_store_recovery_batch(batch)
+    }
+
+    pub fn clear_cross_store_recovery_batch(&self, batch_id: &str) -> Result<()> {
+        let path = self.cross_store_recovery_batch_path(batch_id);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn list_cross_store_recovery_batches(&self) -> Result<Vec<CrossStoreRecoveryBatch>> {
+        let dir = self.cross_store_recovery_dir();
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+
+        let mut batches = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = std::fs::read(&path)?;
+            let batch: CrossStoreRecoveryBatch = serde_json::from_slice(&payload)?;
+            batches.push(batch);
+        }
+
+        batches.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        Ok(batches)
     }
 
     /// Refresh the table connection to see new data written by other processes.

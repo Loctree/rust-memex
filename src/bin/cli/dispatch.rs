@@ -497,6 +497,14 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             };
             run_gc(gc_config, cfg.db_path, json).await
         }
+        Some(Commands::RepairWrites {
+            namespace,
+            execute,
+            json,
+        }) => {
+            let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
+            run_repair_writes(cfg.db_path, namespace, execute, json).await
+        }
         Some(Commands::CrossSearch {
             query,
             limit,

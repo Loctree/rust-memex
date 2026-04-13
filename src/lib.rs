@@ -50,6 +50,9 @@ pub use query::{
 pub use rag::{
     Chunk as PipelineChunk,
     ContextPrefixConfig,
+    CrossStoreRecoveryBatchReport,
+    CrossStoreRecoveryReport,
+    CrossStoreRecoveryState,
     EmbeddedChunk,
     EnrichedChunk,
     FileContent,
@@ -69,6 +72,8 @@ pub use rag::{
     compute_content_hash,
     create_enriched_chunks,
     create_onion_slices,
+    inspect_cross_store_recovery,
+    repair_cross_store_recovery,
     // Async pipeline exports
     run_pipeline,
 };
@@ -78,7 +83,8 @@ pub use search::{
 };
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{
-    ChromaDocument, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+    ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
+    CrossStoreRecoveryStatus, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
 };
 
 // High-level engine API
