@@ -1359,6 +1359,9 @@ impl StorageManager {
 
     /// List all unique namespaces in the database
     pub async fn list_namespaces(&self) -> Result<Vec<(String, usize)>> {
+        // Namespace inventory is a control-plane truth surface. Re-open the table
+        // before scanning so listings can observe writes made by other processes.
+        self.refresh().await?;
         let all_docs = self.all_documents(None, 1_000_000).await?;
 
         let mut namespace_counts: std::collections::HashMap<String, usize> =
