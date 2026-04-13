@@ -184,7 +184,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn settings_fields(app: &App) -> Vec<(&'static str, String, &'static str)> {
-    let mut fields = vec![
+    let fields = vec![
         (
             "Database Path",
             app.memex_cfg.db_path.clone(),
