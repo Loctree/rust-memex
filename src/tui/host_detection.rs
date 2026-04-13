@@ -22,11 +22,10 @@ pub struct McpServerEntry {
     pub env: HashMap<String, String>,
 }
 
-pub const DEFAULT_MUX_PROXY_CMD: &str = "rmcp_mux_proxy";
 pub const DEFAULT_MUX_SERVICE_NAME: &str = "rmcp-memex";
-pub const DEFAULT_MUX_SOCKET_PATH: &str = "~/.rmcp_servers/rmcp-memex/sockets/main.sock";
-pub const DEFAULT_MUX_CONFIG_PATH: &str = "~/.rmcp_servers/rmcp-memex/mux_config.toml";
-const DEFAULT_MUX_STATUS_PATH: &str = "~/.rmcp_servers/rmcp-memex/status/main.json";
+pub const DEFAULT_MUX_SOCKET_PATH: &str = "~/.rmcp-servers/rmcp-memex/sockets/main.sock";
+pub const DEFAULT_MUX_CONFIG_PATH: &str = "~/.rmcp-servers/rmcp-memex/mux_config.toml";
+const DEFAULT_MUX_STATUS_PATH: &str = "~/.rmcp-servers/rmcp-memex/status/main.json";
 const RMCP_MEMEX_SERVER_NAME: &str = "rmcp_memex";
 const MUX_MAX_ACTIVE_CLIENTS: usize = 5;
 const MUX_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -372,8 +371,8 @@ fn build_direct_host_entry(
     build_server_entry(binary_path, direct_command_args(config_path, http_port))
 }
 
-fn build_mux_host_entry(sock_path: &str) -> McpServerEntry {
-    build_server_entry(DEFAULT_MUX_PROXY_CMD, proxy_command_args(sock_path))
+fn build_mux_host_entry(proxy_command: &str, sock_path: &str) -> McpServerEntry {
+    build_server_entry(proxy_command, proxy_command_args(sock_path))
 }
 
 fn entry_description(entry: &McpServerEntry) -> &'static str {
@@ -701,16 +700,21 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
     results
 }
 
-pub fn generate_extended_snippet_mux(kind: ExtendedHostKind, sock_path: &str) -> String {
+pub fn generate_extended_snippet_mux(
+    kind: ExtendedHostKind,
+    proxy_command: &str,
+    sock_path: &str,
+) -> String {
     let Some((_, format)) = get_extended_host_config_path(kind) else {
         return String::new();
     };
 
-    render_snippet(format, &build_mux_host_entry(sock_path)).unwrap_or_default()
+    render_snippet(format, &build_mux_host_entry(proxy_command, sock_path)).unwrap_or_default()
 }
 
 pub fn write_extended_host_config_mux(
     kind: ExtendedHostKind,
+    proxy_command: &str,
     sock_path: &str,
 ) -> Result<WriteResult> {
     let (path, format) =
@@ -720,7 +724,7 @@ pub fn write_extended_host_config_mux(
         &path,
         format,
         path.exists(),
-        &build_mux_host_entry(sock_path),
+        &build_mux_host_entry(proxy_command, sock_path),
     )
 }
 
@@ -1066,9 +1070,10 @@ args = []
     fn test_generate_mux_snippet_uses_proxy_command() {
         let snippet = generate_extended_snippet_mux(
             ExtendedHostKind::Standard(HostKind::Claude),
+            "/custom/bin/rmcp-mux-proxy",
             DEFAULT_MUX_SOCKET_PATH,
         );
-        assert!(snippet.contains(DEFAULT_MUX_PROXY_CMD));
+        assert!(snippet.contains("/custom/bin/rmcp-mux-proxy"));
         assert!(snippet.contains("--socket"));
         assert!(snippet.contains(DEFAULT_MUX_SOCKET_PATH));
     }
@@ -1085,11 +1090,11 @@ args = []
         .unwrap();
 
         assert!(config.contains("[servers.rmcp-memex]"));
-        assert!(config.contains("socket = \"~/.rmcp_servers/rmcp-memex/sockets/main.sock\""));
+        assert!(config.contains("socket = \"~/.rmcp-servers/rmcp-memex/sockets/main.sock\""));
         assert!(config.contains("cmd = \"/usr/bin/rmcp-memex\""));
         assert!(config.contains("--http-port"));
         assert!(config.contains("8765"));
-        assert!(config.contains("status_file = \"~/.rmcp_servers/rmcp-memex/status/main.json\""));
+        assert!(config.contains("status_file = \"~/.rmcp-servers/rmcp-memex/status/main.json\""));
         assert!(config.contains("service_name = \"rmcp-memex\""));
         assert!(config.contains("max_request_bytes = 4194304"));
     }
