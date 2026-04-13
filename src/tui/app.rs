@@ -585,17 +585,29 @@ pub struct App {
     pub index_paused: bool,
     /// Whether rmcp-memex config has been written
     pub config_written: bool,
-    /// Cached mux proxy availability.
-    pub mux_proxy_available: bool,
+    /// Resolved mux proxy command/path if available.
+    pub mux_proxy_command: Option<String>,
 }
 
-fn mux_proxy_on_path() -> bool {
-    which_binary(&["rmcp_mux_proxy", "rmcp-mux-proxy"]).is_some()
+fn which_mux_proxy() -> Option<String> {
+    which_binary(&["rmcp_mux_proxy", "rmcp-mux-proxy"])
 }
 
 impl App {
     pub fn mux_proxy_on_path(&self) -> bool {
-        self.mux_proxy_available
+        self.mux_proxy_command.is_some()
+    }
+
+    pub fn mux_proxy_command(&self) -> Option<&str> {
+        self.mux_proxy_command.as_deref()
+    }
+
+    fn required_mux_proxy_command(&self) -> Result<&str> {
+        self.mux_proxy_command().ok_or_else(|| {
+            anyhow!(
+                "Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before writing host configs."
+            )
+        })
     }
     pub fn new(config: WizardConfig) -> Self {
         let WizardConfig {
@@ -606,7 +618,7 @@ impl App {
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp-memex".to_string());
         let embedder_state = EmbedderState::default();
         let embedding_config = embedder_state.build_embedding_config();
-        let mux_proxy_available = mux_proxy_on_path();
+        let mux_proxy_command = which_mux_proxy();
 
         Self {
             step: WizardStep::Welcome,
@@ -638,7 +650,7 @@ impl App {
             index_parallelism: DEFAULT_INDEX_PARALLELISM,
             index_paused: false,
             config_written: false,
-            mux_proxy_available,
+            mux_proxy_command,
         }
     }
 
@@ -702,9 +714,18 @@ impl App {
                         &config_path,
                         self.memex_cfg.http_port,
                     ),
-                    DeploymentMode::SharedMux => {
-                        generate_extended_snippet_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
-                    }
+                    DeploymentMode::SharedMux => self
+                        .mux_proxy_command()
+                        .map(|proxy_command| {
+                            generate_extended_snippet_mux(
+                                *kind,
+                                proxy_command,
+                                DEFAULT_MUX_SOCKET_PATH,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "Shared mux unavailable: install `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before generating host snippets.".to_string()
+                        }),
                 };
                 (*kind, snippet)
             })
@@ -761,6 +782,11 @@ impl App {
 
     pub fn write_configs(&mut self) -> Result<()> {
         let config_path = self.resolved_config_path();
+        let mux_proxy_command = if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+            Some(self.required_mux_proxy_command()?.to_string())
+        } else {
+            None
+        };
 
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
@@ -777,9 +803,13 @@ impl App {
                             &config_path,
                             self.memex_cfg.http_port,
                         ),
-                        DeploymentMode::SharedMux => {
-                            generate_extended_snippet_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
-                        }
+                        DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                            *kind,
+                            mux_proxy_command
+                                .as_deref()
+                                .expect("mux proxy command must exist in shared mode"),
+                            DEFAULT_MUX_SOCKET_PATH,
+                        ),
                     };
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
@@ -848,9 +878,13 @@ impl App {
                         &config_path,
                         self.memex_cfg.http_port,
                     ),
-                    DeploymentMode::SharedMux => {
-                        write_extended_host_config_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
-                    }
+                    DeploymentMode::SharedMux => write_extended_host_config_mux(
+                        *kind,
+                        mux_proxy_command
+                            .as_deref()
+                            .expect("mux proxy command must exist in shared mode"),
+                        DEFAULT_MUX_SOCKET_PATH,
+                    ),
                 };
 
                 match write_result {
@@ -1993,5 +2027,24 @@ mod tests {
         assert_eq!(app.embedder_state.dimension, 1536);
         assert_eq!(app.embedder_state.dimension_truth, DimensionTruth::Manual);
         assert_eq!(app.embedding_config.required_dimension, 1536);
+    }
+
+    #[test]
+    fn shared_mux_write_requires_resolved_proxy_command() {
+        let mut app = App::new(WizardConfig {
+            dry_run: true,
+            ..WizardConfig::default()
+        });
+        app.memex_cfg.deployment_mode = DeploymentMode::SharedMux;
+        app.mux_proxy_command = None;
+
+        let error = app
+            .write_configs()
+            .expect_err("shared mux should be blocked");
+        assert!(
+            error
+                .to_string()
+                .contains("Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH")
+        );
     }
 }
