@@ -1,15 +1,17 @@
 use anyhow::Result;
+use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::{Mutex, Semaphore};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, PreprocessingConfig, RAGPipeline,
-    SliceMode, StorageManager, path_utils,
+    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, PipelineConfig, PipelineEvent,
+    PipelineSnapshot, PreprocessingConfig, RAGPipeline, SliceMode, StorageManager, path_utils,
 };
 
 #[allow(dead_code)]
@@ -77,23 +79,65 @@ fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, O
 
 use crate::cli::config::*;
 use crate::cli::definition::*;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct IndexCheckpointStats {
+    pub total_files: usize,
+    pub files_read: usize,
+    pub files_skipped: usize,
+    pub files_committed: usize,
+    pub files_failed: usize,
+    pub chunks_created: usize,
+    pub chunks_embedded: usize,
+    pub chunks_stored: usize,
+    pub errors: usize,
+}
+
+impl From<&PipelineSnapshot> for IndexCheckpointStats {
+    fn from(snapshot: &PipelineSnapshot) -> Self {
+        Self {
+            total_files: snapshot.total_files,
+            files_read: snapshot.files_read,
+            files_skipped: snapshot.files_skipped,
+            files_committed: snapshot.files_committed,
+            files_failed: snapshot.files_failed,
+            chunks_created: snapshot.chunks_created,
+            chunks_embedded: snapshot.chunks_embedded,
+            chunks_stored: snapshot.chunks_stored,
+            errors: snapshot.errors,
+        }
+    }
+}
+
 /// Checkpoint for resumable indexing
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexCheckpoint {
     /// Namespace being indexed
     pub namespace: String,
+    /// Database path tied to this checkpoint
+    #[serde(default)]
+    pub db_path: Option<String>,
     /// Files that have been successfully indexed (canonical paths)
     pub indexed_files: HashSet<String>,
+    /// Content hashes that were durably committed or already satisfied
+    #[serde(default)]
+    pub indexed_hashes: HashSet<String>,
     /// When checkpoint was last updated
     pub updated_at: String,
+    /// Optional runtime stats snapshot
+    #[serde(default)]
+    pub stats: Option<IndexCheckpointStats>,
 }
 
 impl IndexCheckpoint {
-    pub fn new(namespace: &str) -> Self {
+    pub fn new(namespace: &str, db_path: &str) -> Self {
         Self {
             namespace: namespace.to_string(),
+            db_path: Some(db_path.to_string()),
             indexed_files: HashSet::new(),
+            indexed_hashes: HashSet::new(),
             updated_at: chrono::Utc::now().to_rfc3339(),
+            stats: None,
         }
     }
 
@@ -117,6 +161,7 @@ impl IndexCheckpoint {
     }
 
     pub fn save(&mut self, db_path: &str) -> Result<()> {
+        self.db_path = Some(db_path.to_string());
         self.updated_at = chrono::Utc::now().to_rfc3339();
         let path = Self::checkpoint_path(db_path, &self.namespace);
         let json = serde_json::to_string_pretty(self)?;
@@ -130,13 +175,24 @@ impl IndexCheckpoint {
     }
 
     pub fn mark_indexed(&mut self, file_path: &Path) {
+        self.mark_indexed_with_hash(file_path, None);
+    }
+
+    pub fn mark_indexed_with_hash(&mut self, file_path: &Path, content_hash: Option<&str>) {
         self.indexed_files
             .insert(file_path.to_string_lossy().to_string());
+        if let Some(content_hash) = content_hash {
+            self.indexed_hashes.insert(content_hash.to_string());
+        }
     }
 
     pub fn is_indexed(&self, file_path: &Path) -> bool {
         self.indexed_files
             .contains(&file_path.to_string_lossy().to_string())
+    }
+
+    pub fn update_from_snapshot(&mut self, snapshot: &PipelineSnapshot) {
+        self.stats = Some(IndexCheckpointStats::from(snapshot));
     }
 }
 
@@ -154,7 +210,7 @@ pub struct BatchIndexConfig {
     pub slice_mode: SliceMode,
     pub dedup: bool,
     pub embedding_config: EmbeddingConfig,
-    /// Show smart progress bar with calibration-based ETA
+    /// Show progress bar with calibration-based ETA
     pub show_progress: bool,
     /// Resume from checkpoint if interrupted
     pub resume: bool,
@@ -175,6 +231,151 @@ pub enum FileIndexResult {
     SkippedResume,
     /// Indexing failed
     Failed,
+}
+
+struct PipelineProgressRenderer {
+    total_files: usize,
+    progress_bar: Option<ProgressBar>,
+    last_line_at: Instant,
+}
+
+impl PipelineProgressRenderer {
+    fn new(total_files: usize, interactive: bool) -> Self {
+        let progress_bar = if interactive {
+            let pb = ProgressBar::new(total_files as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} files | {msg}")
+                    .expect("invalid pipeline progress template")
+                    .progress_chars("#>-"),
+            );
+            Some(pb)
+        } else {
+            None
+        };
+
+        Self {
+            total_files,
+            progress_bar,
+            last_line_at: Instant::now() - Duration::from_secs(5),
+        }
+    }
+
+    fn render(&mut self, snapshot: &PipelineSnapshot, force: bool) {
+        let terminal_files =
+            snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
+        let eta = snapshot
+            .eta
+            .map(HumanDuration)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "--".to_string());
+        let message = format!(
+            "stored {} chunks | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
+            snapshot.chunks_stored,
+            snapshot.chunks_per_sec,
+            eta,
+            snapshot.reader_queue_depth,
+            snapshot.chunker_queue_depth,
+            snapshot.storage_queue_depth,
+            snapshot.current_embed_batch_items,
+            snapshot.current_embed_batch_chars,
+            snapshot.bottleneck
+        );
+
+        if let Some(progress_bar) = &self.progress_bar {
+            progress_bar.set_length(self.total_files as u64);
+            progress_bar.set_position(terminal_files.min(self.total_files) as u64);
+            progress_bar.set_message(message);
+            if force && terminal_files >= self.total_files {
+                progress_bar.finish_with_message("complete");
+            }
+            return;
+        }
+
+        if !force && self.last_line_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+
+        self.last_line_at = Instant::now();
+        eprintln!(
+            "[pipeline] {}/{} files | committed {} skipped {} failed {} | chunks {} stored {} | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
+            terminal_files.min(self.total_files),
+            self.total_files,
+            snapshot.files_committed,
+            snapshot.files_skipped,
+            snapshot.files_failed,
+            snapshot.chunks_created,
+            snapshot.chunks_stored,
+            snapshot.chunks_per_sec,
+            eta,
+            snapshot.reader_queue_depth,
+            snapshot.chunker_queue_depth,
+            snapshot.storage_queue_depth,
+            snapshot.current_embed_batch_items,
+            snapshot.current_embed_batch_chars,
+            snapshot.bottleneck
+        );
+    }
+}
+
+async fn consume_pipeline_events(
+    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+    checkpoint: Option<Arc<Mutex<IndexCheckpoint>>>,
+    db_path: String,
+    show_progress: bool,
+    interactive_progress: bool,
+    total_files: usize,
+) -> PipelineSnapshot {
+    let mut renderer =
+        show_progress.then(|| PipelineProgressRenderer::new(total_files, interactive_progress));
+    let mut latest_snapshot = PipelineSnapshot {
+        total_files,
+        ..Default::default()
+    };
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            PipelineEvent::FileCommitted {
+                path, content_hash, ..
+            } => {
+                if let Some(checkpoint) = &checkpoint {
+                    let mut checkpoint = checkpoint.lock().await;
+                    checkpoint.mark_indexed_with_hash(&path, Some(&content_hash));
+                    let _ = checkpoint.save(&db_path);
+                }
+            }
+            PipelineEvent::FileSkipped {
+                path, content_hash, ..
+            } => {
+                if let Some(checkpoint) = &checkpoint {
+                    let mut checkpoint = checkpoint.lock().await;
+                    checkpoint.mark_indexed_with_hash(&path, Some(&content_hash));
+                    let _ = checkpoint.save(&db_path);
+                }
+            }
+            PipelineEvent::Snapshot(snapshot) => {
+                latest_snapshot = snapshot;
+                if let Some(checkpoint) = &checkpoint {
+                    let mut checkpoint = checkpoint.lock().await;
+                    checkpoint.update_from_snapshot(&latest_snapshot);
+                    let _ = checkpoint.save(&db_path);
+                }
+                if let Some(renderer) = &mut renderer {
+                    renderer.render(&latest_snapshot, false);
+                }
+            }
+            PipelineEvent::FileRead { .. }
+            | PipelineEvent::ChunksCreated { .. }
+            | PipelineEvent::ChunksEmbedded { .. }
+            | PipelineEvent::Error { .. } => {}
+        }
+    }
+
+    if let Some(renderer) = &mut renderer {
+        renderer.render(&latest_snapshot, true);
+    }
+
+    latest_snapshot
 }
 
 /// Run batch indexing with optional pipeline mode for concurrent processing
@@ -215,15 +416,13 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         SliceMode::Flat => "flat (traditional chunks)",
     };
 
-    // Use compact progress viewport automatically on interactive terminals.
-    let use_compact_progress = std::io::stderr().is_terminal();
-    if show_progress && !use_compact_progress {
+    let use_progress_bar = show_progress && std::io::stderr().is_terminal();
+    if show_progress && !use_progress_bar {
         eprintln!("Warning: --progress requires an interactive terminal (using line logs)");
     }
 
-    let tracker = if use_compact_progress {
-        let mut t = IndexProgressTracker::pre_scan(&files);
-        t.set_run_context(mode_name, dedup, preprocess, parallel);
+    let tracker = if use_progress_bar {
+        let t = IndexProgressTracker::pre_scan(&files);
         t.display_pre_scan();
         Some(t)
     } else {
@@ -255,39 +454,100 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         if preprocess {
             eprintln!("Warning: --preprocess is not supported in pipeline mode (ignoring)");
         }
-        if resume {
-            eprintln!("Warning: --resume is not supported in pipeline mode (ignoring)");
+
+        let checkpoint = if resume {
+            if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
+                let resumed_count = cp.indexed_files.len();
+                eprintln!(
+                    "Resuming from checkpoint: {} files already committed",
+                    resumed_count
+                );
+                Arc::new(Mutex::new(cp))
+            } else {
+                Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+            }
+        } else {
+            IndexCheckpoint::delete(&db_path, ns_name);
+            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+        };
+
+        let (pipeline_files, resumed_count, disable_storage_dedup) = if resume {
+            let checkpoint_guard = checkpoint.lock().await;
+            let resumed_count = checkpoint_guard.indexed_files.len();
+            let filtered_files: Vec<PathBuf> = files
+                .iter()
+                .filter(|path| !checkpoint_guard.is_indexed(path))
+                .cloned()
+                .collect();
+            let disable_storage_dedup = resumed_count > 0;
+            (filtered_files, resumed_count, disable_storage_dedup)
+        } else {
+            (files.clone(), 0, false)
+        };
+
+        if pipeline_files.is_empty() {
+            eprintln!("Pipeline resume complete: all files already committed");
+            if resume {
+                IndexCheckpoint::delete(&db_path, ns_name);
+            }
+            return Ok(());
         }
-        if show_progress {
-            eprintln!("Warning: --progress is not supported in pipeline mode (ignoring)");
+
+        if disable_storage_dedup {
+            eprintln!(
+                "Pipeline resume: using checkpoint truth for committed files to avoid partial-write false positives"
+            );
         }
 
         eprintln!(
-            "Pipeline mode: {} files, slice mode: {:?}",
-            total, slice_mode
+            "Pipeline mode: {} files ({} discovered, {} resumed), slice mode: {:?}",
+            pipeline_files.len(),
+            total,
+            resumed_count,
+            slice_mode
         );
         eprintln!("Running concurrent stages: reader -> chunker -> embedder -> storage");
 
-        let pipeline_config = rmcp_memex::PipelineConfig {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let event_task = tokio::spawn(consume_pipeline_events(
+            event_rx,
+            resume.then_some(Arc::clone(&checkpoint)),
+            db_path.clone(),
+            show_progress,
+            use_progress_bar,
+            pipeline_files.len(),
+        ));
+
+        let pipeline_config = PipelineConfig {
             slice_mode,
-            dedup_enabled: dedup,
+            dedup_enabled: dedup && !disable_storage_dedup,
+            event_sender: Some(event_tx),
             ..Default::default()
         };
 
-        let result = rmcp_memex::run_pipeline(
-            files,
+        let pipeline_run = rmcp_memex::run_pipeline(
+            pipeline_files,
             ns_name.to_string(),
             storage,
             embedding_client,
             pipeline_config,
         )
-        .await?;
+        .await;
+        let snapshot = event_task.await?;
+        let result = pipeline_run?;
 
         eprintln!();
         eprintln!("Pipeline complete:");
+        eprintln!("  Files committed:   {}", result.stats.files_committed);
         eprintln!("  Files read:        {}", result.stats.files_read);
         if result.stats.files_skipped > 0 {
             eprintln!("  Files skipped:     {}", result.stats.files_skipped);
+        }
+        if result.stats.files_failed > 0 {
+            eprintln!("  Files failed:      {}", result.stats.files_failed);
+        }
+        if resumed_count > 0 {
+            eprintln!("  Skipped (resumed): {}", resumed_count);
         }
         eprintln!("  Chunks created:    {}", result.stats.chunks_created);
         eprintln!("  Chunks embedded:   {}", result.stats.chunks_embedded);
@@ -295,8 +555,19 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         if result.stats.errors > 0 {
             eprintln!("  Errors:            {}", result.stats.errors);
         }
+        eprintln!("  Bottleneck:        {}", snapshot.bottleneck);
         eprintln!("  Namespace:         {}", ns_name);
         eprintln!("  DB path:           {}", expanded_db);
+
+        if resume && result.stats.files_failed == 0 {
+            IndexCheckpoint::delete(&db_path, ns_name);
+            eprintln!("Checkpoint cleared (pipeline completed successfully)");
+        } else if resume && result.stats.files_failed > 0 {
+            eprintln!(
+                "Checkpoint preserved ({} files failed - rerun with --resume to retry)",
+                result.stats.files_failed
+            );
+        }
 
         return Ok(());
     }
@@ -321,12 +592,12 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             );
             Arc::new(Mutex::new(cp))
         } else {
-            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name)))
+            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
         }
     } else {
         // Clean start - remove any stale checkpoint
         IndexCheckpoint::delete(&db_path, ns_name);
-        Arc::new(Mutex::new(IndexCheckpoint::new(ns_name)))
+        Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
     };
 
     // Atomic counters for thread-safe progress tracking
@@ -474,9 +745,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     total_chunks_count.fetch_add(chunks_indexed, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        t.lock()
-                            .await
-                            .file_indexed_path(&display_path, chunks_indexed);
+                        t.lock().await.file_indexed(chunks_indexed);
                     } else {
                         eprintln!("  -> {} done ({} chunks)", display_path, chunks_indexed);
                     }
@@ -503,7 +772,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     skipped_count.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        t.lock().await.file_skipped_path(&display_path, &reason);
+                        t.lock().await.file_skipped();
                     } else {
                         eprintln!("  -> {} SKIPPED ({})", display_path, reason);
                     }
@@ -530,8 +799,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     failed_count.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(ref t) = tracker {
-                        let error_text = e.to_string();
-                        t.lock().await.file_failed_path(&display_path, &error_text);
+                        t.lock().await.file_failed();
                     } else {
                         eprintln!("  -> {} FAILED: {}", display_path, e);
                     }

@@ -442,11 +442,6 @@ impl BM25Index {
         Ok(1)
     }
 
-    #[deprecated(note = "use delete_namespace_term")]
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.delete_namespace_term(namespace).await
-    }
-
     /// Escape special query characters
     fn escape_query(query: &str) -> String {
         // Tantivy query syntax special characters

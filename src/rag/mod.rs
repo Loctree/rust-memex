@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use pdf_extract;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,8 +19,10 @@ use crate::{
 
 // Async pipeline module for concurrent indexing
 pub mod pipeline;
+pub mod structured;
 pub use pipeline::{
-    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineResult, PipelineStats, run_pipeline,
+    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineResult,
+    PipelineSnapshot, PipelineStats, run_pipeline,
 };
 
 const DEFAULT_NAMESPACE: &str = "rag";
@@ -233,6 +235,19 @@ impl Default for OnionSliceConfig {
     }
 }
 
+fn create_core_only_slice(content: &str) -> Vec<OnionSlice> {
+    let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
+    let keywords = extract_keywords(content, 5);
+    vec![OnionSlice {
+        id: core_id,
+        layer: SliceLayer::Core,
+        content: content.to_string(),
+        parent_id: None,
+        children_ids: vec![],
+        keywords,
+    }]
+}
+
 /// Create onion slices from content
 ///
 /// Algorithm:
@@ -242,23 +257,19 @@ impl Default for OnionSliceConfig {
 /// 4. Extract keywords/topic -> OUTER slice (~100 chars)
 pub fn create_onion_slices(
     content: &str,
-    _metadata: &serde_json::Value,
+    metadata: &serde_json::Value,
     config: &OnionSliceConfig,
 ) -> Vec<OnionSlice> {
+    if structured::is_structured_conversation(metadata) {
+        return structured::create_structured_onion_slices(content, metadata, config);
+    }
+
     let content = content.trim();
 
-    // For very short content, just create a single Core slice
+    // For very short content, keep at least Outer+Core for structured dialog turns
+    // so outer-only search can still see short but meaningful conversational units.
     if content.len() < config.min_content_for_slicing {
-        let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
-        let keywords = extract_keywords(content, 5);
-        return vec![OnionSlice {
-            id: core_id,
-            layer: SliceLayer::Core,
-            content: content.to_string(),
-            parent_id: None,
-            children_ids: vec![],
-            keywords,
-        }];
+        return create_core_only_slice(content);
     }
 
     let mut slices = Vec::with_capacity(4);
@@ -328,23 +339,18 @@ pub fn create_onion_slices(
 /// Outer layer enables fast keyword-style search, Core provides full content.
 pub fn create_onion_slices_fast(
     content: &str,
-    _metadata: &serde_json::Value,
+    metadata: &serde_json::Value,
     config: &OnionSliceConfig,
 ) -> Vec<OnionSlice> {
+    if structured::is_structured_conversation(metadata) {
+        return structured::create_structured_onion_slices_fast(content, metadata, config);
+    }
+
     let content = content.trim();
 
-    // For very short content, just create a single Core slice
+    // Fast mode keeps the same structured short-content behavior as full onion mode.
     if content.len() < config.min_content_for_slicing {
-        let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
-        let keywords = extract_keywords(content, 5);
-        return vec![OnionSlice {
-            id: core_id,
-            layer: SliceLayer::Core,
-            content: content.to_string(),
-            parent_id: None,
-            children_ids: vec![],
-            keywords,
-        }];
+        return create_core_only_slice(content);
     }
 
     let mut slices = Vec::with_capacity(2);
@@ -402,15 +408,15 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
 
     // Tokenize and count word frequencies
     let mut word_counts: HashMap<String, usize> = HashMap::new();
-    for word in text.split_whitespace() {
-        let cleaned: String = word
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-
-        if cleaned.len() >= 3 && !stop_set.contains(cleaned.as_str()) {
-            *word_counts.entry(cleaned).or_insert(0) += 1;
+    for raw in text.split_whitespace() {
+        for token in tokenize_keyword_candidates(raw) {
+            if token.len() >= 3
+                && token.len() <= 30
+                && !stop_set.contains(token.as_str())
+                && !looks_like_session_token(&token)
+            {
+                *word_counts.entry(token).or_insert(0) += 1;
+            }
         }
     }
 
@@ -425,6 +431,57 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
         .collect()
 }
 
+fn tokenize_keyword_candidates(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    for segment in raw
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        let compact: String = segment.chars().flat_map(|ch| ch.to_lowercase()).collect();
+        let mut normalized = String::with_capacity(segment.len() * 2);
+        let mut previous_is_lowercase = false;
+
+        for ch in segment.chars() {
+            if ch.is_ascii_uppercase() && previous_is_lowercase {
+                normalized.push(' ');
+            }
+
+            normalized.push(ch.to_ascii_lowercase());
+            previous_is_lowercase = ch.is_ascii_lowercase();
+        }
+
+        let segment_tokens = normalized
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        tokens.extend(segment_tokens.iter().cloned());
+
+        if segment_tokens.len() > 1
+            && compact.len() >= 3
+            && compact.len() <= 30
+            && !tokens.iter().any(|token| token == &compact)
+        {
+            tokens.push(compact);
+        }
+    }
+
+    tokens
+}
+
+fn looks_like_session_token(token: &str) -> bool {
+    let hex_chars = token.chars().filter(|ch| ch.is_ascii_hexdigit()).count();
+    let digit_chars = token.chars().filter(|ch| ch.is_ascii_digit()).count();
+    let alpha_chars = token.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+
+    token.len() > 12 && hex_chars == token.len()
+        || digit_chars >= 6
+        || (token.len() > 20 && alpha_chars < token.len() / 3)
+}
+
 /// Create short hash for document deduplication
 fn hash_content(text: &str) -> String {
     let mut hash = compute_content_hash(text);
@@ -432,8 +489,296 @@ fn hash_content(text: &str) -> String {
     hash
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRole {
+    User,
+    Assistant,
+    Reasoning,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredDialogEntry {
+    time: Option<String>,
+    role: TranscriptRole,
+    text: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MarkdownTranscriptTurn {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    user_segments: Vec<String>,
+    assistant_segments: Vec<String>,
+    reasoning_segments: Vec<String>,
+}
+
+impl MarkdownTranscriptTurn {
+    fn is_empty(&self) -> bool {
+        self.user_segments.is_empty()
+            && self.assistant_segments.is_empty()
+            && self.reasoning_segments.is_empty()
+    }
+
+    fn push(&mut self, role: TranscriptRole, time: &str, text: String) {
+        if !time.is_empty() {
+            if self.start_time.is_none() {
+                self.start_time = Some(time.to_string());
+            }
+            self.end_time = Some(time.to_string());
+        }
+
+        let target = match role {
+            TranscriptRole::User => &mut self.user_segments,
+            TranscriptRole::Assistant => &mut self.assistant_segments,
+            TranscriptRole::Reasoning => &mut self.reasoning_segments,
+        };
+
+        if target.last().is_some_and(|existing| existing == &text) {
+            return;
+        }
+        target.push(text);
+    }
+}
+
+fn parse_transcript_header(line: &str) -> Option<HashMap<String, String>> {
+    let inner = line.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+
+    if !inner.starts_with("project:") {
+        return None;
+    }
+
+    let mut fields = HashMap::new();
+    for segment in inner.split(" | ") {
+        let (key, value) = segment.split_once(':')?;
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+
+    Some(fields)
+}
+
+fn parse_transcript_role(role: &str) -> Option<TranscriptRole> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "user" | "human" => Some(TranscriptRole::User),
+        "assistant" | "bot" | "model" => Some(TranscriptRole::Assistant),
+        "reasoning" | "analysis" | "thinking" | "tool" => Some(TranscriptRole::Reasoning),
+        _ => None,
+    }
+}
+
+fn parse_transcript_entry_line(line: &str) -> Option<(String, TranscriptRole, String)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let (time, rest) = rest.split_once(']')?;
+    let is_timestamp = time.len() == 8
+        && time.chars().enumerate().all(|(idx, ch)| match idx {
+            2 | 5 => ch == ':',
+            _ => ch.is_ascii_digit(),
+        });
+    if !is_timestamp {
+        return None;
+    }
+
+    let (role, body) = rest.trim_start().split_once(':')?;
+    let role = parse_transcript_role(role)?;
+
+    Some((time.to_string(), role, body.trim_start().to_string()))
+}
+
+fn normalize_role_aware_turn(turn: &MarkdownTranscriptTurn) -> Option<String> {
+    let mut sections = Vec::new();
+
+    if !turn.user_segments.is_empty() {
+        sections.push(format!("User request:\n{}", turn.user_segments.join("\n")));
+    }
+    if !turn.assistant_segments.is_empty() {
+        sections.push(format!(
+            "Assistant response:\n{}",
+            turn.assistant_segments.join("\n")
+        ));
+    }
+    if !turn.reasoning_segments.is_empty() {
+        sections.push(format!(
+            "Reasoning focus:\n{}",
+            turn.reasoning_segments.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(sections.join("\n\n"))
+}
+
+fn build_role_aware_turn_documents(
+    entries: Vec<StructuredDialogEntry>,
+    doc_prefix: &str,
+    base_metadata: serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String, serde_json::Value)> {
+    let mut turns = Vec::new();
+    let mut current_turn = MarkdownTranscriptTurn::default();
+
+    for entry in entries {
+        let text = entry.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        if matches!(entry.role, TranscriptRole::User) && !current_turn.is_empty() {
+            turns.push(current_turn);
+            current_turn = MarkdownTranscriptTurn::default();
+        }
+
+        current_turn.push(
+            entry.role,
+            entry.time.as_deref().unwrap_or_default(),
+            text.to_string(),
+        );
+    }
+
+    if !current_turn.is_empty() {
+        turns.push(current_turn);
+    }
+
+    let mut docs = Vec::new();
+    for (idx, turn) in turns.into_iter().enumerate() {
+        let Some(content) = normalize_role_aware_turn(&turn) else {
+            continue;
+        };
+
+        if content.len() < 20 {
+            continue;
+        }
+
+        let doc_id = format!("{doc_prefix}-{idx:04}-{}", hash_content(&content));
+        let mut metadata = serde_json::Value::Object(base_metadata.clone());
+
+        if let serde_json::Value::Object(ref mut map) = metadata {
+            map.insert("turn_index".to_string(), json!(idx));
+            map.insert("start_time".to_string(), json!(turn.start_time));
+            map.insert("end_time".to_string(), json!(turn.end_time));
+        }
+
+        docs.push((doc_id, content, metadata));
+    }
+
+    docs
+}
+
+fn extract_markdown_transcript_documents(
+    raw: &str,
+    source_path: &std::path::Path,
+) -> Option<Vec<(String, String, serde_json::Value)>> {
+    let mut header = HashMap::new();
+    let mut current_entry: Option<(String, TranscriptRole, String)> = None;
+    let mut entries = Vec::new();
+    let mut in_signals = false;
+    let mut signal_lines = Vec::new();
+
+    for line in raw.lines() {
+        if header.is_empty()
+            && let Some(parsed) = parse_transcript_header(line)
+        {
+            header = parsed;
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed == "[signals]" {
+            in_signals = true;
+            continue;
+        }
+        if trimmed == "[/signals]" {
+            in_signals = false;
+            continue;
+        }
+
+        if let Some((time, role, body)) = parse_transcript_entry_line(line) {
+            if let Some(entry) = current_entry.take() {
+                entries.push(entry);
+            }
+            current_entry = Some((time, role, body));
+            continue;
+        }
+
+        if in_signals {
+            if !trimmed.is_empty() {
+                signal_lines.push(trimmed.to_string());
+            }
+            continue;
+        }
+
+        if let Some((_, _, ref mut text)) = current_entry
+            && !trimmed.is_empty()
+        {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(trimmed);
+        }
+    }
+
+    if let Some(entry) = current_entry.take() {
+        entries.push(entry);
+    }
+
+    if header.is_empty() || entries.is_empty() {
+        return None;
+    }
+
+    let project = header
+        .get("project")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let agent = header
+        .get("agent")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let date = header
+        .get("date")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let source_name = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let transcript_id = hash_content(&source_path.to_string_lossy());
+    let signals_summary = if signal_lines.is_empty() {
+        None
+    } else {
+        Some(signal_lines.join("\n"))
+    };
+
+    let entries = entries
+        .into_iter()
+        .map(|(time, role, text)| StructuredDialogEntry {
+            time: Some(time),
+            role,
+            text,
+        })
+        .collect();
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("project".to_string(), json!(project));
+    metadata.insert("agent".to_string(), json!(agent));
+    metadata.insert("date".to_string(), json!(date));
+    metadata.insert("source".to_string(), json!(source_name));
+    metadata.insert("path".to_string(), json!(source_path.to_str()));
+    metadata.insert("type".to_string(), json!("transcript_turn"));
+    metadata.insert("format".to_string(), json!("markdown_transcript"));
+
+    if let Some(summary) = signals_summary.as_ref() {
+        metadata.insert("signals".to_string(), json!(summary));
+    }
+
+    let docs =
+        build_role_aware_turn_documents(entries, &format!("mdturn-{transcript_id}"), metadata);
+
+    if docs.is_empty() { None } else { Some(docs) }
+}
+
 /// Extract conversation documents from JSON with smart format detection.
-/// Returns individual messages as separate documents with proper metadata.
+/// Returns role-aware turn documents with proper metadata.
 /// Handles: sessions format, ChatGPT export, generic messages array.
 fn extract_conversation_documents(
     value: &serde_json::Value,
@@ -444,6 +789,25 @@ fn extract_conversation_documents(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+
+    fn extract_text_blocks(msg_obj: &serde_json::Map<String, serde_json::Value>) -> String {
+        if let Some(text) = msg_obj.get("text").and_then(serde_json::Value::as_str) {
+            return text.to_string();
+        }
+        if let Some(content) = msg_obj.get("content") {
+            if let Some(text) = content.as_str() {
+                return text.to_string();
+            }
+            if let Some(blocks) = content.as_array() {
+                return blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+        String::new()
+    }
 
     // Pattern 1: {sessions: [{info: {}, messages: [{role, text, timestamp}]}]}
     // From extract_session_essence.py output
@@ -463,50 +827,62 @@ fn extract_conversation_documents(
                 .unwrap_or("unknown");
             let session_short = &session_id[..session_id.len().min(8)];
 
+            let mut entries = Vec::new();
             if let Some(serde_json::Value::Array(messages)) = session_obj.get("messages") {
-                for (idx, msg) in messages.iter().enumerate() {
+                for msg in messages {
                     let msg_obj = match msg.as_object() {
                         Some(o) => o,
                         None => continue,
                     };
-
-                    let role = msg_obj
+                    let Some(role) = msg_obj
                         .get("role")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let timestamp = msg_obj
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                        .and_then(parse_transcript_role)
+                    else {
+                        continue;
+                    };
 
-                    // Skip empty or too short messages
-                    let text = text.trim();
+                    let text = msg_obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     if text.len() < 20 {
                         continue;
                     }
 
-                    let content_hash = hash_content(text);
-                    let doc_id = format!("msg-{}-{:04}-{}", session_short, idx, content_hash);
+                    let timestamp = msg_obj
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
 
-                    let metadata = json!({
-                        "role": role,
-                        "session": session_short,
-                        "project": project,
-                        "timestamp": timestamp,
-                        "source": source_name,
-                        "type": "conversation",
-                        "format": "sessions"
+                    entries.push(StructuredDialogEntry {
+                        time: timestamp,
+                        role,
+                        text,
                     });
-
-                    docs.push((doc_id, text.to_string(), metadata));
                 }
             }
+
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("session".to_string(), json!(session_short));
+            metadata.insert("project".to_string(), json!(project));
+            metadata.insert("source".to_string(), json!(source_name));
+            metadata.insert("type".to_string(), json!("conversation"));
+            metadata.insert("format".to_string(), json!("sessions"));
+
+            let mut session_docs = build_role_aware_turn_documents(
+                entries,
+                &format!("sess-{session_short}"),
+                metadata,
+            );
+            docs.append(&mut session_docs);
         }
 
         if !docs.is_empty() {
             tracing::info!(
-                "Sessions format detected: {} -> {} messages",
+                "Sessions format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -514,7 +890,7 @@ fn extract_conversation_documents(
         }
     }
 
-    // Pattern 2: [{uuid, name, messages: [{sender, text, created_at}]}]
+    // Pattern 2: {uuid, name, messages: [{sender, text, created_at}]}
     // Claude.ai conversations export (conversations-merged.json)
     // This is handled at array level in extract_json_documents, but check for single conversation
     if let Some(serde_json::Value::Array(messages)) = obj.get("messages") {
@@ -530,97 +906,59 @@ fn extract_conversation_documents(
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Check if it looks like a conversation (messages with sender/role)
         let looks_like_conversation = messages.iter().any(|m| {
             m.get("sender").is_some() || m.get("role").is_some() || m.get("author").is_some()
         });
 
         if looks_like_conversation {
-            let mut docs = Vec::new();
-            for (idx, msg) in messages.iter().enumerate() {
+            let mut entries = Vec::new();
+            for msg in messages {
                 let msg_obj = match msg.as_object() {
                     Some(o) => o,
                     None => continue,
                 };
 
-                let role = msg_obj
+                let Some(role) = msg_obj
                     .get("sender")
                     .or_else(|| msg_obj.get("role"))
                     .or_else(|| msg_obj.get("author").and_then(|a| a.get("role")))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-
-                // Normalize role names
-                let role = match role {
-                    "human" => "user",
-                    "assistant" | "bot" => "assistant",
-                    other => other,
+                    .and_then(parse_transcript_role)
+                else {
+                    continue;
                 };
 
-                // Extract text from various formats
-                let text = msg_obj
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        // Handle content array (Claude format)
-                        msg_obj.get("content").and_then(|c| {
-                            if let Some(s) = c.as_str() {
-                                Some(s)
-                            } else if let Some(_arr) = c.as_array() {
-                                // Collect text from content blocks
-                                None // Handle below
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or("");
-
-                // Handle content blocks array
-                let text = if text.is_empty() {
-                    if let Some(serde_json::Value::Array(content)) = msg_obj.get("content") {
-                        content
-                            .iter()
-                            .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    text.to_string()
-                };
+                let text = extract_text_blocks(msg_obj).trim().to_string();
+                if text.len() < 20 {
+                    continue;
+                }
 
                 let timestamp = msg_obj
                     .get("created_at")
                     .or_else(|| msg_obj.get("timestamp"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                    .map(ToOwned::to_owned);
 
-                let text = text.trim();
-                if text.len() < 20 {
-                    continue;
-                }
-
-                let content_hash = hash_content(text);
-                let doc_id = format!("conv-{}-{:04}-{}", conv_short, idx, content_hash);
-
-                let metadata = json!({
-                    "role": role,
-                    "conversation": conv_short,
-                    "title": title,
-                    "timestamp": timestamp,
-                    "source": source_name,
-                    "type": "conversation",
-                    "format": "claude_web"
+                entries.push(StructuredDialogEntry {
+                    time: timestamp,
+                    role,
+                    text,
                 });
-
-                docs.push((doc_id, text.to_string(), metadata));
             }
+
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("conversation".to_string(), json!(conv_short));
+            metadata.insert("title".to_string(), json!(title));
+            metadata.insert("source".to_string(), json!(source_name));
+            metadata.insert("type".to_string(), json!("conversation"));
+            metadata.insert("format".to_string(), json!("claude_web"));
+
+            let docs =
+                build_role_aware_turn_documents(entries, &format!("conv-{conv_short}"), metadata);
 
             if !docs.is_empty() {
                 tracing::info!(
-                    "Conversation format detected: {} -> {} messages",
+                    "Conversation format detected: {} -> {} turn documents",
                     source_path.display(),
                     docs.len()
                 );
@@ -639,56 +977,56 @@ fn extract_conversation_documents(
         let conv_short = &conv_id[..conv_id.len().min(8)];
         let title = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut docs = Vec::new();
-        for (idx, msg) in messages.iter().enumerate() {
+        let mut entries = Vec::new();
+        for msg in messages {
             let msg_obj = match msg.as_object() {
                 Some(o) => o,
                 None => continue,
             };
 
-            let role = msg_obj
+            let Some(role) = msg_obj
                 .get("sender")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            // Normalize role names
-            let role = match role {
-                "human" => "user",
-                "assistant" | "bot" => "assistant",
-                other => other,
+                .and_then(parse_transcript_role)
+            else {
+                continue;
             };
 
-            let text = msg_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-            let timestamp = msg_obj
-                .get("created_at")
+            let text = msg_obj
+                .get("text")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let text = text.trim();
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if text.len() < 20 {
                 continue;
             }
 
-            let content_hash = hash_content(text);
-            let doc_id = format!("chat-{}-{:04}-{}", conv_short, idx, content_hash);
+            let timestamp = msg_obj
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
 
-            let metadata = json!({
-                "role": role,
-                "conversation": conv_short,
-                "title": title,
-                "timestamp": timestamp,
-                "source": source_name,
-                "type": "conversation",
-                "format": "claude_web"
+            entries.push(StructuredDialogEntry {
+                time: timestamp,
+                role,
+                text,
             });
-
-            docs.push((doc_id, text.to_string(), metadata));
         }
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("conversation".to_string(), json!(conv_short));
+        metadata.insert("title".to_string(), json!(title));
+        metadata.insert("source".to_string(), json!(source_name));
+        metadata.insert("type".to_string(), json!("conversation"));
+        metadata.insert("format".to_string(), json!("claude_web"));
+
+        let docs =
+            build_role_aware_turn_documents(entries, &format!("chat-{conv_short}"), metadata);
 
         if !docs.is_empty() {
             tracing::info!(
-                "Claude.ai chat_messages format detected: {} -> {} messages",
+                "Claude.ai chat_messages format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -707,9 +1045,7 @@ fn extract_conversation_documents(
         let conv_short = &conv_id[..conv_id.len().min(8)];
         let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut docs = Vec::new();
         let mut entries: Vec<_> = mapping.iter().collect();
-        // Try to sort by create_time if available
         entries.sort_by(|a, b| {
             let time_a =
                 a.1.get("message")
@@ -726,22 +1062,21 @@ fn extract_conversation_documents(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        for (idx, (_node_id, node)) in entries.iter().enumerate() {
+        let mut dialog_entries = Vec::new();
+        for (_node_id, node) in entries {
             let message = match node.get("message") {
                 Some(m) => m,
                 None => continue,
             };
 
-            let role = message
+            let Some(role) = message
                 .get("author")
                 .and_then(|a| a.get("role"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            // Skip system messages
-            if role == "system" {
+                .and_then(parse_transcript_role)
+            else {
                 continue;
-            }
+            };
 
             let text = message
                 .get("content")
@@ -754,42 +1089,39 @@ fn extract_conversation_documents(
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
-                .unwrap_or_default();
-
-            let timestamp = message
-                .get("create_time")
-                .and_then(|t| t.as_f64())
-                .map(|ts| {
-                    chrono::DateTime::from_timestamp(ts as i64, 0)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            let text = text.trim();
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if text.len() < 20 {
                 continue;
             }
 
-            let content_hash = hash_content(text);
-            let doc_id = format!("gpt-{}-{:04}-{}", conv_short, idx, content_hash);
+            let timestamp = message
+                .get("create_time")
+                .and_then(|t| t.as_f64())
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+                .map(|dt| dt.to_rfc3339());
 
-            let metadata = json!({
-                "role": role,
-                "conversation": conv_short,
-                "title": title,
-                "timestamp": timestamp,
-                "source": source_name,
-                "type": "conversation",
-                "format": "chatgpt"
+            dialog_entries.push(StructuredDialogEntry {
+                time: timestamp,
+                role,
+                text,
             });
-
-            docs.push((doc_id, text.to_string(), metadata));
         }
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("conversation".to_string(), json!(conv_short));
+        metadata.insert("title".to_string(), json!(title));
+        metadata.insert("source".to_string(), json!(source_name));
+        metadata.insert("type".to_string(), json!("conversation"));
+        metadata.insert("format".to_string(), json!("chatgpt"));
+
+        let docs =
+            build_role_aware_turn_documents(dialog_entries, &format!("gpt-{conv_short}"), metadata);
 
         if !docs.is_empty() {
             tracing::info!(
-                "ChatGPT format detected: {} -> {} messages",
+                "ChatGPT format detected: {} -> {} turn documents",
                 source_path.display(),
                 docs.len()
             );
@@ -1140,18 +1472,101 @@ impl RAGPipeline {
             return Ok(());
         }
 
+        let mut unique_documents = Vec::with_capacity(documents.len());
+        let mut seen_ids: HashSet<(String, String)> = HashSet::new();
+        let mut seen_hashes: HashSet<(String, String)> = HashSet::new();
+
+        for mut document in documents {
+            if let Value::Object(ref mut map) = document.metadata {
+                map.entry("indexed_at".to_string())
+                    .or_insert_with(|| json!(chrono::Utc::now().to_rfc3339()));
+            }
+
+            let id_key = (document.namespace.clone(), document.id.clone());
+            if !seen_ids.insert(id_key) {
+                continue;
+            }
+
+            if let Some(hash) = document.content_hash.as_ref() {
+                let hash_key = (document.namespace.clone(), hash.clone());
+                if !seen_hashes.insert(hash_key) {
+                    continue;
+                }
+            }
+
+            unique_documents.push(document);
+        }
+
+        let documents = self
+            .filter_documents_against_store(unique_documents)
+            .await?;
+        if documents.is_empty() {
+            return Ok(());
+        }
+
         let bm25_documents: Vec<(String, String, String)> = documents
             .iter()
             .map(|doc| (doc.id.clone(), doc.namespace.clone(), doc.document.clone()))
             .collect();
+        let inserted_ids: Vec<(String, String)> = documents
+            .iter()
+            .map(|doc| (doc.namespace.clone(), doc.id.clone()))
+            .collect();
 
         self.storage.add_to_store(documents).await?;
 
-        if let Some(bm25_writer) = &self.bm25_writer {
-            bm25_writer.add_documents(&bm25_documents).await?;
+        if let Some(bm25_writer) = &self.bm25_writer
+            && let Err(error) = bm25_writer.add_documents(&bm25_documents).await
+        {
+            for (namespace, id) in &inserted_ids {
+                let _ = self.storage.delete_document(namespace, id).await;
+            }
+            return Err(error);
         }
 
         Ok(())
+    }
+
+    async fn filter_documents_against_store(
+        &self,
+        documents: Vec<ChromaDocument>,
+    ) -> Result<Vec<ChromaDocument>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut hashes_by_namespace: HashMap<String, Vec<String>> = HashMap::new();
+        for document in &documents {
+            if let Some(hash) = document.content_hash.as_ref() {
+                hashes_by_namespace
+                    .entry(document.namespace.clone())
+                    .or_default()
+                    .push(hash.clone());
+            }
+        }
+
+        let mut allowed_hashes: HashMap<String, HashSet<String>> = HashMap::new();
+        for (namespace, hashes) in hashes_by_namespace {
+            let hashes = self
+                .storage
+                .filter_existing_hashes(&namespace, &hashes)
+                .await?;
+            allowed_hashes.insert(
+                namespace,
+                hashes.into_iter().cloned().collect::<HashSet<_>>(),
+            );
+        }
+
+        Ok(documents
+            .into_iter()
+            .filter(|document| match document.content_hash.as_ref() {
+                None => true,
+                Some(hash) => allowed_hashes
+                    .get(&document.namespace)
+                    .map(|hashes| hashes.contains(hash))
+                    .unwrap_or(true),
+            })
+            .collect())
     }
 
     async fn clear_namespace_from_indices(&self, namespace: &str) -> Result<usize> {
@@ -1164,14 +1579,80 @@ impl RAGPipeline {
         Ok(deleted)
     }
 
-    async fn delete_memory_from_indices(&self, namespace: &str, id: &str) -> Result<usize> {
-        let deleted = self.storage.delete_document(namespace, id).await?;
+    async fn load_memory_family(&self, namespace: &str, id: &str) -> Result<Vec<ChromaDocument>> {
+        let docs = self.storage.get_all_in_namespace(namespace).await?;
+        Ok(docs
+            .into_iter()
+            .filter(|doc| {
+                doc.id == id
+                    || doc
+                        .metadata
+                        .get("original_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|original_id| original_id == id)
+            })
+            .collect())
+    }
 
-        if let Some(bm25_writer) = &self.bm25_writer {
-            bm25_writer.delete_documents(&[id.to_string()]).await?;
+    async fn delete_memory_family(&self, namespace: &str, id: &str) -> Result<usize> {
+        let family = self.load_memory_family(namespace, id).await?;
+        if family.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted = 0usize;
+        let mut ids = Vec::with_capacity(family.len());
+
+        for document in family {
+            deleted += self
+                .storage
+                .delete_document(namespace, &document.id)
+                .await?
+                .min(1);
+            ids.push(document.id);
+        }
+
+        if let Some(bm25_writer) = &self.bm25_writer
+            && !ids.is_empty()
+        {
+            bm25_writer.delete_documents(&ids).await?;
         }
 
         Ok(deleted)
+    }
+
+    fn preferred_memory_family_document(
+        mut family: Vec<ChromaDocument>,
+        requested_id: &str,
+    ) -> Option<ChromaDocument> {
+        fn rank(layer: Option<SliceLayer>) -> u8 {
+            match layer {
+                None => 0,
+                Some(SliceLayer::Outer) => 1,
+                Some(SliceLayer::Middle) => 2,
+                Some(SliceLayer::Inner) => 3,
+                Some(SliceLayer::Core) => 4,
+            }
+        }
+
+        fn chunk_index(document: &ChromaDocument) -> usize {
+            document
+                .metadata
+                .get("chunk_index")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(usize::MAX)
+        }
+
+        family.sort_by_key(|document| {
+            if document.id == requested_id {
+                (0_u8, 0_u8, 0_usize)
+            } else {
+                (1_u8, rank(document.slice_layer()), chunk_index(document))
+            }
+        });
+
+        family.into_iter().next()
     }
 
     /// Get which MLX server we're connected to (for health/status reporting)
@@ -1324,54 +1805,34 @@ impl RAGPipeline {
                 );
             }
 
-            // Check if this is a conversation message - store directly without chunking
-            let is_conversation = doc_metadata
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t == "conversation")
-                .unwrap_or(false);
-
-            let chunks = if is_conversation {
-                // Store conversation message as single document (no chunking!)
-                self.index_conversation_message_direct(
-                    &doc_id,
-                    &content,
-                    namespace,
-                    doc_metadata,
-                    &doc_hash,
-                )
-                .await?
-            } else {
-                // Index with onion/flat slicing for non-conversation content
-                match slice_mode {
-                    SliceMode::Onion => {
-                        self.index_with_onion_slicing_and_hash(
-                            &content,
-                            namespace,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
-                    SliceMode::OnionFast => {
-                        self.index_with_onion_slicing_fast_and_hash(
-                            &content,
-                            namespace,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
-                    SliceMode::Flat => {
-                        self.index_with_flat_chunking_and_hash(
-                            &content,
-                            namespace,
-                            path,
-                            doc_metadata,
-                            &doc_hash,
-                        )
-                        .await?
-                    }
+            let chunks = match slice_mode {
+                SliceMode::Onion => {
+                    self.index_with_onion_slicing_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::OnionFast => {
+                    self.index_with_onion_slicing_fast_and_hash(
+                        &content,
+                        namespace,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
+                }
+                SliceMode::Flat => {
+                    self.index_with_flat_chunking_and_hash(
+                        &content,
+                        namespace,
+                        path,
+                        doc_metadata,
+                        &doc_hash,
+                    )
+                    .await?
                 }
             };
 
@@ -1768,42 +2229,6 @@ impl RAGPipeline {
         Ok(())
     }
 
-    /// Index a conversation message directly without chunking.
-    /// Each message is stored as a single document with its own embedding.
-    /// Used for smart-extracted conversation messages where chunking would lose context.
-    async fn index_conversation_message_direct(
-        &self,
-        doc_id: &str,
-        text: &str,
-        namespace: &str,
-        metadata: serde_json::Value,
-        content_hash: &str,
-    ) -> Result<usize> {
-        // Embed the entire message as one unit
-        let embedding = self.embed_query(text).await?;
-
-        // Create document with the smart-extracted ID (msg-XXX-NNNN-HASH)
-        let doc = ChromaDocument::new_flat_with_hash(
-            doc_id.to_string(),
-            namespace.to_string(),
-            embedding,
-            metadata,
-            text.to_string(),
-            content_hash.to_string(),
-        );
-
-        // Store directly
-        self.persist_documents(vec![doc]).await?;
-
-        tracing::debug!(
-            "Conversation message stored directly: {} ({} chars)",
-            doc_id,
-            text.len()
-        );
-
-        Ok(1) // One document stored
-    }
-
     /// Index using traditional flat chunking with content hash for deduplication
     async fn index_with_flat_chunking_and_hash(
         &self,
@@ -1860,6 +2285,70 @@ impl RAGPipeline {
             self.persist_documents(batch_docs).await?;
             total_stored += batch.len();
             tracing::info!("Stored {}/{} chunks", total_stored, total_chunks);
+        }
+
+        Ok(total_chunks)
+    }
+
+    async fn index_flat_memory_family_with_hash(
+        &self,
+        text: &str,
+        namespace: &str,
+        original_id: &str,
+        base_metadata: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<usize> {
+        let chunks = self.chunk_text(text, 512, 128)?;
+        let total_chunks = chunks.len();
+
+        tracing::info!(
+            "Flat memory chunking: {} chars -> {} chunks",
+            text.len(),
+            total_chunks
+        );
+
+        let mut total_stored = 0;
+        let mut global_idx = 0;
+        for batch in chunks.chunks(STORAGE_BATCH_SIZE) {
+            let embeddings = self.embed_chunks(batch).await?;
+
+            let mut batch_docs = Vec::with_capacity(batch.len());
+            for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
+                let mut metadata = base_metadata.clone();
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("chunk_index".to_string(), json!(global_idx));
+                    map.insert("total_chunks".to_string(), json!(total_chunks));
+                    map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("original_id".to_string(), json!(original_id));
+                }
+
+                let doc_id = if total_chunks == 1 {
+                    original_id.to_string()
+                } else {
+                    format!("{original_id}::chunk::{global_idx}")
+                };
+
+                let chunk_hash = compute_content_hash(chunk);
+                let doc = ChromaDocument::new_flat_with_hash(
+                    doc_id,
+                    namespace.to_string(),
+                    embedding.clone(),
+                    metadata,
+                    chunk.clone(),
+                    chunk_hash,
+                );
+                batch_docs.push(doc);
+                global_idx += 1;
+            }
+
+            self.persist_documents(batch_docs).await?;
+            total_stored += batch.len();
+            tracing::info!(
+                "Stored {}/{} flat memory chunks for {}",
+                total_stored,
+                total_chunks,
+                original_id
+            );
         }
 
         Ok(total_chunks)
@@ -1946,6 +2435,58 @@ impl RAGPipeline {
         }
     }
 
+    async fn index_text_memory_family_with_hash(
+        &self,
+        namespace: &str,
+        id: &str,
+        text: &str,
+        metadata: serde_json::Value,
+        slice_mode: SliceMode,
+    ) -> Result<()> {
+        let slice_mode_name = match slice_mode {
+            SliceMode::Onion => "onion",
+            SliceMode::OnionFast => "onion-fast",
+            SliceMode::Flat => "flat",
+        };
+        let content_hash = compute_content_hash(text);
+        let mut metadata = metadata;
+
+        if let serde_json::Value::Object(ref mut map) = metadata {
+            map.insert("slice_mode".to_string(), json!(slice_mode_name));
+            if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
+                map.insert("original_id".to_string(), json!(id));
+            }
+        }
+
+        match slice_mode {
+            SliceMode::Onion => {
+                self.index_with_onion_slicing_and_hash(text, namespace, metadata, &content_hash)
+                    .await?;
+            }
+            SliceMode::OnionFast => {
+                self.index_with_onion_slicing_fast_and_hash(
+                    text,
+                    namespace,
+                    metadata,
+                    &content_hash,
+                )
+                .await?;
+            }
+            SliceMode::Flat => {
+                self.index_flat_memory_family_with_hash(
+                    text,
+                    namespace,
+                    id,
+                    metadata,
+                    &content_hash,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn memory_upsert(
         &self,
         namespace: &str,
@@ -1953,9 +2494,25 @@ impl RAGPipeline {
         text: String,
         metadata: serde_json::Value,
     ) -> Result<()> {
-        // Use Flat mode to preserve the user-provided ID (no onion slicing)
-        // This ensures memory_get(id) will find the exact record
-        self.index_text_with_mode(Some(namespace), id, text, metadata, SliceMode::Flat)
+        let slice_mode = match metadata
+            .get("slice_mode")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("onion") => SliceMode::Onion,
+            Some("onion-fast") | Some("onion_fast") | Some("fast") => SliceMode::OnionFast,
+            Some("flat") | None => SliceMode::Flat,
+            Some(other) => {
+                return Err(anyhow!(
+                    "Unsupported metadata.slice_mode '{}'. Use 'flat', 'onion', or 'onion-fast'.",
+                    other
+                ));
+            }
+        };
+
+        self.delete_memory_family(namespace, &id).await?;
+        self.index_text_memory_family_with_hash(namespace, &id, &text, metadata, slice_mode)
             .await?;
         Ok(())
     }
@@ -1975,30 +2532,34 @@ impl RAGPipeline {
                 keywords: doc.keywords,
             }));
         }
+
+        if let Some(doc) = Self::preferred_memory_family_document(
+            self.load_memory_family(namespace, id).await?,
+            id,
+        ) {
+            let layer = doc.slice_layer();
+            return Ok(Some(SearchResult {
+                id: doc.id,
+                namespace: doc.namespace,
+                text: doc.document,
+                score: 1.0,
+                metadata: doc.metadata,
+                layer,
+                parent_id: doc.parent_id,
+                children_ids: doc.children_ids,
+                keywords: doc.keywords,
+            }));
+        }
+
         Ok(None)
     }
 
-    #[deprecated(note = "use lookup_memory")]
-    pub async fn memory_get(&self, namespace: &str, id: &str) -> Result<Option<SearchResult>> {
-        self.lookup_memory(namespace, id).await
-    }
-
     pub async fn remove_memory(&self, namespace: &str, id: &str) -> Result<usize> {
-        self.delete_memory_from_indices(namespace, id).await
-    }
-
-    #[deprecated(note = "use remove_memory")]
-    pub async fn memory_delete(&self, namespace: &str, id: &str) -> Result<usize> {
-        self.remove_memory(namespace, id).await
+        self.delete_memory_family(namespace, id).await
     }
 
     pub async fn clear_namespace(&self, namespace: &str) -> Result<usize> {
         self.clear_namespace_from_indices(namespace).await
-    }
-
-    #[deprecated(note = "use clear_namespace")]
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.clear_namespace(namespace).await
     }
 
     pub async fn search_memory(
@@ -2009,16 +2570,6 @@ impl RAGPipeline {
     ) -> Result<Vec<SearchResult>> {
         self.search_with_options(Some(namespace), query, k, SearchOptions::default())
             .await
-    }
-
-    #[deprecated(note = "use search_memory")]
-    pub async fn memory_search(
-        &self,
-        namespace: &str,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<SearchResult>> {
-        self.search_memory(namespace, query, k).await
     }
 
     /// Search with layer filter - returns only outer slices by default (efficient context usage)
@@ -2035,6 +2586,7 @@ impl RAGPipeline {
             k,
             SearchOptions {
                 layer_filter: layer,
+                project_filter: None,
             },
         )
         .await
@@ -2064,16 +2616,25 @@ impl RAGPipeline {
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         let query_embedding = self.embed_query(query).await?;
+        let candidate_multiplier = if options.project_filter.is_some() {
+            8
+        } else {
+            3
+        };
 
-        let candidates = self
+        let mut candidates = self
             .storage
             .search_store_with_layer(
                 namespace,
                 query_embedding.clone(),
-                k * 3,
+                k * candidate_multiplier,
                 options.layer_filter,
             )
             .await?;
+
+        if let Some(project) = options.project_filter.as_deref() {
+            candidates.retain(|candidate| metadata_matches_project(&candidate.metadata, project));
+        }
 
         // Rerank if we have candidates
         if !candidates.is_empty() {
@@ -2202,7 +2763,7 @@ impl RAGPipeline {
     /// For non-array JSON or other file types, returns a single document.
     ///
     /// This enables proper onion slicing for conversation/session files where
-    /// each array element (message, conversation) should be indexed separately.
+    /// dialog-like content should be normalized into turn documents before slicing.
     ///
     /// Returns: Vec of (doc_id, content, metadata) tuples
     async fn extract_json_documents(
@@ -2214,6 +2775,22 @@ impl RAGPipeline {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+
+        if matches!(ext.as_str(), "md" | "markdown") {
+            let (_p, raw) = crate::path_utils::safe_read_to_string_async(path).await?;
+            if let Some(docs) = extract_markdown_transcript_documents(&raw, path) {
+                tracing::info!(
+                    "Markdown transcript detected: {} -> {} turn documents",
+                    path.display(),
+                    docs.len()
+                );
+                return Ok(docs);
+            }
+
+            let doc_id = format!("{}:0", path.display());
+            let metadata = json!({ "path": path.to_str(), "index": 0 });
+            return Ok(vec![(doc_id, raw, metadata)]);
+        }
 
         // Only process JSON files specially
         if ext != "json" {
@@ -2251,7 +2828,7 @@ impl RAGPipeline {
             // If smart extraction found conversations, use those
             if used_smart_extraction && !docs.is_empty() {
                 tracing::info!(
-                    "Conversation array detected: {} -> {} messages",
+                    "Conversation array detected: {} -> {} turn documents",
                     path.display(),
                     docs.len()
                 );
@@ -2788,10 +3365,12 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 }
 
 /// Options for search operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     /// Filter by onion slice layer (None = all layers)
     pub layer_filter: Option<SliceLayer>,
+    /// Optional project identifier from metadata (e.g. project / project_id)
+    pub project_filter: Option<String>,
 }
 
 impl SearchOptions {
@@ -2799,12 +3378,21 @@ impl SearchOptions {
     pub fn outer_only() -> Self {
         Self {
             layer_filter: Some(SliceLayer::Outer),
+            project_filter: None,
         }
     }
 
     /// Deep search - include all layers including Core
     pub fn deep() -> Self {
-        Self { layer_filter: None }
+        Self {
+            layer_filter: None,
+            project_filter: None,
+        }
+    }
+
+    pub fn with_project(mut self, project: Option<String>) -> Self {
+        self.project_filter = project.filter(|value| !value.trim().is_empty());
+        self
     }
 }
 
@@ -2812,6 +3400,21 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self::outer_only()
     }
+}
+
+fn metadata_matches_project(metadata: &Value, project: &str) -> bool {
+    let needle = project.trim();
+    if needle.is_empty() {
+        return true;
+    }
+
+    metadata.as_object().is_some_and(|object| {
+        ["project", "project_id", "source_project"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .filter_map(|value| value.as_str())
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2885,7 +3488,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::hash_content;
+    use super::{
+        OnionSliceConfig, SearchOptions, SliceLayer, create_onion_slices, create_onion_slices_fast,
+        extract_conversation_documents, extract_keywords, extract_markdown_transcript_documents,
+        hash_content, metadata_matches_project,
+    };
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn short_hash_uses_sha256_prefix_with_minimum_length() {
@@ -2893,5 +3502,215 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(hash, hash_content("same content"));
+    }
+
+    #[test]
+    fn keyword_extraction_splits_paths_and_filters_session_tokens() {
+        let keywords = extract_keywords(
+            "/Users/silver/Git/tools/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            10,
+        );
+
+        assert!(keywords.contains(&"users".to_string()));
+        assert!(keywords.contains(&"twinsweep".to_string()));
+        assert!(!keywords.iter().any(|keyword| keyword.contains("2ff4de8b")));
+    }
+
+    #[test]
+    fn search_options_can_carry_project_filter() {
+        let options = SearchOptions::deep().with_project(Some("Vista".to_string()));
+        assert_eq!(options.layer_filter, None);
+        assert_eq!(options.project_filter.as_deref(), Some("Vista"));
+    }
+
+    #[test]
+    fn project_match_uses_metadata_fields() {
+        assert!(metadata_matches_project(
+            &json!({"project": "Vista"}),
+            "vista"
+        ));
+        assert!(metadata_matches_project(
+            &json!({"project_id": "VetCoders"}),
+            "vetcoders"
+        ));
+        assert!(!metadata_matches_project(
+            &json!({"project": "rmcp-memex"}),
+            "vista"
+        ));
+        assert_eq!(
+            SearchOptions::default().layer_filter,
+            Some(SliceLayer::Outer)
+        );
+    }
+
+    #[test]
+    fn markdown_transcript_extraction_builds_role_aware_turn_docs() {
+        let raw = r#"[project: VetCoders/vibecrafted | agent: codex | date: 2026-03-30]
+
+[signals]
+Results:
+- AICX lookup działa
+[/signals]
+
+[09:14:00] assistant: Tak, i to właśnie jest sedno: `aicx-dragon` to żywy endpoint MCP.
+[09:15:33] user: ziom ale ty sobie sam skonfigurowałeś ~/.codex/config.toml
+[09:15:47] assistant: Sprawdzam teraz lokalny kontrakt konfiguracji MCP dla Codexa.
+[09:15:55] reasoning: **Checking config contract**
+[09:16:06] assistant: Składnia configu wygląda już poprawnie według samego Codexa.
+"#;
+
+        let docs = extract_markdown_transcript_documents(raw, Path::new("sample.md"))
+            .expect("expected transcript docs");
+
+        assert_eq!(docs.len(), 2);
+        assert!(docs[0].1.contains("Assistant response:"));
+        assert!(docs[1].1.contains("User request:"));
+        assert!(docs[1].1.contains("Reasoning focus:"));
+        assert_eq!(docs[1].2["format"], "markdown_transcript");
+        assert_eq!(docs[1].2["type"], "transcript_turn");
+        assert_eq!(docs[1].2["project"], "VetCoders/vibecrafted");
+    }
+
+    #[test]
+    fn short_structured_transcript_turns_keep_outer_slice_in_full_and_fast_modes() {
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript"
+        });
+        let config = OnionSliceConfig::default();
+        let content = "User request:\nDodaj progress do pipeline.\n\nAssistant response:\nPodepnę licznik etapów.";
+
+        let full_layers: Vec<SliceLayer> = create_onion_slices(content, &metadata, &config)
+            .into_iter()
+            .map(|slice| slice.layer)
+            .collect();
+        let fast_layers: Vec<SliceLayer> = create_onion_slices_fast(content, &metadata, &config)
+            .into_iter()
+            .map(|slice| slice.layer)
+            .collect();
+
+        assert_eq!(full_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
+        assert_eq!(fast_layers, vec![SliceLayer::Outer, SliceLayer::Core]);
+    }
+
+    #[test]
+    fn structured_markdown_outer_becomes_semantic_card() {
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript",
+            "project": "VetCoders/rmcp-memex",
+            "agent": "codex"
+        });
+        let config = OnionSliceConfig {
+            outer_target: 220,
+            ..OnionSliceConfig::default()
+        };
+        let content = "User request:\nMake outer retrieval useful for transcript search.\n\nAssistant response:\nDecision: build semantic cards instead of keyword prefixes.\nNext action: add JSON slicing coverage.\n\nReasoning focus:\nOuter-only is the default search path, so weak outer text hides short turns.";
+
+        let slices = create_onion_slices(content, &metadata, &config);
+        let outer = &slices[0].content;
+        let middle = &slices[1].content;
+        let inner = &slices[2].content;
+
+        assert!(outer.contains("Request:"));
+        assert!(outer.contains("Response:"));
+        assert!(outer.contains("Decision:"));
+        assert!(!outer.starts_with('['));
+        assert!(middle.contains("Decision:"));
+        assert!(middle.contains("Next:"));
+        assert!(inner.contains("Assistant response:"));
+        assert!(inner.contains("Entities:"));
+    }
+
+    #[test]
+    fn json_conversation_docs_flow_through_structured_semantic_slices() {
+        let conversation = json!({
+            "project": "VetCoders/rmcp-memex",
+            "sessions": [
+                {
+                    "info": {
+                        "sessionId": "session-1234567890"
+                    },
+                    "messages": [
+                        {
+                            "role": "user",
+                            "text": "Please replace the keyword-prefixed outer summary with something that reads like a semantic card for search.",
+                            "timestamp": "2026-04-12T04:00:00Z"
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Decision: we will use semantic cards for outer retrieval. Next action: add JSON regression coverage and preserve the plain text fallback.",
+                            "timestamp": "2026-04-12T04:01:00Z"
+                        },
+                        {
+                            "role": "user",
+                            "text": "Keep the generic plain text path as a safe fallback.",
+                            "timestamp": "2026-04-12T04:02:00Z"
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Reasoning: default search prefers outer-only, so the semantic card needs to surface the exchange even for short turns.",
+                            "timestamp": "2026-04-12T04:03:00Z"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let docs = extract_conversation_documents(&conversation, Path::new("conversation.json"))
+            .expect("expected conversation docs");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[0].2.get("format").and_then(|value| value.as_str()),
+            Some("sessions")
+        );
+        assert_eq!(
+            docs[0].2.get("turn_index").and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert!(docs[0].1.contains("User request:"));
+        assert!(docs[0].1.contains("Assistant response:"));
+
+        let config = OnionSliceConfig {
+            outer_target: 220,
+            ..OnionSliceConfig::default()
+        };
+        let slices = create_onion_slices(&docs[0].1, &docs[0].2, &config);
+        let outer = &slices[0].content;
+        let middle = &slices[1].content;
+        let inner = &slices[2].content;
+
+        assert!(outer.contains("Request:"));
+        assert!(outer.contains("Response:"));
+        assert!(outer.contains("Decision:"));
+        assert!(!outer.starts_with('['));
+        assert!(middle.contains("Decision:"));
+        assert!(middle.contains("Next:"));
+        assert!(inner.contains("Assistant response:"));
+    }
+
+    #[test]
+    fn plain_text_still_uses_generic_fallback_path() {
+        let metadata = json!({
+            "type": "note",
+            "format": "markdown"
+        });
+        let config = OnionSliceConfig::default();
+        let content = "The release workflow still needs a truthful browse surface. We should preserve the plain text fallback while improving structured conversation retrieval with semantic cards and regression tests so the generic path does not regress.";
+
+        let slices = create_onion_slices(content, &metadata, &config);
+        let outer = &slices[0].content;
+
+        assert_eq!(
+            slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(),
+            vec![
+                SliceLayer::Outer,
+                SliceLayer::Middle,
+                SliceLayer::Inner,
+                SliceLayer::Core
+            ]
+        );
+        assert!(!outer.contains("Request:"));
+        assert!(!outer.contains("Response:"));
     }
 }

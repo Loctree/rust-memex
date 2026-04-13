@@ -15,7 +15,7 @@
 //! | tools/call (list_protected)    |        | ✓             |                     |
 //! | tools/call (dive validation)   |        | ✓             |                     |
 //! | tools/call (unknown)           |        | ✓             | ✓                   |
-//! | unknown method                 |        |               | ✓                   |
+//! | resources/list rejected        |        |               | ✓                   |
 //! | missing id                     |        |               | ✓                   |
 //! | notifications                  |        | ✓             | ✓                   |
 //! | JSON-RPC framing               | ✓      |               |                     |
@@ -32,11 +32,15 @@
 //! via `McpTransport::HttpSse`. This is intentional — clients use it for
 //! diagnostics. All other tool responses are transport-independent.
 
-use crate::mcp_protocol::{
-    McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error, jsonrpc_success,
-    shared_initialize_result, shared_tools_list_result,
+use crate::{
+    MCPServer, McpDispatch, dispatch_mcp_jsonrpc_request, dispatch_mcp_request,
+    mcp_protocol::{
+        McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error, jsonrpc_success,
+        shared_initialize_result, shared_tools_list_result,
+    },
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,10 +94,9 @@ fn initialize_result_has_server_info() {
 }
 
 #[test]
-fn initialize_result_has_tools_and_resources_capabilities() {
+fn initialize_result_advertises_only_tools_capability() {
     let result = shared_initialize_result();
-    assert!(result["capabilities"]["tools"].is_object());
-    assert!(result["capabilities"]["resources"].is_object());
+    assert_eq!(result["capabilities"], json!({ "tools": {} }));
 }
 
 #[test]
@@ -974,6 +977,83 @@ async fn handle_payload_valid_roundtrip_parity_stub() {
     let response = stdio.expect("valid payload must produce a response");
     assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
     assert_eq!(response["id"], "pl-1");
+}
+
+/// The shared request-dispatch facade preserves transport parity.
+#[tokio::test]
+async fn dispatch_request_wrapper_roundtrip_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "wrapper-1",
+        "method": "initialize",
+        "params": {}
+    });
+
+    let stdio = dispatch_mcp_request(&core, request.clone(), McpTransport::Stdio).await;
+    let http = dispatch_mcp_request(&core, request, McpTransport::HttpSse).await;
+
+    assert_eq!(stdio, http);
+
+    let response = stdio.expect("initialize through facade must produce a response");
+    assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(response["id"], "wrapper-1");
+}
+
+/// The JSON-RPC facade preserves notification semantics instead of coercing them
+/// into synthetic responses.
+#[tokio::test]
+async fn dispatch_jsonrpc_wrapper_preserves_notification_semantics_stub() {
+    let core = build_mcp_core_stub().await;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+
+    let stdio = dispatch_mcp_jsonrpc_request(&core, request.clone(), McpTransport::Stdio).await;
+    let http = dispatch_mcp_jsonrpc_request(&core, request, McpTransport::HttpSse).await;
+
+    assert!(matches!(stdio, McpDispatch::Notification));
+    assert!(matches!(http, McpDispatch::Notification));
+}
+
+/// The `MCPServer` convenience wrapper must preserve stdio notification
+/// semantics instead of fabricating a JSON-RPC success response.
+#[tokio::test]
+async fn server_dispatch_request_preserves_notification_semantics_stub() {
+    let server = MCPServer::from_mcp_core(Arc::new(build_mcp_core_stub().await));
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+
+    let response = server.dispatch_request(request).await;
+
+    assert!(
+        response.is_none(),
+        "notification dispatch must remain silent for stdio callers too"
+    );
+}
+
+/// The `MCPServer` helper should be a thin wrapper over the shared core, not a
+/// second JSON-RPC implementation.
+#[tokio::test]
+async fn server_dispatch_request_matches_shared_facade_stub() {
+    let core = Arc::new(build_mcp_core_stub().await);
+    let server = MCPServer::from_mcp_core(core.clone());
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "server-wrapper-1",
+        "method": "initialize",
+        "params": {}
+    });
+
+    let server_response = server.dispatch_request(request.clone()).await;
+    let shared_response = dispatch_mcp_request(core.as_ref(), request, McpTransport::Stdio).await;
+
+    assert_eq!(server_response, shared_response);
 }
 
 /// Valid tools/list through raw payload path — confirms wire-level parity.

@@ -1,3 +1,9 @@
+//! Shared MCP transport entry points.
+//!
+//! `mcp_protocol` owns the protocol contract and tool dispatch implementation.
+//! This module is the transport-facing facade that both stdio and HTTP/SSE call
+//! so request parsing and dispatch stay routed through one public surface.
+
 use serde_json::Value;
 
 pub use crate::mcp_protocol::{

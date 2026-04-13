@@ -94,15 +94,17 @@
           <p>
             Use stdio for local MCP hosts or switch to HTTP/SSE when several agents
             need one shared memory backend. The daemon mode removes the lock-contention
-            pain of direct LanceDB access.
+            pain of direct LanceDB access, and HTTP clients can bootstrap from one
+            canonical <code>/api/discovery</code> surface.
           </p>
         </article>
         <article class="card">
           <h2>Release-ready install path</h2>
           <p>
             GitHub Releases ship platform tarballs, SHA256 checksums, and a one-line
-            installer that creates the documented aliases: <code>rust-memex</code>,
-            <code>rmmx</code>, and <code>rmemex</code>.
+            installer that keeps the canonical <code>rmcp-memex</code> binary front and
+            center while preserving a legacy <code>rmcp_memex</code> symlink for older
+            automation.
           </p>
         </article>
       </section>
@@ -133,7 +135,7 @@ rmcp-memex serve --http-port 6660 --http-only</code></pre>
         <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/HTTP_API.md">
           <span class="doc-kicker">HTTP/SSE</span>
           <h3>Daemon reference</h3>
-          <p>Endpoints, event shapes, and multi-agent transport behavior.</p>
+          <p>Start with <code>/api/discovery</code>, then drill into browse, search, and write routes.</p>
         </a>
         <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/RELEASE.md">
           <span class="doc-kicker">Release ops</span>
@@ -148,8 +150,8 @@ rmcp-memex serve --http-port 6660 --http-only</code></pre>
           <h2>What shipping now means.</h2>
         </div>
         <ul class="checklist">
-          <li>Canonical binary naming across Cargo, release workflow, and installer</li>
-          <li>Checksum-backed GitHub Release artifacts for macOS and Linux</li>
+          <li>Canonical binary naming across Cargo, local signing pipeline, and installer</li>
+          <li>Locally built and signed release artifacts uploaded to GitHub Releases</li>
           <li>Static launch page source for GitHub Pages with zero client-side JS dependency</li>
           <li>Library-only and package smoke checks in CI, not just the default feature build</li>
         </ul>

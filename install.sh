@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# rmcp-memex installer
+# rmcp-memex installer for prebuilt GitHub Release bundles
 # curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 # or with a specific release tag:
-# RMCP_MEMEX_VERSION=v0.4.1 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+# RMCP_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 
 set -euo pipefail
 
@@ -11,7 +11,7 @@ INSTALL_DIR="${RMCP_MEMEX_INSTALL_DIR:-$HOME/.cargo/bin}"
 GITHUB_REPO="VetCoders/rmcp-memex"
 BINARY_NAME="rmcp-memex"
 CHECKSUM_FILE="rmcp-memex-sha256sums.txt"
-ALIASES=("rmcp_memex" "rust-memex" "rmmx" "rmemex")
+COMPAT_ALIASES=("rmcp_memex")
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -147,11 +147,11 @@ is_in_path() {
     esac
 }
 
-install_aliases() {
+install_compat_aliases() {
     local binary_path="$1"
     local alias_name
 
-    for alias_name in "${ALIASES[@]}"; do
+    for alias_name in "${COMPAT_ALIASES[@]}"; do
         ln -sfn "$binary_path" "$INSTALL_DIR/$alias_name"
     done
 }
@@ -208,8 +208,9 @@ main() {
     mkdir -p "$INSTALL_DIR"
     cp "$extracted_binary" "$INSTALL_DIR/$BINARY_NAME"
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
-    install_aliases "$INSTALL_DIR/$BINARY_NAME"
+    install_compat_aliases "$INSTALL_DIR/$BINARY_NAME"
     success "Installed ${BINARY_NAME} to $INSTALL_DIR/$BINARY_NAME"
+    info "Legacy compatibility alias: $INSTALL_DIR/rmcp_memex"
 
     installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null || echo "unknown")
     info "Installed version: $installed_version"

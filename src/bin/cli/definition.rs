@@ -6,14 +6,8 @@ use walkdir::WalkDir;
 
 use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
+pub const DEFAULT_SSE_PORT: u16 = 8997;
 
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
@@ -72,10 +66,12 @@ fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, O
 use crate::cli::config::*;
 #[derive(Parser, Debug)]
 #[command(
+    name = "rmcp-memex",
+    bin_name = "rmcp-memex",
     author,
     version,
-    about = "rmcp-memex: Custom Rust MCP kernel for RAG and long-term memory.\nPrimary entrypoint. Supports stdio (native MCP) & SSE/HTTP (multi-agent) transports.\n(Aliases: rust-memex, rmmx, rmemex)",
-    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nNote: rust-memex, rmmx, and rmemex are strictly convenience aliases for this identical kernel, not separate products."
+    about = "rmcp-memex: custom Rust MCP kernel for RAG and long-term memory.\nCanonical entrypoint for stdio (native MCP) and HTTP/SSE (multi-agent) transports.",
+    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nrmcp-memex is the only supported binary name. The GitHub installer may also create rmcp_memex as a legacy compatibility symlink for older scripts."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -85,12 +81,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Server mode: "memory" (memory-only, no filesystem) or "full" (all features)
-    #[arg(long, value_parser = ["memory", "full"], global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, value_parser = ["memory", "full"], global = true, hide = true)]
     pub mode: Option<String>,
 
-    /// Enable specific features (comma-separated). Overrides --mode if set.
-    #[arg(long, global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, global = true, hide = true)]
     pub features: Option<String>,
 
     /// Cache size in MB
@@ -128,7 +124,7 @@ pub struct Cli {
     /// HTTP/SSE server port for multi-agent access.
     /// When set, starts an HTTP server alongside MCP stdio.
     /// Agents can query via HTTP instead of holding LanceDB lock directly.
-    /// Example: --http-port 6660
+    /// Example: --http-port 8997
     #[arg(long, global = true)]
     pub http_port: Option<u16>,
 
@@ -158,6 +154,24 @@ pub struct Cli {
 pub enum Commands {
     /// Run the MCP server (default if no subcommand specified)
     Serve,
+
+    /// Run the local dashboard server and open it in the default browser.
+    Dashboard {
+        /// Dashboard HTTP port (default: 8987)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+
+        /// Do not open the dashboard in a browser after startup
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Run the HTTP/SSE daemon on the agent-facing port.
+    Sse {
+        /// HTTP/SSE port (default: 8997)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+    },
 
     /// Launch interactive configuration wizard
     #[command(alias = "config")]
@@ -260,13 +274,13 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
-        /// Prefer compact progress output when an interactive terminal is detected.
+        /// Show progress bar with ETA when running in an interactive terminal.
         /// Non-interactive runs fall back to line logs.
         #[arg(long)]
         progress: bool,
 
         /// Resume from last checkpoint if interrupted.
-        /// Saves progress after each file to .index-checkpoint.json.
+        /// Saves progress after each committed file to .index-checkpoint-<namespace>.json.
         /// On restart, skips already indexed files and continues.
         #[arg(long)]
         resume: bool,
@@ -274,7 +288,7 @@ pub enum Commands {
         /// Enable async pipeline mode for concurrent indexing.
         /// Runs file reading, chunking, embedding, and storage in parallel
         /// using tokio channels. Can significantly speed up large batch operations.
-        /// Note: Pipeline mode ignores --progress and --resume flags.
+        /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
 
@@ -767,6 +781,88 @@ pub enum Commands {
         db_path: Option<String>,
     },
 
+    /// Reprocess exported JSONL into a fresh namespace using the current chunker
+    ///
+    /// Useful when the original source files are gone but the namespace export is valuable.
+    /// The command collapses onion families back to a single canonical document, optionally
+    /// preprocesses the text, and re-indexes it with the requested slice mode.
+    ///
+    /// Examples:
+    ///   rmcp-memex export -n kodowanie -o kodowanie.jsonl
+    ///   rmcp-memex reprocess -i kodowanie.jsonl -n kodowanie-v2 --slice-mode onion-fast
+    ///   rmcp-memex reprocess -i memories.jsonl -n memories-v2 --preprocess --dry-run
+    #[command(alias = "reindex-export")]
+    Reprocess {
+        /// Target namespace for rebuilt documents
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Input JSONL file produced by 'export'
+        #[arg(long, short = 'i', required = true)]
+        input: PathBuf,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
+    /// Reindex an existing rmcp-memex namespace into '<namespace>-reindexed'
+    ///
+    /// This is the in-database equivalent of 'export -> reprocess' for namespaced
+    /// rmcp-memex stores. It reads the existing namespace, collapses onion families
+    /// back to canonical documents, and writes a rebuilt namespace without touching
+    /// the source data.
+    ///
+    /// Examples:
+    ///   rmcp-memex reindex -n kodowanie
+    ///   rmcp-memex reindex -n kodowanie --dry-run
+    ///   rmcp-memex reindex -n kodowanie --target-namespace kodowanie-v2 --slice-mode onion-fast
+    Reindex {
+        /// Source namespace to rebuild
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Target namespace override (default: '<namespace>-reindexed')
+        #[arg(long)]
+        target_namespace: Option<String>,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
     /// Audit database quality and text integrity
     ///
     /// Analyzes namespaces for embedding quality, text integrity (>90% target),
@@ -828,57 +924,50 @@ impl Cli {
             eprintln!("Using config: {}", path);
         }
 
+        let legacy_mode = self.mode.clone().or_else(|| file_cfg.mode.clone());
+        let legacy_features = self.features.clone().or_else(|| file_cfg.features.clone());
+        if legacy_mode.is_some() || legacy_features.is_some() {
+            eprintln!(
+                "Warning: legacy mode/features settings are ignored. rmcp-memex now exposes one canonical MCP surface; constrain access with --allowed-paths, HTTP auth, or namespace security instead."
+            );
+        }
+
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.resolve_embedding_config();
-
-        // Determine base config from mode (CLI > file > default)
-        let mode = self.mode.as_deref().or(file_cfg.mode.as_deref());
-        let base_cfg = match mode {
-            Some("memory") => ServerConfig::for_memory_only(),
-            Some("full") => ServerConfig::for_full_rag(),
-            _ => ServerConfig::default(),
-        };
-
-        // CLI --features overrides mode-derived features
-        let features = self
-            .features
-            .or(file_cfg.features)
-            .map(|s| parse_features(&s))
-            .unwrap_or(base_cfg.features);
+        let default_cfg = ServerConfig::default();
 
         // Build security config from CLI and file settings
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
         Ok(ServerConfig {
-            features,
             cache_mb: self
                 .cache_mb
                 .or(file_cfg.cache_mb)
-                .unwrap_or(base_cfg.cache_mb),
+                .unwrap_or(default_cfg.cache_mb),
             db_path: self
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or(base_cfg.db_path),
+                .unwrap_or(default_cfg.db_path),
             max_request_bytes: self
                 .max_request_bytes
                 .or(file_cfg.max_request_bytes)
-                .unwrap_or(base_cfg.max_request_bytes),
+                .unwrap_or(default_cfg.max_request_bytes),
             log_level: self
                 .log_level
                 .or(file_cfg.log_level)
                 .map(|s| parse_log_level(&s))
-                .unwrap_or(base_cfg.log_level),
+                .unwrap_or(default_cfg.log_level),
             allowed_paths: self
                 .allowed_paths
                 .or(file_cfg.allowed_paths)
-                .unwrap_or(base_cfg.allowed_paths),
+                .unwrap_or(default_cfg.allowed_paths),
             security: NamespaceSecurityConfig {
                 enabled: security_enabled,
                 token_store_path,
             },
             embeddings,
-            hybrid: base_cfg.hybrid,
+            hybrid: default_cfg.hybrid,
         })
     }
 }
@@ -949,4 +1038,62 @@ pub fn collect_files(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_mode_and_features_flags_parse_but_do_not_change_server_shape() {
+        let tmp = tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "mode = \"memory\"\nfeatures = \"memory,search\"\n",
+        )
+        .unwrap();
+
+        let cli = Cli::parse_from([
+            "rmcp-memex",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--mode",
+            "full",
+            "--features",
+            "filesystem,memory,search",
+            "serve",
+        ]);
+        let config = cli.into_server_config().unwrap();
+        let defaults = ServerConfig::default();
+
+        assert_eq!(config.db_path, defaults.db_path);
+        assert_eq!(config.cache_mb, defaults.cache_mb);
+        assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
+        assert_eq!(config.allowed_paths, defaults.allowed_paths);
+    }
+
+    #[test]
+    fn dashboard_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "dashboard"]);
+
+        match cli.command {
+            Some(Commands::Dashboard { port, no_open }) => {
+                assert_eq!(port, None);
+                assert!(!no_open);
+            }
+            other => panic!("expected dashboard command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sse_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "sse"]);
+
+        match cli.command {
+            Some(Commands::Sse { port }) => assert_eq!(port, None),
+            other => panic!("expected sse command, got {:?}", other),
+        }
+    }
 }
