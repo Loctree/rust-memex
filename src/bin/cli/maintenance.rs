@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, PipelineConfig, PipelineEvent,
-    PipelineSnapshot, PreprocessingConfig, RAGPipeline, SliceMode, StorageManager, path_utils,
+    BM25Config, BM25Index, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig,
+    IndexProgressTracker, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
+    RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, path_utils,
+    repair_cross_store_recovery,
 };
 
 #[allow(dead_code)]
@@ -907,6 +909,82 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             "Checkpoint preserved ({} files failed - rerun with --resume to retry)",
             failed
         );
+    }
+
+    Ok(())
+}
+
+fn print_cross_store_recovery_report(report: &CrossStoreRecoveryReport, execute: bool) {
+    let mode = if execute { "EXECUTE" } else { "DRY RUN" };
+    eprintln!("\n=== CROSS-STORE RECOVERY ({}) ===\n", mode);
+    eprintln!("Recovery dir: {}", report.recovery_dir);
+    eprintln!("Pending batches: {}", report.pending_batches);
+    eprintln!("  Divergent:   {}", report.divergent_batches);
+    eprintln!("  Rolled back: {}", report.rolled_back_batches);
+    eprintln!("  Stale:       {}", report.stale_batches);
+    eprintln!("  Clean:       {}", report.clean_batches);
+    eprintln!("Documents examined: {}", report.documents_examined);
+    eprintln!("Missing BM25 docs:  {}", report.documents_missing_bm25);
+    eprintln!("Missing Lance docs: {}", report.documents_missing_lance);
+    if execute {
+        eprintln!("Repaired docs:      {}", report.repaired_documents);
+        eprintln!("Skipped docs:       {}", report.skipped_documents);
+        eprintln!("Cleared batches:    {}", report.cleared_batches);
+    }
+
+    if report.batches.is_empty() {
+        eprintln!("\nNo recovery ledgers found.");
+        return;
+    }
+
+    eprintln!();
+    for batch in &report.batches {
+        let state = match batch.state {
+            rmcp_memex::CrossStoreRecoveryState::Clean => "clean",
+            rmcp_memex::CrossStoreRecoveryState::Divergent => "divergent",
+            rmcp_memex::CrossStoreRecoveryState::RolledBack => "rolled_back",
+            rmcp_memex::CrossStoreRecoveryState::Stale => "stale",
+        };
+        eprintln!(
+            "- {} [{}] state={} docs={} lance={} bm25={}",
+            batch.batch_id,
+            batch.namespace,
+            state,
+            batch.document_count,
+            batch.lance_documents,
+            batch.bm25_documents
+        );
+        if let Some(ref error) = batch.last_error {
+            eprintln!("  last_error: {}", error);
+        }
+        if !batch.missing_bm25_ids.is_empty() {
+            eprintln!("  missing_bm25: {}", batch.missing_bm25_ids.join(", "));
+        }
+        if !batch.missing_lance_ids.is_empty() {
+            eprintln!("  missing_lance: {}", batch.missing_lance_ids.join(", "));
+        }
+    }
+}
+
+pub async fn run_repair_writes(
+    db_path: String,
+    namespace: Option<String>,
+    execute: bool,
+    json_output: bool,
+) -> Result<()> {
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+    let bm25 = BM25Index::new(&BM25Config::default().with_read_only(!execute))?;
+
+    let report = if execute {
+        repair_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
+    } else {
+        inspect_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_cross_store_recovery_report(&report, execute);
     }
 
     Ok(())

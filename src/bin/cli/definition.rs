@@ -593,6 +593,31 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Inspect or repair pending Lance/BM25 recovery ledgers
+    ///
+    /// This is the explicit recovery contract for partial cross-store writes.
+    /// It does not claim crash-safe atomicity. Instead it inspects persisted
+    /// batch ledgers, reports divergence, and can replay BM25 writes to match
+    /// current Lance truth.
+    ///
+    /// Examples:
+    ///   rmcp-memex repair-writes
+    ///   rmcp-memex repair-writes --execute
+    ///   rmcp-memex repair-writes -n memories --json
+    RepairWrites {
+        /// Limit inspection/repair to a single namespace
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Actually execute reconciliation. Default is dry-run/report-only.
+        #[arg(long)]
+        execute: bool,
+
+        /// Output results as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Search across all namespaces
     ///
     /// Performs a unified search across every namespace, merging and ranking results.
@@ -1094,6 +1119,24 @@ mod tests {
         match cli.command {
             Some(Commands::Sse { port }) => assert_eq!(port, None),
             other => panic!("expected sse command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn repair_writes_command_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "repair-writes", "--execute", "-n", "memories"]);
+
+        match cli.command {
+            Some(Commands::RepairWrites {
+                namespace,
+                execute,
+                json,
+            }) => {
+                assert_eq!(namespace.as_deref(), Some("memories"));
+                assert!(execute);
+                assert!(!json);
+            }
+            other => panic!("expected repair-writes command, got {:?}", other),
         }
     }
 }
