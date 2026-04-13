@@ -1635,11 +1635,20 @@ impl RAGPipeline {
             }
         }
 
+        fn chunk_index(document: &ChromaDocument) -> usize {
+            document
+                .metadata
+                .get("chunk_index")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(usize::MAX)
+        }
+
         family.sort_by_key(|document| {
             if document.id == requested_id {
-                (0_u8, 0_u8)
+                (0_u8, 0_u8, 0_usize)
             } else {
-                (1_u8, rank(document.slice_layer()))
+                (1_u8, rank(document.slice_layer()), chunk_index(document))
             }
         });
 
@@ -2281,6 +2290,70 @@ impl RAGPipeline {
         Ok(total_chunks)
     }
 
+    async fn index_flat_memory_family_with_hash(
+        &self,
+        text: &str,
+        namespace: &str,
+        original_id: &str,
+        base_metadata: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<usize> {
+        let chunks = self.chunk_text(text, 512, 128)?;
+        let total_chunks = chunks.len();
+
+        tracing::info!(
+            "Flat memory chunking: {} chars -> {} chunks",
+            text.len(),
+            total_chunks
+        );
+
+        let mut total_stored = 0;
+        let mut global_idx = 0;
+        for batch in chunks.chunks(STORAGE_BATCH_SIZE) {
+            let embeddings = self.embed_chunks(batch).await?;
+
+            let mut batch_docs = Vec::with_capacity(batch.len());
+            for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
+                let mut metadata = base_metadata.clone();
+                if let serde_json::Value::Object(ref mut map) = metadata {
+                    map.insert("chunk_index".to_string(), json!(global_idx));
+                    map.insert("total_chunks".to_string(), json!(total_chunks));
+                    map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("original_id".to_string(), json!(original_id));
+                }
+
+                let doc_id = if total_chunks == 1 {
+                    original_id.to_string()
+                } else {
+                    format!("{original_id}::chunk::{global_idx}")
+                };
+
+                let chunk_hash = compute_content_hash(chunk);
+                let doc = ChromaDocument::new_flat_with_hash(
+                    doc_id,
+                    namespace.to_string(),
+                    embedding.clone(),
+                    metadata,
+                    chunk.clone(),
+                    chunk_hash,
+                );
+                batch_docs.push(doc);
+                global_idx += 1;
+            }
+
+            self.persist_documents(batch_docs).await?;
+            total_stored += batch.len();
+            tracing::info!(
+                "Stored {}/{} flat memory chunks for {}",
+                total_stored,
+                total_chunks,
+                original_id
+            );
+        }
+
+        Ok(total_chunks)
+    }
+
     pub async fn index_text(
         &self,
         namespace: Option<&str>,
@@ -2400,11 +2473,10 @@ impl RAGPipeline {
                 .await?;
             }
             SliceMode::Flat => {
-                let synthetic_path = Path::new(id);
-                self.index_with_flat_chunking_and_hash(
+                self.index_flat_memory_family_with_hash(
                     text,
                     namespace,
-                    synthetic_path,
+                    id,
                     metadata,
                     &content_hash,
                 )

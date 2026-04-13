@@ -486,3 +486,72 @@ The text stays comfortably above the slicing threshold so onion-fast still write
 
     Ok(())
 }
+
+#[tokio::test]
+async fn flat_memory_upsert_keeps_original_id_for_chunked_family_operations() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage.clone()).await?;
+    let namespace = "memory-upsert-flat";
+    let original_id = "../customer-notes/../../alpha";
+    let text = "Operator notes about cache invalidation, path hardening, and release readiness. "
+        .repeat(80);
+
+    rag.memory_upsert(
+        namespace,
+        original_id.to_string(),
+        text,
+        json!({"project": "Pathless"}),
+    )
+    .await?;
+
+    let docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert!(
+        docs.len() > 1,
+        "flat memory upsert should chunk this long document into a family"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc.metadata["original_id"] == original_id),
+        "every flat family chunk should remember the caller's original id"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc.id == original_id || doc.id.contains("::chunk::")),
+        "chunk ids should stay in the memory-id domain instead of pretending to be file paths"
+    );
+
+    let fetched = rag
+        .lookup_memory(namespace, original_id)
+        .await?
+        .ok_or_else(|| anyhow!("expected lookup by original id to resolve flat family"))?;
+    assert_eq!(fetched.metadata["original_id"], original_id);
+    assert_eq!(
+        fetched.metadata["chunk_index"], 0,
+        "lookup should deterministically return the first flat chunk"
+    );
+
+    let deleted = rag.remove_memory(namespace, original_id).await?;
+    assert_eq!(
+        deleted,
+        docs.len(),
+        "remove_memory should delete the whole flat family by original id"
+    );
+    assert!(
+        rag.storage_manager()
+            .get_all_in_namespace(namespace)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
