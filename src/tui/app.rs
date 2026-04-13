@@ -575,6 +575,10 @@ pub struct App {
     pub index_task: Option<JoinHandle<Result<()>>>,
     /// Running monitor sampler task.
     pub monitor_task: Option<JoinHandle<()>>,
+    /// Background dimension probe task paired with its generation token.
+    pub dimension_probe_task: Option<(u64, JoinHandle<Result<usize>>)>,
+    /// Monotonic token that invalidates stale probe completions.
+    pub dimension_probe_generation: u64,
     /// Current requested indexer parallelism.
     pub index_parallelism: usize,
     /// Whether the indexer is currently paused.
@@ -629,6 +633,8 @@ impl App {
             index_control_tx: None,
             index_task: None,
             monitor_task: None,
+            dimension_probe_task: None,
+            dimension_probe_generation: 0,
             index_parallelism: DEFAULT_INDEX_PARALLELISM,
             index_paused: false,
             config_written: false,
@@ -944,6 +950,75 @@ impl App {
         self.embedding_config = self.embedder_state.build_embedding_config();
     }
 
+    fn invalidate_dimension_probe_generation(&mut self) {
+        self.dimension_probe_generation = self.dimension_probe_generation.wrapping_add(1);
+    }
+
+    fn cancel_dimension_probe_task(&mut self) {
+        if let Some((_, handle)) = self.dimension_probe_task.take() {
+            handle.abort();
+        }
+        self.invalidate_dimension_probe_generation();
+    }
+
+    fn start_dimension_probe_task(&mut self, rt: &tokio::runtime::Handle) {
+        if self.dimension_probe_task.is_some() {
+            return;
+        }
+
+        let Some(provider) = self.embedder_state.pending_dimension_probe.take() else {
+            return;
+        };
+
+        let generation = self.dimension_probe_generation;
+        let task = rt.spawn(async move {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .unwrap_or_default();
+
+            probe_provider_dimension(&client, &provider).await
+        });
+
+        self.dimension_probe_task = Some((generation, task));
+    }
+
+    fn apply_dimension_probe_completion(&mut self, generation: u64, result: Result<usize>) -> bool {
+        if generation != self.dimension_probe_generation {
+            return false;
+        }
+
+        self.embedder_state.apply_probe_result(result);
+        self.refresh_embedding_config();
+        true
+    }
+
+    fn poll_dimension_probe_task(&mut self, rt: &tokio::runtime::Handle) {
+        let Some((generation, handle)) = self.dimension_probe_task.take() else {
+            return;
+        };
+
+        if !handle.is_finished() {
+            self.dimension_probe_task = Some((generation, handle));
+            return;
+        }
+
+        let join_result = tokio::task::block_in_place(|| rt.block_on(handle));
+        match join_result {
+            Ok(result) => {
+                let _ = self.apply_dimension_probe_completion(generation, result);
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                let _ = self.apply_dimension_probe_completion(
+                    generation,
+                    Err(anyhow!("dimension probe task failed: {}", error)),
+                );
+            }
+        }
+    }
+
     pub fn set_field_value(&mut self, field: usize, value: String) {
         match field {
             0 => self.memex_cfg.db_path = value,
@@ -1102,6 +1177,7 @@ impl App {
                         // Handle embedder setup fields
                         if self.step == WizardStep::EmbedderSetup && self.embedder_state.use_manual
                         {
+                            self.cancel_dimension_probe_task();
                             match field {
                                 0 => self.embedder_state.manual_url = self.input_buffer.clone(),
                                 1 => {
@@ -1201,11 +1277,13 @@ impl App {
             };
         } else if self.focus < self.embedder_state.detected_providers.len() {
             // Select a detected provider
+            self.cancel_dimension_probe_task();
             let provider = self.embedder_state.detected_providers[self.focus].clone();
             self.embedder_state.apply_detected_provider(provider);
             self.refresh_embedding_config();
         } else {
             // Switch to manual configuration (last option)
+            self.cancel_dimension_probe_task();
             self.embedder_state.use_manual = true;
             self.focus = 0;
             self.embedder_state.refresh_manual_dimension_state();
@@ -1542,31 +1620,16 @@ impl App {
                 .detected_providers
                 .iter()
                 .find(|p| p.is_usable())
+                .cloned()
             {
-                self.embedder_state
-                    .apply_detected_provider(provider.clone());
+                self.cancel_dimension_probe_task();
+                self.embedder_state.apply_detected_provider(provider);
             } else {
+                self.cancel_dimension_probe_task();
                 self.embedder_state.reset_probe_state();
             }
             self.refresh_embedding_config();
         }
-    }
-
-    pub async fn run_dimension_probe(&mut self) {
-        let Some(provider) = self.embedder_state.pending_dimension_probe.clone() else {
-            self.embedder_state.dimension_probe_in_flight = false;
-            return;
-        };
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(8))
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-
-        let result = probe_provider_dimension(&client, &provider).await;
-        self.embedder_state.apply_probe_result(result);
-        self.refresh_embedding_config();
     }
 
     /// Generate the complete config TOML for rmcp-memex
@@ -1793,6 +1856,9 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     };
 
     loop {
+        app.start_dimension_probe_task(&rt);
+        app.poll_dimension_probe_task(&rt);
+
         let current_telemetry = app.current_index_telemetry();
         if app.step == WizardStep::DataSetup
             && app.data_setup.sub_step == DataSetupSubStep::Indexing
@@ -1822,17 +1888,6 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
             });
         }
 
-        if app.embedder_state.dimension_probe_in_flight
-            && app.embedder_state.pending_dimension_probe.is_some()
-        {
-            let rt_clone = rt.clone();
-            tokio::task::block_in_place(|| {
-                rt_clone.block_on(async {
-                    app.run_dimension_probe().await;
-                });
-            });
-        }
-
         // Handle async health check if triggered
         if app.health_running && app.health_result.is_none() {
             let rt_clone = rt.clone();
@@ -1851,6 +1906,7 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
 
         if app.should_quit {
+            app.cancel_dimension_probe_task();
             app.stop_indexing_tasks();
             break;
         }
@@ -1917,5 +1973,25 @@ mod tests {
 
         assert_eq!(state.dimension_truth, DimensionTruth::Default);
         assert!(state.dimension_write_blocker().is_some());
+    }
+
+    #[test]
+    fn stale_probe_completion_cannot_override_newer_manual_choice() {
+        let mut app = App::new(WizardConfig::default());
+        app.embedder_state
+            .apply_detected_provider(detected_provider("qwen3-embedding:8b"));
+        app.refresh_embedding_config();
+
+        app.dimension_probe_generation = 5;
+        app.cancel_dimension_probe_task();
+        app.embedder_state.set_manual_dimension(1536);
+        app.refresh_embedding_config();
+
+        let applied = app.apply_dimension_probe_completion(5, Ok(4096));
+
+        assert!(!applied);
+        assert_eq!(app.embedder_state.dimension, 1536);
+        assert_eq!(app.embedder_state.dimension_truth, DimensionTruth::Manual);
+        assert_eq!(app.embedding_config.required_dimension, 1536);
     }
 }
