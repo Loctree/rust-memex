@@ -5,6 +5,7 @@
 
 use crate::embeddings::{
     DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, infer_embedding_dimension,
+    probe_provider_dimension,
 };
 use crate::tui::detection::{
     DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
@@ -27,6 +28,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
+use reqwest::Client;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +37,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 const DEFAULT_INDEX_PARALLELISM: usize = 4;
+const DEFAULT_MEMEX_CONFIG_PATH: &str = "~/.rmcp-servers/rmcp-memex/config.toml";
 
 /// Configuration for running the wizard.
 #[derive(Debug, Clone, Default)]
@@ -114,6 +117,19 @@ impl WizardStep {
     }
 }
 
+/// How trustworthy the currently selected embedding dimension is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionTruth {
+    /// Built-in fallback only; no reliable model-specific signal yet.
+    Default,
+    /// Derived from a recognized model name.
+    Inferred,
+    /// Verified by a live embedding probe against the provider.
+    Probed,
+    /// Explicitly set by the operator.
+    Manual,
+}
+
 /// Embedder configuration state for the wizard.
 #[derive(Debug, Clone)]
 pub struct EmbedderState {
@@ -129,6 +145,14 @@ pub struct EmbedderState {
     pub manual_model: String,
     /// Required embedding dimension
     pub dimension: usize,
+    /// Where the current dimension came from.
+    pub dimension_truth: DimensionTruth,
+    /// Whether a live dimension probe is currently pending.
+    pub dimension_probe_in_flight: bool,
+    /// Last live probe error, if any.
+    pub dimension_probe_error: Option<String>,
+    /// Provider config queued for the next live probe attempt.
+    pub pending_dimension_probe: Option<ProviderConfig>,
     /// Whether to use manual configuration instead of detected
     pub use_manual: bool,
 }
@@ -142,6 +166,10 @@ impl Default for EmbedderState {
             manual_url: "http://localhost:11434".to_string(),
             manual_model: String::new(),
             dimension: DEFAULT_REQUIRED_DIMENSION,
+            dimension_truth: DimensionTruth::Default,
+            dimension_probe_in_flight: false,
+            dimension_probe_error: None,
+            pending_dimension_probe: None,
             use_manual: false,
         }
     }
@@ -167,9 +195,222 @@ impl EmbedderState {
         }
     }
 
+    pub fn selected_base_url(&self) -> Option<&str> {
+        if self.use_manual {
+            let url = self.manual_url.trim();
+            if url.is_empty() { None } else { Some(url) }
+        } else {
+            self.selected_provider
+                .as_ref()
+                .map(|provider| provider.base_url.trim())
+                .filter(|url| !url.is_empty())
+        }
+    }
+
+    pub fn dimension_display(&self) -> String {
+        if self.dimension_probe_in_flight && matches!(self.dimension_truth, DimensionTruth::Default)
+        {
+            return "probing...".to_string();
+        }
+
+        let suffix = match self.dimension_truth {
+            DimensionTruth::Default => "placeholder",
+            DimensionTruth::Inferred => {
+                if self.dimension_probe_in_flight {
+                    "inferred; probing"
+                } else {
+                    "inferred"
+                }
+            }
+            DimensionTruth::Probed => "probed",
+            DimensionTruth::Manual => "manual",
+        };
+
+        format!("{} [{}]", self.dimension, suffix)
+    }
+
     /// Get dimension explanation text
-    pub fn dimension_hint(&self) -> &'static str {
-        dimension_explanation(self.dimension)
+    pub fn dimension_hint(&self) -> String {
+        if self.dimension_probe_in_flight {
+            return match self.dimension_truth {
+                DimensionTruth::Inferred => format!(
+                    "Inferred from the model name and now verifying against the live provider. {}",
+                    dimension_explanation(self.dimension)
+                ),
+                _ => "No reliable heuristic for this model yet; probing the provider for the actual vector size.".to_string(),
+            };
+        }
+
+        if let Some(error) = &self.dimension_probe_error {
+            let concise_error = error.lines().next().unwrap_or(error).trim();
+            return match self.dimension_truth {
+                DimensionTruth::Inferred => format!(
+                    "Live probe failed, so the wizard is keeping the inferred dimension for now. Re-run Health Check before shipping this config. Probe error: {concise_error}"
+                ),
+                DimensionTruth::Manual => format!(
+                    "Manual override is active. Probe failed, but the operator-supplied dimension will be used. Probe error: {concise_error}"
+                ),
+                _ => format!(
+                    "Live probe failed and there is no trustworthy fallback yet. Run Health Check or set the dimension manually before writing config. Probe error: {concise_error}"
+                ),
+            };
+        }
+
+        match self.dimension_truth {
+            DimensionTruth::Default => {
+                if let Some(model) = self.selected_model() {
+                    format!(
+                        "No trustworthy dimension has been established for `{model}` yet. {}",
+                        dimension_explanation(self.dimension)
+                    )
+                } else {
+                    format!(
+                        "Select an embedding model or enter one manually. {}",
+                        dimension_explanation(self.dimension)
+                    )
+                }
+            }
+            DimensionTruth::Inferred => format!(
+                "Derived from the model name. Health Check can still verify it live. {}",
+                dimension_explanation(self.dimension)
+            ),
+            DimensionTruth::Probed => format!(
+                "Verified live against the provider response. {}",
+                dimension_explanation(self.dimension)
+            ),
+            DimensionTruth::Manual => format!(
+                "Set manually by the operator. {}",
+                dimension_explanation(self.dimension)
+            ),
+        }
+    }
+
+    pub fn dimension_write_blocker(&self) -> Option<String> {
+        if self.dimension_probe_in_flight {
+            return Some(
+                "Embedding dimension is still being probed. Wait for the live probe to finish or set a manual dimension.".to_string(),
+            );
+        }
+
+        match self.dimension_truth {
+            DimensionTruth::Default => Some(
+                "Embedding dimension is still a placeholder. Pick a recognized model, let the live probe succeed, or enter the dimension manually before writing config.".to_string(),
+            ),
+            DimensionTruth::Inferred | DimensionTruth::Probed | DimensionTruth::Manual => None,
+        }
+    }
+
+    fn reset_probe_state(&mut self) {
+        self.dimension_probe_in_flight = false;
+        self.dimension_probe_error = None;
+        self.pending_dimension_probe = None;
+    }
+
+    fn schedule_dimension_probe(&mut self, provider: ProviderConfig) {
+        self.pending_dimension_probe = Some(provider);
+        self.dimension_probe_in_flight = true;
+        self.dimension_probe_error = None;
+    }
+
+    fn current_provider_config(&self) -> Option<ProviderConfig> {
+        let model = self.selected_model()?;
+        let base_url = self.selected_base_url()?.to_string();
+
+        Some(ProviderConfig {
+            name: if self.use_manual {
+                "manual".to_string()
+            } else if let Some(provider) = &self.selected_provider {
+                match provider.kind {
+                    ProviderKind::Ollama => "ollama-local".to_string(),
+                    ProviderKind::Mlx => "mlx-local".to_string(),
+                    ProviderKind::OpenAICompat => "openai-compat".to_string(),
+                    ProviderKind::Manual => "manual".to_string(),
+                }
+            } else {
+                "manual".to_string()
+            },
+            base_url,
+            model,
+            priority: 1,
+            ..Default::default()
+        })
+    }
+
+    fn refresh_manual_dimension_state(&mut self) {
+        self.selected_provider = None;
+        self.dimension_probe_error = None;
+
+        let model = self.manual_model.trim();
+        if model.is_empty() {
+            self.dimension = DEFAULT_REQUIRED_DIMENSION;
+            self.dimension_truth = DimensionTruth::Default;
+            self.pending_dimension_probe = None;
+            self.dimension_probe_in_flight = false;
+            return;
+        }
+
+        if let Some(dim) = infer_embedding_dimension(model) {
+            self.dimension = dim;
+            self.dimension_truth = DimensionTruth::Inferred;
+        } else {
+            self.dimension = DEFAULT_REQUIRED_DIMENSION;
+            self.dimension_truth = DimensionTruth::Default;
+        }
+
+        if let Some(provider) = self.current_provider_config() {
+            self.schedule_dimension_probe(provider);
+        } else {
+            self.dimension_probe_in_flight = false;
+            self.pending_dimension_probe = None;
+        }
+    }
+
+    fn set_manual_dimension(&mut self, dimension: usize) {
+        self.dimension = dimension;
+        self.dimension_truth = DimensionTruth::Manual;
+        self.reset_probe_state();
+    }
+
+    fn apply_detected_provider(&mut self, provider: DetectedProvider) {
+        self.use_manual = false;
+        self.selected_provider = Some(provider);
+        self.dimension_probe_error = None;
+
+        if let Some(dim) = self
+            .selected_provider
+            .as_ref()
+            .and_then(DetectedProvider::inferred_dimension)
+        {
+            self.dimension = dim;
+            self.dimension_truth = DimensionTruth::Inferred;
+        } else {
+            self.dimension = DEFAULT_REQUIRED_DIMENSION;
+            self.dimension_truth = DimensionTruth::Default;
+        }
+
+        if let Some(provider) = self.current_provider_config() {
+            self.schedule_dimension_probe(provider);
+        } else {
+            self.dimension_probe_in_flight = false;
+            self.pending_dimension_probe = None;
+        }
+    }
+
+    fn apply_probe_result(&mut self, result: Result<usize>) {
+        self.dimension_probe_in_flight = false;
+
+        match result {
+            Ok(dimension) => {
+                self.dimension = dimension;
+                self.dimension_truth = DimensionTruth::Probed;
+                self.dimension_probe_error = None;
+            }
+            Err(error) => {
+                self.dimension_probe_error = Some(error.to_string());
+            }
+        }
+
+        self.pending_dimension_probe = None;
     }
 
     /// Update embedding config from state
@@ -300,6 +541,7 @@ impl MemexCfg {
 pub struct App {
     pub step: WizardStep,
     pub memex_cfg: MemexCfg,
+    pub config_path: String,
     /// Embedder configuration state (new EmbedderSetup step)
     pub embedder_state: EmbedderState,
     /// Derived embedding config (updated from embedder_state)
@@ -351,6 +593,10 @@ impl App {
         self.mux_proxy_available
     }
     pub fn new(config: WizardConfig) -> Self {
+        let WizardConfig {
+            config_path,
+            dry_run,
+        } = config;
         let hosts = detect_extended_hosts();
         let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp-memex".to_string());
         let embedder_state = EmbedderState::default();
@@ -360,11 +606,12 @@ impl App {
         Self {
             step: WizardStep::Welcome,
             memex_cfg: MemexCfg::default(),
+            config_path: config_path.unwrap_or_else(|| DEFAULT_MEMEX_CONFIG_PATH.to_string()),
             embedder_state,
             embedding_config,
             hosts,
             selected_hosts: Vec::new(),
-            dry_run: config.dry_run,
+            dry_run,
             messages: Vec::new(),
             focus: 0,
             binary_path,
@@ -392,7 +639,7 @@ impl App {
         if let Some(next) = self.step.next() {
             // On leaving EmbedderSetup, update the embedding config
             if self.step == WizardStep::EmbedderSetup {
-                self.embedding_config = self.embedder_state.build_embedding_config();
+                self.refresh_embedding_config();
             }
             self.step = next;
             self.focus = 0;
@@ -437,14 +684,14 @@ impl App {
     }
 
     pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
-        let effective_path = self.memex_cfg.resolved_db_path();
+        let config_path = self.resolved_config_path();
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
                 let snippet = match self.memex_cfg.deployment_mode {
                     DeploymentMode::PerHostStdio => {
                         let mut snippet =
-                            generate_extended_snippet(*kind, &self.binary_path, &effective_path);
+                            generate_extended_snippet(*kind, &self.binary_path, &config_path);
                         if let Some(port) = self.memex_cfg.http_port {
                             snippet = snippet.replace(
                                 "\"serve\"",
@@ -489,6 +736,8 @@ impl App {
             "[INFO] Host: {} (path mode: {:?})",
             self.memex_cfg.hostname, self.memex_cfg.db_path_mode
         ));
+        self.messages
+            .push(format!("[INFO] Config path: {}", self.config_path));
 
         // Check db_path (use effective path)
         let effective_path = self.memex_cfg.resolved_db_path();
@@ -510,7 +759,7 @@ impl App {
     }
 
     pub fn write_configs(&mut self) -> Result<()> {
-        let effective_path = self.memex_cfg.resolved_db_path();
+        let config_path = self.resolved_config_path();
 
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
@@ -522,7 +771,7 @@ impl App {
                 if let Some((kind, detection)) = self.hosts.get(idx) {
                     let snippet = match self.memex_cfg.deployment_mode {
                         DeploymentMode::PerHostStdio => {
-                            generate_extended_snippet(*kind, &self.binary_path, &effective_path)
+                            generate_extended_snippet(*kind, &self.binary_path, &config_path)
                         }
                         DeploymentMode::SharedMux => generate_extended_snippet_mux(
                             *kind,
@@ -553,7 +802,7 @@ impl App {
             if let Some((kind, _detection)) = self.hosts.get(idx) {
                 let write_result = match self.memex_cfg.deployment_mode {
                     DeploymentMode::PerHostStdio => {
-                        write_extended_host_config(*kind, &self.binary_path, &effective_path)
+                        write_extended_host_config(*kind, &self.binary_path, &config_path)
                     }
                     DeploymentMode::SharedMux => write_extended_host_config_mux(
                         *kind,
@@ -610,7 +859,7 @@ impl App {
         Ok(())
     }
 
-    fn settings_field_count(&self) -> usize {
+    pub(crate) fn settings_field_count(&self) -> usize {
         6 + usize::from(self.mux_proxy_on_path())
     }
 
@@ -634,6 +883,22 @@ impl App {
             },
             _ => String::new(),
         }
+    }
+
+    pub fn resolved_config_path(&self) -> String {
+        let expanded = shellexpand::tilde(&self.config_path).to_string();
+        let path = PathBuf::from(&expanded);
+        if path.is_absolute() {
+            expanded
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(path).display().to_string()
+        } else {
+            expanded
+        }
+    }
+
+    fn refresh_embedding_config(&mut self) {
+        self.embedding_config = self.embedder_state.build_embedding_config();
     }
 
     pub fn set_field_value(&mut self, field: usize, value: String) {
@@ -798,19 +1063,19 @@ impl App {
                                 0 => self.embedder_state.manual_url = self.input_buffer.clone(),
                                 1 => {
                                     self.embedder_state.manual_model = self.input_buffer.clone();
-                                    if let Some(dim) =
-                                        infer_embedding_dimension(&self.embedder_state.manual_model)
-                                    {
-                                        self.embedder_state.dimension = dim;
-                                    }
+                                    self.embedder_state.refresh_manual_dimension_state();
                                 }
                                 2 => {
                                     if let Ok(dim) = self.input_buffer.parse() {
-                                        self.embedder_state.dimension = dim;
+                                        self.embedder_state.set_manual_dimension(dim);
                                     }
                                 }
                                 _ => {}
                             }
+                            if field == 0 {
+                                self.embedder_state.refresh_manual_dimension_state();
+                            }
+                            self.refresh_embedding_config();
                         } else {
                             self.set_field_value(field, self.input_buffer.clone());
                         }
@@ -894,14 +1159,14 @@ impl App {
         } else if self.focus < self.embedder_state.detected_providers.len() {
             // Select a detected provider
             let provider = self.embedder_state.detected_providers[self.focus].clone();
-            self.embedder_state.dimension = provider
-                .inferred_dimension()
-                .unwrap_or(self.embedder_state.dimension);
-            self.embedder_state.selected_provider = Some(provider);
+            self.embedder_state.apply_detected_provider(provider);
+            self.refresh_embedding_config();
         } else {
             // Switch to manual configuration (last option)
             self.embedder_state.use_manual = true;
             self.focus = 0;
+            self.embedder_state.refresh_manual_dimension_state();
+            self.refresh_embedding_config();
         }
     }
 
@@ -1050,6 +1315,7 @@ impl App {
     /// Trigger the async health check
     pub fn trigger_health_check(&mut self) {
         self.health_running = true;
+        self.health_result = None;
         self.health_status = Some("Running health checks...".to_string());
         self.messages.clear();
 
@@ -1081,8 +1347,9 @@ impl App {
         }
 
         let checker = HealthChecker::new();
+        let effective_path = self.memex_cfg.resolved_db_path();
         let result = checker
-            .run_all(&self.embedding_config, &self.memex_cfg.db_path)
+            .run_all(&self.embedding_config, &effective_path)
             .await;
 
         self.health_result = Some(result.clone());
@@ -1157,7 +1424,7 @@ impl App {
             files,
             namespace.clone(),
             self.embedding_config.clone(),
-            self.memex_cfg.db_path.clone(),
+            self.memex_cfg.resolved_db_path(),
             sink,
             control_rx,
             self.index_parallelism,
@@ -1194,7 +1461,8 @@ impl App {
     fn perform_import(&mut self) {
         if let Some(ref source_path) = self.data_setup.source_path {
             let source = PathBuf::from(shellexpand::tilde(source_path).to_string());
-            let target = PathBuf::from(shellexpand::tilde(&self.memex_cfg.db_path).to_string());
+            let target =
+                PathBuf::from(shellexpand::tilde(&self.memex_cfg.resolved_db_path()).to_string());
 
             // Run import synchronously for now (it's mostly IO)
             let rt = tokio::runtime::Handle::try_current();
@@ -1232,12 +1500,30 @@ impl App {
                 .iter()
                 .find(|p| p.is_usable())
             {
-                self.embedder_state.selected_provider = Some(provider.clone());
-                self.embedder_state.dimension = provider
-                    .inferred_dimension()
-                    .unwrap_or(self.embedder_state.dimension);
+                self.embedder_state
+                    .apply_detected_provider(provider.clone());
+            } else {
+                self.embedder_state.reset_probe_state();
             }
+            self.refresh_embedding_config();
         }
+    }
+
+    pub async fn run_dimension_probe(&mut self) {
+        let Some(provider) = self.embedder_state.pending_dimension_probe.clone() else {
+            self.embedder_state.dimension_probe_in_flight = false;
+            return;
+        };
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        let result = probe_provider_dimension(&client, &provider).await;
+        self.embedder_state.apply_probe_result(result);
+        self.refresh_embedding_config();
     }
 
     /// Generate the complete config TOML for rmcp-memex
@@ -1269,11 +1555,6 @@ impl App {
             self.memex_cfg.max_request_bytes
         ));
 
-        // HTTP/SSE server configuration
-        if let Some(port) = self.memex_cfg.http_port {
-            toml.push_str("\n# HTTP/SSE server for multi-agent access\n");
-            toml.push_str(&format!("http_port = {}\n", port));
-        }
         toml.push('\n');
 
         // Embeddings configuration
@@ -1331,11 +1612,14 @@ impl App {
             ));
         }
 
+        if let Some(reason) = self.embedder_state.dimension_write_blocker() {
+            return Err(anyhow!(reason));
+        }
+
         if self.dry_run {
             self.messages
                 .push("DRY RUN: Config would be written to:".to_string());
-            self.messages
-                .push("  ~/.rmcp-servers/rmcp-memex/config.toml".to_string());
+            self.messages.push(format!("  {}", self.config_path));
             self.messages.push(String::new());
             self.messages.push("Generated config:".to_string());
             self.messages.push("---".to_string());
@@ -1347,14 +1631,17 @@ impl App {
             return Ok(());
         }
 
-        // Create config directory
-        let config_dir = shellexpand::tilde("~/.rmcp-servers/rmcp-memex").to_string();
-        let config_path = format!("{}/config.toml", config_dir);
-
-        std::fs::create_dir_all(&config_dir)?;
+        let config_path = self.resolved_config_path();
+        let config_file = PathBuf::from(&config_path);
+        let config_dir = config_file.parent().ok_or_else(|| {
+            anyhow!(
+                "Cannot determine parent directory for config path {}",
+                self.config_path
+            )
+        })?;
+        std::fs::create_dir_all(config_dir)?;
 
         // Backup existing config if present
-        let config_file = PathBuf::from(&config_path);
         if config_file.exists() {
             let backup_path = format!("{}.bak.{}", config_path, timestamp());
             std::fs::copy(&config_file, &backup_path)?;
@@ -1369,7 +1656,7 @@ impl App {
             .push(format!("[OK] Config written: {}", config_path));
 
         // Create database directory if needed
-        let db_path = shellexpand::tilde(&self.memex_cfg.db_path).to_string();
+        let db_path = shellexpand::tilde(&self.memex_cfg.resolved_db_path()).to_string();
         if let Some(parent) = PathBuf::from(&db_path).parent()
             && !parent.exists()
         {
@@ -1381,8 +1668,15 @@ impl App {
         self.config_written = true;
         self.messages.push(String::new());
         self.messages.push("Configuration complete!".to_string());
-        self.messages
-            .push("Run 'rmcp-memex serve' to start the server.".to_string());
+        if self.config_path == DEFAULT_MEMEX_CONFIG_PATH {
+            self.messages
+                .push("Run 'rmcp-memex serve' to start the server.".to_string());
+        } else {
+            self.messages.push(format!(
+                "Run 'rmcp-memex serve --config {}' to start the server.",
+                self.config_path
+            ));
+        }
 
         Ok(())
     }
@@ -1481,6 +1775,17 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
             });
         }
 
+        if app.embedder_state.dimension_probe_in_flight
+            && app.embedder_state.pending_dimension_probe.is_some()
+        {
+            let rt_clone = rt.clone();
+            tokio::task::block_in_place(|| {
+                rt_clone.block_on(async {
+                    app.run_dimension_probe().await;
+                });
+            });
+        }
+
         // Handle async health check if triggered
         if app.health_running && app.health_result.is_none() {
             let rt_clone = rt.clone();
@@ -1505,4 +1810,65 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::detection::ProviderStatus;
+
+    fn detected_provider(model: &str) -> DetectedProvider {
+        DetectedProvider {
+            kind: ProviderKind::Ollama,
+            base_url: "http://localhost:11434".to_string(),
+            port: 11434,
+            models: vec![model.to_string()],
+            suggested_model: Some(model.to_string()),
+            status: ProviderStatus::Online(model.to_string()),
+        }
+    }
+
+    #[test]
+    fn detected_provider_selection_infers_dimension_and_queues_probe() {
+        let mut state = EmbedderState::default();
+        state.apply_detected_provider(detected_provider("qwen3-embedding:8b"));
+
+        assert_eq!(state.dimension, 4096);
+        assert_eq!(state.dimension_truth, DimensionTruth::Inferred);
+        assert!(state.dimension_probe_in_flight);
+        assert!(state.pending_dimension_probe.is_some());
+        assert!(state.dimension_write_blocker().is_some());
+    }
+
+    #[test]
+    fn manual_dimension_override_is_writable_without_probe() {
+        let mut state = EmbedderState {
+            use_manual: true,
+            manual_url: "http://localhost:11434".to_string(),
+            manual_model: "custom-embed".to_string(),
+            ..EmbedderState::default()
+        };
+
+        state.set_manual_dimension(1536);
+
+        assert_eq!(state.dimension, 1536);
+        assert_eq!(state.dimension_truth, DimensionTruth::Manual);
+        assert!(!state.dimension_probe_in_flight);
+        assert!(state.dimension_write_blocker().is_none());
+    }
+
+    #[test]
+    fn unknown_manual_model_without_probe_stays_blocked() {
+        let mut state = EmbedderState {
+            use_manual: true,
+            manual_model: "custom-embed".to_string(),
+            manual_url: String::new(),
+            ..EmbedderState::default()
+        };
+
+        state.refresh_manual_dimension_state();
+
+        assert_eq!(state.dimension_truth, DimensionTruth::Default);
+        assert!(state.dimension_write_blocker().is_some());
+    }
 }

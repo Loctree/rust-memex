@@ -299,16 +299,16 @@ pub fn detect_hosts() -> Vec<HostDetection> {
 pub fn generate_extended_snippet(
     kind: ExtendedHostKind,
     binary_path: &str,
-    db_path: &str,
+    config_path: &str,
 ) -> String {
     match get_extended_host_config_path(kind) {
         Some((_, HostFormat::Toml)) => {
             format!(
                 r#"[mcp_servers.rmcp_memex]
 command = "{}"
-args = ["serve", "--db-path", "{}", "--log-level", "info"]
+args = ["serve", "--config", "{}"]
 "#,
-                binary_path, db_path
+                binary_path, config_path
             )
         }
         Some((_, HostFormat::Json)) => {
@@ -317,11 +317,11 @@ args = ["serve", "--db-path", "{}", "--log-level", "info"]
   "mcpServers": {{
     "rmcp_memex": {{
       "command": "{}",
-      "args": ["serve", "--db-path", "{}", "--log-level", "info"]
+      "args": ["serve", "--config", "{}"]
     }}
   }}
 }}"#,
-                binary_path, db_path
+                binary_path, config_path
             )
         }
         None => String::new(),
@@ -367,7 +367,11 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
 }
 
 /// Merge the rmcp_memex host entry into existing JSON config.
-fn merge_json_config(existing_content: &str, binary_path: &str, db_path: &str) -> Result<String> {
+fn merge_json_config(
+    existing_content: &str,
+    binary_path: &str,
+    config_path: &str,
+) -> Result<String> {
     let mut config: serde_json::Value = if existing_content.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -383,7 +387,7 @@ fn merge_json_config(existing_content: &str, binary_path: &str, db_path: &str) -
     // Add or update rmcp_memex entry
     config["mcpServers"]["rmcp_memex"] = serde_json::json!({
         "command": binary_path,
-        "args": ["serve", "--db-path", db_path, "--log-level", "info"],
+        "args": ["serve", "--config", config_path],
         "description": "RAG memory with vector search"
     });
 
@@ -391,7 +395,11 @@ fn merge_json_config(existing_content: &str, binary_path: &str, db_path: &str) -
 }
 
 /// Merge the rmcp_memex host entry into existing TOML config.
-fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -> Result<String> {
+fn merge_toml_config(
+    existing_content: &str,
+    binary_path: &str,
+    config_path: &str,
+) -> Result<String> {
     let mut config: toml::Value = if existing_content.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
@@ -420,10 +428,8 @@ fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -
             "args".to_string(),
             toml::Value::Array(vec![
                 toml::Value::String("serve".to_string()),
-                toml::Value::String("--db-path".to_string()),
-                toml::Value::String(db_path.to_string()),
-                toml::Value::String("--log-level".to_string()),
-                toml::Value::String("info".to_string()),
+                toml::Value::String("--config".to_string()),
+                toml::Value::String(config_path.to_string()),
             ]),
         );
         mcp_servers.insert("rmcp_memex".to_string(), toml::Value::Table(entry));
@@ -438,7 +444,7 @@ fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -
 /// # Arguments
 /// * `host` - The detected host to write config for
 /// * `binary_path` - Path to the rmcp-memex binary
-/// * `db_path` - Path to the LanceDB database
+/// * `config_path` - Path to the rmcp-memex config file
 ///
 /// # Returns
 /// * `Ok(WriteResult)` with details about the write operation
@@ -446,7 +452,7 @@ fn merge_toml_config(existing_content: &str, binary_path: &str, db_path: &str) -
 pub fn write_host_config(
     host: &HostDetection,
     binary_path: &str,
-    db_path: &str,
+    config_path: &str,
 ) -> Result<WriteResult> {
     let host_name = host.kind.display_name().to_string();
 
@@ -480,8 +486,8 @@ pub fn write_host_config(
 
     // Merge config based on format
     let new_content = match host.format {
-        HostFormat::Json => merge_json_config(&existing_content, binary_path, db_path)?,
-        HostFormat::Toml => merge_toml_config(&existing_content, binary_path, db_path)?,
+        HostFormat::Json => merge_json_config(&existing_content, binary_path, config_path)?,
+        HostFormat::Toml => merge_toml_config(&existing_content, binary_path, config_path)?,
     };
 
     // Validate path before writing
@@ -508,7 +514,7 @@ pub fn write_host_config(
 pub fn write_extended_host_config(
     kind: ExtendedHostKind,
     binary_path: &str,
-    db_path: &str,
+    config_path: &str,
 ) -> Result<WriteResult> {
     let (path, format) =
         get_extended_host_config_path(kind).ok_or_else(|| anyhow::anyhow!("Unknown host kind"))?;
@@ -526,7 +532,7 @@ pub fn write_extended_host_config(
         servers: Vec::new(),
     };
 
-    let mut result = write_host_config(&host, binary_path, db_path)?;
+    let mut result = write_host_config(&host, binary_path, config_path)?;
     result.host_name = kind.label().to_string();
     Ok(result)
 }
@@ -655,10 +661,11 @@ command = "other"
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Codex),
             "/usr/bin/rmcp-memex",
-            "~/.rmcp/db",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
         );
         assert!(snippet.contains("[mcp_servers.rmcp_memex]"));
         assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("--config"));
     }
 
     #[test]
@@ -666,11 +673,12 @@ command = "other"
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Claude),
             "/usr/bin/rmcp-memex",
-            "~/.rmcp/db",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
         assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("--config"));
     }
 
     #[test]
@@ -678,25 +686,35 @@ command = "other"
         let snippet = generate_extended_snippet(
             ExtendedHostKind::ClaudeCode,
             "/usr/bin/rmcp-memex",
-            "~/.rmcp/db",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
         assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("--config"));
     }
 
     #[test]
     fn test_generate_extended_junie_snippet() {
-        let snippet =
-            generate_extended_snippet(ExtendedHostKind::Junie, "/usr/bin/rmcp-memex", "~/.rmcp/db");
+        let snippet = generate_extended_snippet(
+            ExtendedHostKind::Junie,
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+        );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
         assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("--config"));
     }
 
     #[test]
     fn test_merge_json_config_empty() {
-        let result = merge_json_config("", "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
+        let result = merge_json_config(
+            "",
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
             parsed["mcpServers"]["rmcp_memex"]["command"]
@@ -716,7 +734,12 @@ command = "other"
     }
   }
 }"#;
-        let result = merge_json_config(existing, "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
+        let result = merge_json_config(
+            existing,
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Should preserve existing server
         assert!(
@@ -735,9 +758,15 @@ command = "other"
 
     #[test]
     fn test_merge_toml_config_empty() {
-        let result = merge_toml_config("", "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
+        let result = merge_toml_config(
+            "",
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+        )
+        .unwrap();
         assert!(result.contains("[mcp_servers.rmcp_memex]"));
         assert!(result.contains("rmcp-memex"));
+        assert!(result.contains("--config"));
     }
 
     #[test]
@@ -747,11 +776,17 @@ command = "other"
 command = "other"
 args = []
 "#;
-        let result = merge_toml_config(existing, "/usr/bin/rmcp-memex", "~/.rmcp/db").unwrap();
+        let result = merge_toml_config(
+            existing,
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+        )
+        .unwrap();
         // Should preserve existing server
         assert!(result.contains("other_server"));
         // Should add rmcp_memex
         assert!(result.contains("rmcp-memex"));
+        assert!(result.contains("--config"));
     }
 
     #[test]

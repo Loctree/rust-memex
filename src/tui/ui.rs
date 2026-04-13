@@ -183,30 +183,76 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let fields = [
+fn settings_fields(app: &App) -> Vec<(&'static str, String, &'static str)> {
+    let mut fields = vec![
         (
             "Database Path",
-            &app.memex_cfg.db_path,
+            app.memex_cfg.db_path.clone(),
             "LanceDB storage location",
         ),
         (
+            "Path Mode",
+            app.get_field_value(1),
+            "shared or hostname-suffixed",
+        ),
+        (
+            "HTTP/SSE Port",
+            app.get_field_value(2),
+            "disabled or a port number",
+        ),
+        (
             "Cache Size (MB)",
-            &app.memex_cfg.cache_mb.to_string(),
-            "In-memory cache size",
+            app.get_field_value(3),
+            "in-memory cache budget",
         ),
         (
             "Log Level",
-            &app.memex_cfg.log_level,
+            app.get_field_value(4),
             "trace/debug/info/warn/error",
         ),
         (
             "Max Request (bytes)",
-            &app.memex_cfg.max_request_bytes.to_string(),
+            app.get_field_value(5),
             "JSON-RPC size limit",
         ),
     ];
 
+    if app.mux_proxy_on_path() {
+        fields.push((
+            "Deployment Mode",
+            app.get_field_value(6),
+            "direct stdio or shared mux",
+        ));
+    }
+
+    fields
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(8)])
+        .split(area);
+
+    let info = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Config path: ", Style::default().bold()),
+            Span::raw(app.resolved_config_path()),
+        ]),
+        Line::from(vec![
+            Span::styled("Effective database: ", Style::default().bold()),
+            Span::raw(app.memex_cfg.resolved_db_path()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Current Paths "),
+    );
+    frame.render_widget(info, chunks[0]);
+
+    let fields = settings_fields(app);
     let items: Vec<ListItem> = fields
         .iter()
         .enumerate()
@@ -246,7 +292,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Memex Configuration "),
     );
 
-    frame.render_widget(list, area);
+    frame.render_widget(list, chunks[1]);
 }
 
 fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
@@ -461,6 +507,20 @@ fn render_health_check(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let provider_label = if app.embedder_state.use_manual {
+        "Manual configuration".to_string()
+    } else if let Some(provider) = &app.embedder_state.selected_provider {
+        provider.kind.label().to_string()
+    } else {
+        "No provider selected yet".to_string()
+    };
+
+    let model_label = app
+        .embedder_state
+        .selected_model()
+        .unwrap_or_else(|| "<unset>".to_string());
+    let base_url = app.embedder_state.selected_base_url().unwrap_or("<unset>");
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Embedding Provider Setup",
@@ -476,17 +536,12 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
         "Current Configuration:",
         Style::default().bold(),
     )));
-    lines.push(Line::from(format!(
-        "  Provider: {}",
-        app.embedding_config.provider_name()
-    )));
-    lines.push(Line::from(format!(
-        "  Model: {}",
-        app.embedding_config.model_name()
-    )));
+    lines.push(Line::from(format!("  Provider: {}", provider_label)));
+    lines.push(Line::from(format!("  Base URL: {}", base_url)));
+    lines.push(Line::from(format!("  Model: {}", model_label)));
     lines.push(Line::from(format!(
         "  Dimension: {}",
-        app.embedding_config.dimension()
+        app.embedder_state.dimension_display()
     )));
     lines.push(Line::from(Span::styled(
         format!("             {}", app.embedder_state.dimension_hint()),
@@ -494,48 +549,132 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::from(""));
 
-    // Show detected providers if available
-    if !app.embedder_state.detected_providers.is_empty() {
+    if app.embedder_state.use_manual {
         lines.push(Line::from(Span::styled(
-            "Detected Providers:",
+            "Manual Fields:",
             Style::default().bold(),
         )));
 
-        for (i, provider) in app.embedder_state.detected_providers.iter().enumerate() {
+        let fields = [
+            ("Base URL", app.embedder_state.manual_url.clone()),
+            ("Model", app.embedder_state.manual_model.clone()),
+            ("Dimension", app.embedder_state.dimension_display()),
+        ];
+
+        for (i, (label, value)) in fields.iter().enumerate() {
             let is_focused = i == app.focus;
-            let prefix = if is_focused { "▶ " } else { "  " };
-            let style = if is_focused {
+            let is_editing = app.input_mode && app.editing_field == Some(i);
+            let display_value = if is_editing {
+                format!("{}▏", app.input_buffer)
+            } else {
+                value.clone()
+            };
+            let style = if is_editing {
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+            } else if is_focused {
                 Style::default().fg(Color::Cyan).bold()
             } else {
                 Style::default()
             };
-
-            let status_icon = match &provider.status {
-                ProviderStatus::Online(_) => "[OK]",
-                ProviderStatus::OnlineNoModel => "[--]",
-                ProviderStatus::Offline => "[XX]",
-            };
-
-            let status_color = match &provider.status {
-                ProviderStatus::Online(_) => Color::Green,
-                ProviderStatus::OnlineNoModel => Color::Yellow,
-                ProviderStatus::Offline => Color::DarkGray,
-            };
+            let prefix = if is_focused { "▶ " } else { "  " };
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
-                Span::styled(
-                    format!("{} ", status_icon),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(provider.summary(), style),
+                Span::styled(format!("{:<12}", label), style),
+                Span::styled(display_value, style),
             ]));
         }
-    } else {
+
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "No providers detected yet. Continue to proceed with default configuration.",
-            Style::default().fg(Color::Yellow),
+            "Press [Esc] to return to detected providers.",
+            Style::default().fg(Color::DarkGray),
         )));
+    } else {
+        // Show detected providers if available
+        if !app.embedder_state.detected_providers.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Detected Providers:",
+                Style::default().bold(),
+            )));
+
+            for (i, provider) in app.embedder_state.detected_providers.iter().enumerate() {
+                let is_focused = i == app.focus;
+                let is_selected = app
+                    .embedder_state
+                    .selected_provider
+                    .as_ref()
+                    .map(|selected| {
+                        selected.base_url == provider.base_url
+                            && selected.model() == provider.model()
+                    })
+                    .unwrap_or(false);
+                let prefix = if is_focused { "▶ " } else { "  " };
+                let style = if is_focused {
+                    Style::default().fg(Color::Cyan).bold()
+                } else if is_selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+
+                let status_icon = match &provider.status {
+                    ProviderStatus::Online(_) => "[OK]",
+                    ProviderStatus::OnlineNoModel => "[--]",
+                    ProviderStatus::Offline => "[XX]",
+                };
+
+                let status_color = match &provider.status {
+                    ProviderStatus::Online(_) => Color::Green,
+                    ProviderStatus::OnlineNoModel => Color::Yellow,
+                    ProviderStatus::Offline => Color::DarkGray,
+                };
+
+                let dimension_note = provider
+                    .inferred_dimension()
+                    .map(|dim| format!("{dim} inferred"))
+                    .unwrap_or_else(|| "dimension probe required".to_string());
+
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(
+                        format!("{} ", status_icon),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::styled(provider.summary(), style),
+                    Span::styled(
+                        format!(" ({dimension_note})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No providers detected yet. Continue to proceed with default configuration.",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        let manual_index = app.embedder_state.detected_providers.len();
+        let manual_style = if app.focus == manual_index {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default()
+        };
+        let manual_prefix = if app.focus == manual_index {
+            "▶ "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(manual_prefix, manual_style),
+            Span::styled("Configure manually", manual_style),
+            Span::styled(
+                " (edit URL, model, and dimension directly)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
     }
 
     let paragraph = Paragraph::new(lines)
@@ -898,7 +1037,8 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled("Memex Settings:", Style::default().bold())),
-        Line::from(format!("  Database: {}", app.memex_cfg.db_path)),
+        Line::from(format!("  Config: {}", app.config_path)),
+        Line::from(format!("  Database: {}", app.memex_cfg.resolved_db_path())),
         Line::from(format!("  Cache: {} MB", app.memex_cfg.cache_mb)),
         Line::from(format!("  Log Level: {}", app.memex_cfg.log_level)),
         Line::from(""),
@@ -957,4 +1097,16 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_fields;
+    use crate::tui::app::{App, WizardConfig};
+
+    #[test]
+    fn settings_fields_track_live_app_field_count() {
+        let app = App::new(WizardConfig::default());
+        assert_eq!(settings_fields(&app).len(), app.settings_field_count());
+    }
 }
