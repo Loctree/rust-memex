@@ -12,8 +12,9 @@ use crate::tui::detection::{
 };
 use crate::tui::health::{HealthCheckResult, HealthChecker};
 use crate::tui::host_detection::{
-    ExtendedHostKind, HostDetection, detect_extended_hosts, generate_extended_snippet,
-    generate_extended_snippet_mux, write_extended_host_config, write_extended_host_config_mux,
+    DEFAULT_MUX_CONFIG_PATH, DEFAULT_MUX_SERVICE_NAME, DEFAULT_MUX_SOCKET_PATH, ExtendedHostKind,
+    HostDetection, detect_extended_hosts, generate_extended_snippet, generate_extended_snippet_mux,
+    write_extended_host_config, write_extended_host_config_mux, write_mux_service_config,
 };
 use crate::tui::indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
@@ -585,7 +586,7 @@ pub struct App {
 }
 
 fn mux_proxy_on_path() -> bool {
-    false
+    which_binary(&["rmcp_mux_proxy", "rmcp-mux-proxy"]).is_some()
 }
 
 impl App {
@@ -689,21 +690,15 @@ impl App {
             .iter()
             .map(|(kind, _detection)| {
                 let snippet = match self.memex_cfg.deployment_mode {
-                    DeploymentMode::PerHostStdio => {
-                        let mut snippet =
-                            generate_extended_snippet(*kind, &self.binary_path, &config_path);
-                        if let Some(port) = self.memex_cfg.http_port {
-                            snippet = snippet.replace(
-                                "\"serve\"",
-                                &format!("\"serve\", \"--http-port\", \"{}\"", port),
-                            );
-                        }
-                        snippet
-                    }
-                    DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                    DeploymentMode::PerHostStdio => generate_extended_snippet(
                         *kind,
-                        "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                        &self.binary_path,
+                        &config_path,
+                        self.memex_cfg.http_port,
                     ),
+                    DeploymentMode::SharedMux => {
+                        generate_extended_snippet_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
+                    }
                 };
                 (*kind, snippet)
             })
@@ -770,13 +765,15 @@ impl App {
             for &idx in &self.selected_hosts.clone() {
                 if let Some((kind, detection)) = self.hosts.get(idx) {
                     let snippet = match self.memex_cfg.deployment_mode {
-                        DeploymentMode::PerHostStdio => {
-                            generate_extended_snippet(*kind, &self.binary_path, &config_path)
-                        }
-                        DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                        DeploymentMode::PerHostStdio => generate_extended_snippet(
                             *kind,
-                            "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                            &self.binary_path,
+                            &config_path,
+                            self.memex_cfg.http_port,
                         ),
+                        DeploymentMode::SharedMux => {
+                            generate_extended_snippet_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
+                        }
                     };
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
@@ -787,10 +784,10 @@ impl App {
                 }
             }
             if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
-                self.messages.push(
-                    "Would write mux service config to ~/.rmcp_servers/rmcp-memex/mux_config.toml"
-                        .to_string(),
-                );
+                self.messages.push(format!(
+                    "Would write mux service config to {}",
+                    DEFAULT_MUX_CONFIG_PATH
+                ));
             }
             return Ok(());
         }
@@ -798,16 +795,56 @@ impl App {
         let mut success_count = 0;
         let mut error_count = 0;
 
+        if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+            match write_mux_service_config(
+                &self.binary_path,
+                &config_path,
+                self.memex_cfg.http_port,
+                self.memex_cfg.max_request_bytes,
+                &self.memex_cfg.log_level,
+            ) {
+                Ok(result) => {
+                    if let Some(backup) = result.backup_path {
+                        self.messages.push(format!(
+                            "[OK] {} backup: {}",
+                            result.host_name,
+                            backup.display()
+                        ));
+                    }
+                    if result.created {
+                        self.messages.push(format!(
+                            "[OK] {} created: {}",
+                            result.host_name,
+                            result.config_path.display()
+                        ));
+                    } else {
+                        self.messages.push(format!(
+                            "[OK] {} updated: {}",
+                            result.host_name,
+                            result.config_path.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.messages
+                        .push(format!("[ERR] rmcp-mux service config failed: {}", error));
+                    return Err(error);
+                }
+            }
+        }
+
         for &idx in &self.selected_hosts.clone() {
             if let Some((kind, _detection)) = self.hosts.get(idx) {
                 let write_result = match self.memex_cfg.deployment_mode {
-                    DeploymentMode::PerHostStdio => {
-                        write_extended_host_config(*kind, &self.binary_path, &config_path)
-                    }
-                    DeploymentMode::SharedMux => write_extended_host_config_mux(
+                    DeploymentMode::PerHostStdio => write_extended_host_config(
                         *kind,
-                        "~/.rmcp_servers/rmcp-memex/sockets/main.sock",
+                        &self.binary_path,
+                        &config_path,
+                        self.memex_cfg.http_port,
                     ),
+                    DeploymentMode::SharedMux => {
+                        write_extended_host_config_mux(*kind, DEFAULT_MUX_SOCKET_PATH)
+                    }
                 };
 
                 match write_result {
@@ -848,6 +885,12 @@ impl App {
                 "\nConfiguration complete! {} host(s) configured.",
                 success_count
             ));
+            if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+                self.messages.push(format!(
+                    "Start the shared daemon with: rmcp_mux --config {} --service {}",
+                    DEFAULT_MUX_CONFIG_PATH, DEFAULT_MUX_SERVICE_NAME
+                ));
+            }
         }
         if error_count > 0 {
             self.messages.push(format!(
@@ -1692,7 +1735,11 @@ fn timestamp() -> String {
 }
 
 fn which_rmcp_memex() -> Option<String> {
-    ["rmcp-memex", "rmcp_memex"].into_iter().find_map(|binary| {
+    which_binary(&["rmcp-memex", "rmcp_memex"])
+}
+
+fn which_binary(candidates: &[&str]) -> Option<String> {
+    candidates.iter().find_map(|binary| {
         std::process::Command::new("which")
             .arg(binary)
             .output()

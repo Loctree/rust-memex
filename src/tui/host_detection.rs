@@ -6,7 +6,7 @@
 use crate::common::{HostFormat, HostKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,41 @@ pub struct McpServerEntry {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+}
+
+pub const DEFAULT_MUX_PROXY_CMD: &str = "rmcp_mux_proxy";
+pub const DEFAULT_MUX_SERVICE_NAME: &str = "rmcp-memex";
+pub const DEFAULT_MUX_SOCKET_PATH: &str = "~/.rmcp_servers/rmcp-memex/sockets/main.sock";
+pub const DEFAULT_MUX_CONFIG_PATH: &str = "~/.rmcp_servers/rmcp-memex/mux_config.toml";
+const DEFAULT_MUX_STATUS_PATH: &str = "~/.rmcp_servers/rmcp-memex/status/main.json";
+const RMCP_MEMEX_SERVER_NAME: &str = "rmcp_memex";
+const MUX_MAX_ACTIVE_CLIENTS: usize = 5;
+const MUX_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const MUX_RESTART_BACKOFF_MS: u64 = 1_000;
+const MUX_RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+const MUX_MAX_RESTARTS: u64 = 5;
+
+#[derive(Debug, Clone, Serialize)]
+struct MuxConfigFile {
+    servers: BTreeMap<String, MuxServiceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MuxServiceConfig {
+    socket: String,
+    cmd: String,
+    args: Vec<String>,
+    max_active_clients: usize,
+    max_request_bytes: usize,
+    request_timeout_ms: u64,
+    restart_backoff_ms: u64,
+    restart_backoff_max_ms: u64,
+    max_restarts: u64,
+    lazy_start: bool,
+    tray: bool,
+    service_name: String,
+    log_level: String,
+    status_file: String,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +101,16 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(stripped);
+    }
+
+    PathBuf::from(path)
 }
 
 /// Extended host kind that includes hosts not in rmcp-common
@@ -295,37 +340,153 @@ pub fn detect_hosts() -> Vec<HostDetection> {
         .collect()
 }
 
+fn direct_command_args(config_path: &str, http_port: Option<u16>) -> Vec<String> {
+    let mut args = vec!["serve".to_string()];
+    if let Some(port) = http_port {
+        args.push("--http-port".to_string());
+        args.push(port.to_string());
+    }
+    args.push("--config".to_string());
+    args.push(config_path.to_string());
+    args
+}
+
+fn proxy_command_args(sock_path: &str) -> Vec<String> {
+    vec!["--socket".to_string(), sock_path.to_string()]
+}
+
+fn build_server_entry(command: &str, args: Vec<String>) -> McpServerEntry {
+    McpServerEntry {
+        name: RMCP_MEMEX_SERVER_NAME.to_string(),
+        command: command.to_string(),
+        args,
+        env: HashMap::new(),
+    }
+}
+
+fn build_direct_host_entry(
+    binary_path: &str,
+    config_path: &str,
+    http_port: Option<u16>,
+) -> McpServerEntry {
+    build_server_entry(binary_path, direct_command_args(config_path, http_port))
+}
+
+fn build_mux_host_entry(sock_path: &str) -> McpServerEntry {
+    build_server_entry(DEFAULT_MUX_PROXY_CMD, proxy_command_args(sock_path))
+}
+
+fn entry_description(entry: &McpServerEntry) -> &'static str {
+    if entry.command.contains("rmcp_mux_proxy") || entry.command.contains("rmcp-mux-proxy") {
+        "RAG memory via shared rmcp-mux proxy"
+    } else {
+        "RAG memory with vector search"
+    }
+}
+
+fn json_server_config(entry: &McpServerEntry) -> serde_json::Value {
+    let mut server = serde_json::Map::new();
+    server.insert(
+        "command".to_string(),
+        serde_json::Value::String(entry.command.clone()),
+    );
+    server.insert(
+        "args".to_string(),
+        serde_json::Value::Array(
+            entry
+                .args
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    if !entry.env.is_empty() {
+        server.insert(
+            "env".to_string(),
+            serde_json::Value::Object(
+                entry
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+    }
+    server.insert(
+        "description".to_string(),
+        serde_json::Value::String(entry_description(entry).to_string()),
+    );
+
+    serde_json::Value::Object(server)
+}
+
+fn toml_server_config(entry: &McpServerEntry) -> toml::Value {
+    let mut server = toml::map::Map::new();
+    server.insert(
+        "command".to_string(),
+        toml::Value::String(entry.command.clone()),
+    );
+    server.insert(
+        "args".to_string(),
+        toml::Value::Array(
+            entry
+                .args
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    if !entry.env.is_empty() {
+        let env = entry
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+            .collect();
+        server.insert("env".to_string(), toml::Value::Table(env));
+    }
+
+    toml::Value::Table(server)
+}
+
+fn render_snippet(format: HostFormat, entry: &McpServerEntry) -> Result<String> {
+    match format {
+        HostFormat::Json => {
+            let mut servers = serde_json::Map::new();
+            servers.insert(entry.name.clone(), json_server_config(entry));
+            let mut root = serde_json::Map::new();
+            root.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
+            serde_json::to_string_pretty(&serde_json::Value::Object(root))
+                .with_context(|| "Failed to serialize JSON snippet")
+        }
+        HostFormat::Toml => {
+            let mut servers = toml::map::Map::new();
+            servers.insert(entry.name.clone(), toml_server_config(entry));
+            let mut root = toml::map::Map::new();
+            root.insert("mcp_servers".to_string(), toml::Value::Table(servers));
+            toml::to_string_pretty(&toml::Value::Table(root))
+                .with_context(|| "Failed to serialize TOML snippet")
+        }
+    }
+}
+
 /// Generate a config snippet for an extended host kind.
 pub fn generate_extended_snippet(
     kind: ExtendedHostKind,
     binary_path: &str,
     config_path: &str,
+    http_port: Option<u16>,
 ) -> String {
-    match get_extended_host_config_path(kind) {
-        Some((_, HostFormat::Toml)) => {
-            format!(
-                r#"[mcp_servers.rmcp_memex]
-command = "{}"
-args = ["serve", "--config", "{}"]
-"#,
-                binary_path, config_path
-            )
-        }
-        Some((_, HostFormat::Json)) => {
-            format!(
-                r#"{{
-  "mcpServers": {{
-    "rmcp_memex": {{
-      "command": "{}",
-      "args": ["serve", "--config", "{}"]
-    }}
-  }}
-}}"#,
-                binary_path, config_path
-            )
-        }
-        None => String::new(),
-    }
+    let Some((_, format)) = get_extended_host_config_path(kind) else {
+        return String::new();
+    };
+
+    render_snippet(
+        format,
+        &build_direct_host_entry(binary_path, config_path, http_port),
+    )
+    .unwrap_or_default()
 }
 
 /// Result of writing a host config
@@ -367,11 +528,7 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
 }
 
 /// Merge the rmcp_memex host entry into existing JSON config.
-fn merge_json_config(
-    existing_content: &str,
-    binary_path: &str,
-    config_path: &str,
-) -> Result<String> {
+fn merge_json_config(existing_content: &str, entry: &McpServerEntry) -> Result<String> {
     let mut config: serde_json::Value = if existing_content.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -385,21 +542,13 @@ fn merge_json_config(
     }
 
     // Add or update rmcp_memex entry
-    config["mcpServers"]["rmcp_memex"] = serde_json::json!({
-        "command": binary_path,
-        "args": ["serve", "--config", config_path],
-        "description": "RAG memory with vector search"
-    });
+    config["mcpServers"][entry.name.as_str()] = json_server_config(entry);
 
     serde_json::to_string_pretty(&config).with_context(|| "Failed to serialize JSON config")
 }
 
 /// Merge the rmcp_memex host entry into existing TOML config.
-fn merge_toml_config(
-    existing_content: &str,
-    binary_path: &str,
-    config_path: &str,
-) -> Result<String> {
+fn merge_toml_config(existing_content: &str, entry: &McpServerEntry) -> Result<String> {
     let mut config: toml::Value = if existing_content.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
@@ -419,45 +568,21 @@ fn merge_toml_config(
 
     // Add or update rmcp_memex entry
     if let Some(mcp_servers) = table.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
-        let mut entry = toml::map::Map::new();
-        entry.insert(
-            "command".to_string(),
-            toml::Value::String(binary_path.to_string()),
-        );
-        entry.insert(
-            "args".to_string(),
-            toml::Value::Array(vec![
-                toml::Value::String("serve".to_string()),
-                toml::Value::String("--config".to_string()),
-                toml::Value::String(config_path.to_string()),
-            ]),
-        );
-        mcp_servers.insert("rmcp_memex".to_string(), toml::Value::Table(entry));
+        mcp_servers.insert(entry.name.clone(), toml_server_config(entry));
     }
 
     Ok(toml::to_string_pretty(&config)?)
 }
 
-/// Write host config, merging with existing config if present.
-/// Creates a backup before modifying existing files.
-///
-/// # Arguments
-/// * `host` - The detected host to write config for
-/// * `binary_path` - Path to the rmcp-memex binary
-/// * `config_path` - Path to the rmcp-memex config file
-///
-/// # Returns
-/// * `Ok(WriteResult)` with details about the write operation
-/// * `Err` if the write fails
-pub fn write_host_config(
-    host: &HostDetection,
-    binary_path: &str,
-    config_path: &str,
+fn write_host_config_entry(
+    host_name: String,
+    path: &Path,
+    format: HostFormat,
+    exists: bool,
+    entry: &McpServerEntry,
 ) -> Result<WriteResult> {
-    let host_name = host.kind.display_name().to_string();
-
     // Ensure parent directory exists
-    if let Some(parent) = host.path.parent()
+    if let Some(parent) = path.parent()
         && !parent.exists()
     {
         std::fs::create_dir_all(parent)
@@ -465,8 +590,8 @@ pub fn write_host_config(
     }
 
     // Create backup if file exists
-    let backup_path = if host.exists {
-        Some(create_backup(&host.path)?)
+    let backup_path = if exists {
+        Some(create_backup(path)?)
     } else {
         None
     };
@@ -474,39 +599,36 @@ pub fn write_host_config(
     use crate::path_utils::validate_write_path;
 
     // Read existing content or use empty string
-    let existing_content = if host.exists {
-        // Validate path before reading
-        let (_safe_path, content) =
-            crate::path_utils::safe_read_to_string(&host.path.to_string_lossy())
-                .with_context(|| format!("Cannot read config: {}", host.path.display()))?;
+    let existing_content = if exists {
+        let (_safe_path, content) = crate::path_utils::safe_read_to_string(&path.to_string_lossy())
+            .with_context(|| format!("Cannot read config: {}", path.display()))?;
         content
     } else {
         String::new()
     };
 
     // Merge config based on format
-    let new_content = match host.format {
-        HostFormat::Json => merge_json_config(&existing_content, binary_path, config_path)?,
-        HostFormat::Toml => merge_toml_config(&existing_content, binary_path, config_path)?,
+    let new_content = match format {
+        HostFormat::Json => merge_json_config(&existing_content, entry)?,
+        HostFormat::Toml => merge_toml_config(&existing_content, entry)?,
     };
 
     // Validate path before writing
-    let safe_write_path = validate_write_path(&host.path).with_context(|| {
+    let safe_write_path = validate_write_path(path).with_context(|| {
         format!(
             "Cannot write config: path validation failed for {}",
-            host.path.display()
+            path.display()
         )
     })?;
 
-    // Write the merged config
     std::fs::write(&safe_write_path, &new_content)
         .with_context(|| format!("Failed to write config to {}", safe_write_path.display()))?;
 
     Ok(WriteResult {
         host_name,
-        config_path: host.path.clone(),
+        config_path: path.to_path_buf(),
         backup_path,
-        created: !host.exists,
+        created: !exists,
     })
 }
 
@@ -515,26 +637,18 @@ pub fn write_extended_host_config(
     kind: ExtendedHostKind,
     binary_path: &str,
     config_path: &str,
+    http_port: Option<u16>,
 ) -> Result<WriteResult> {
     let (path, format) =
         get_extended_host_config_path(kind).ok_or_else(|| anyhow::anyhow!("Unknown host kind"))?;
-
-    let exists = path.exists();
-    let host = HostDetection {
-        kind: match kind {
-            ExtendedHostKind::Standard(k) => k,
-            _ => HostKind::Unknown, // Use Unknown for extended types
-        },
-        path: path.clone(),
+    let entry = build_direct_host_entry(binary_path, config_path, http_port);
+    write_host_config_entry(
+        kind.label().to_string(),
+        &path,
         format,
-        exists,
-        has_rmcp_memex: false,
-        servers: Vec::new(),
-    };
-
-    let mut result = write_host_config(&host, binary_path, config_path)?;
-    result.host_name = kind.label().to_string();
-    Ok(result)
+        path.exists(),
+        &entry,
+    )
 }
 
 /// Detect all extended hosts (including ClaudeCode and Junie)
@@ -587,27 +701,128 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
     results
 }
 
-pub fn generate_extended_snippet_mux(_kind: ExtendedHostKind, _sock_path: &str) -> String {
-    String::new()
+pub fn generate_extended_snippet_mux(kind: ExtendedHostKind, sock_path: &str) -> String {
+    let Some((_, format)) = get_extended_host_config_path(kind) else {
+        return String::new();
+    };
+
+    render_snippet(format, &build_mux_host_entry(sock_path)).unwrap_or_default()
 }
 
 pub fn write_extended_host_config_mux(
     kind: ExtendedHostKind,
-    _sock_path: &str,
+    sock_path: &str,
 ) -> Result<WriteResult> {
-    let (path, _format) =
+    let (path, format) =
         get_extended_host_config_path(kind).ok_or_else(|| anyhow::anyhow!("Unknown host kind"))?;
-
-    Ok(WriteResult {
-        host_name: kind.label().to_string(),
-        config_path: path,
-        backup_path: None,
-        created: false,
-    })
+    write_host_config_entry(
+        kind.label().to_string(),
+        &path,
+        format,
+        path.exists(),
+        &build_mux_host_entry(sock_path),
+    )
 }
 
-pub fn write_mux_service_config() -> Result<()> {
-    Ok(())
+fn build_mux_service_config_toml(
+    binary_path: &str,
+    config_path: &str,
+    http_port: Option<u16>,
+    max_request_bytes: usize,
+    log_level: &str,
+) -> Result<String> {
+    let mut servers = BTreeMap::new();
+    servers.insert(
+        DEFAULT_MUX_SERVICE_NAME.to_string(),
+        MuxServiceConfig {
+            socket: DEFAULT_MUX_SOCKET_PATH.to_string(),
+            cmd: binary_path.to_string(),
+            args: direct_command_args(config_path, http_port),
+            max_active_clients: MUX_MAX_ACTIVE_CLIENTS,
+            max_request_bytes,
+            request_timeout_ms: MUX_REQUEST_TIMEOUT_MS,
+            restart_backoff_ms: MUX_RESTART_BACKOFF_MS,
+            restart_backoff_max_ms: MUX_RESTART_BACKOFF_MAX_MS,
+            max_restarts: MUX_MAX_RESTARTS,
+            lazy_start: false,
+            tray: false,
+            service_name: DEFAULT_MUX_SERVICE_NAME.to_string(),
+            log_level: log_level.to_string(),
+            status_file: DEFAULT_MUX_STATUS_PATH.to_string(),
+        },
+    );
+
+    toml::to_string_pretty(&MuxConfigFile { servers })
+        .with_context(|| "Failed to serialize mux service config")
+}
+
+pub fn write_mux_service_config(
+    binary_path: &str,
+    config_path: &str,
+    http_port: Option<u16>,
+    max_request_bytes: usize,
+    log_level: &str,
+) -> Result<WriteResult> {
+    let config_file = expand_home_path(DEFAULT_MUX_CONFIG_PATH);
+    let socket_dir = expand_home_path(DEFAULT_MUX_SOCKET_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("Invalid mux socket path"))?;
+    let status_dir = expand_home_path(DEFAULT_MUX_STATUS_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("Invalid mux status path"))?;
+
+    if let Some(parent) = config_file.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    if !socket_dir.exists() {
+        std::fs::create_dir_all(&socket_dir)
+            .with_context(|| format!("Failed to create directory {}", socket_dir.display()))?;
+    }
+    if !status_dir.exists() {
+        std::fs::create_dir_all(&status_dir)
+            .with_context(|| format!("Failed to create directory {}", status_dir.display()))?;
+    }
+
+    let exists = config_file.exists();
+    let backup_path = if exists {
+        Some(create_backup(&config_file)?)
+    } else {
+        None
+    };
+
+    use crate::path_utils::validate_write_path;
+
+    let content = build_mux_service_config_toml(
+        binary_path,
+        config_path,
+        http_port,
+        max_request_bytes,
+        log_level,
+    )?;
+    let safe_write_path = validate_write_path(&config_file).with_context(|| {
+        format!(
+            "Cannot write mux service config: path validation failed for {}",
+            config_file.display()
+        )
+    })?;
+    std::fs::write(&safe_write_path, content).with_context(|| {
+        format!(
+            "Failed to write mux service config to {}",
+            safe_write_path.display()
+        )
+    })?;
+
+    Ok(WriteResult {
+        host_name: "rmcp-mux service".to_string(),
+        config_path: config_file,
+        backup_path,
+        created: !exists,
+    })
 }
 
 #[cfg(test)]
@@ -662,6 +877,7 @@ command = "other"
             ExtendedHostKind::Standard(HostKind::Codex),
             "/usr/bin/rmcp-memex",
             "~/.rmcp-servers/rmcp-memex/config.toml",
+            None,
         );
         assert!(snippet.contains("[mcp_servers.rmcp_memex]"));
         assert!(snippet.contains("/usr/bin/rmcp-memex"));
@@ -674,6 +890,7 @@ command = "other"
             ExtendedHostKind::Standard(HostKind::Claude),
             "/usr/bin/rmcp-memex",
             "~/.rmcp-servers/rmcp-memex/config.toml",
+            None,
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
@@ -687,6 +904,7 @@ command = "other"
             ExtendedHostKind::ClaudeCode,
             "/usr/bin/rmcp-memex",
             "~/.rmcp-servers/rmcp-memex/config.toml",
+            None,
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
@@ -700,6 +918,7 @@ command = "other"
             ExtendedHostKind::Junie,
             "/usr/bin/rmcp-memex",
             "~/.rmcp-servers/rmcp-memex/config.toml",
+            None,
         );
         assert!(snippet.contains("\"mcpServers\""));
         assert!(snippet.contains("\"rmcp_memex\""));
@@ -708,11 +927,26 @@ command = "other"
     }
 
     #[test]
+    fn test_generate_json_snippet_includes_http_port_when_requested() {
+        let snippet = generate_extended_snippet(
+            ExtendedHostKind::Standard(HostKind::Claude),
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+            Some(8765),
+        );
+        assert!(snippet.contains("--http-port"));
+        assert!(snippet.contains("8765"));
+    }
+
+    #[test]
     fn test_merge_json_config_empty() {
         let result = merge_json_config(
             "",
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            &build_direct_host_entry(
+                "/usr/bin/rmcp-memex",
+                "~/.rmcp-servers/rmcp-memex/config.toml",
+                None,
+            ),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -725,6 +959,36 @@ command = "other"
     }
 
     #[test]
+    fn test_merge_json_config_preserves_http_port() {
+        let result = merge_json_config(
+            "",
+            &build_direct_host_entry(
+                "/usr/bin/rmcp-memex",
+                "~/.rmcp-servers/rmcp-memex/config.toml",
+                Some(8765),
+            ),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let args = parsed["mcpServers"]["rmcp_memex"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--http-port",
+                "8765",
+                "--config",
+                "~/.rmcp-servers/rmcp-memex/config.toml"
+            ]
+        );
+    }
+
+    #[test]
     fn test_merge_json_config_existing() {
         let existing = r#"{
   "mcpServers": {
@@ -733,11 +997,14 @@ command = "other"
       "args": []
     }
   }
-}"#;
+        }"#;
         let result = merge_json_config(
             existing,
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            &build_direct_host_entry(
+                "/usr/bin/rmcp-memex",
+                "~/.rmcp-servers/rmcp-memex/config.toml",
+                None,
+            ),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -760,8 +1027,11 @@ command = "other"
     fn test_merge_toml_config_empty() {
         let result = merge_toml_config(
             "",
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            &build_direct_host_entry(
+                "/usr/bin/rmcp-memex",
+                "~/.rmcp-servers/rmcp-memex/config.toml",
+                None,
+            ),
         )
         .unwrap();
         assert!(result.contains("[mcp_servers.rmcp_memex]"));
@@ -778,8 +1048,11 @@ args = []
 "#;
         let result = merge_toml_config(
             existing,
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            &build_direct_host_entry(
+                "/usr/bin/rmcp-memex",
+                "~/.rmcp-servers/rmcp-memex/config.toml",
+                None,
+            ),
         )
         .unwrap();
         // Should preserve existing server
@@ -787,6 +1060,38 @@ args = []
         // Should add rmcp_memex
         assert!(result.contains("rmcp-memex"));
         assert!(result.contains("--config"));
+    }
+
+    #[test]
+    fn test_generate_mux_snippet_uses_proxy_command() {
+        let snippet = generate_extended_snippet_mux(
+            ExtendedHostKind::Standard(HostKind::Claude),
+            DEFAULT_MUX_SOCKET_PATH,
+        );
+        assert!(snippet.contains(DEFAULT_MUX_PROXY_CMD));
+        assert!(snippet.contains("--socket"));
+        assert!(snippet.contains(DEFAULT_MUX_SOCKET_PATH));
+    }
+
+    #[test]
+    fn test_build_mux_service_config_toml_uses_shared_daemon_shape() {
+        let config = build_mux_service_config_toml(
+            "/usr/bin/rmcp-memex",
+            "~/.rmcp-servers/rmcp-memex/config.toml",
+            Some(8765),
+            4_194_304,
+            "debug",
+        )
+        .unwrap();
+
+        assert!(config.contains("[servers.rmcp-memex]"));
+        assert!(config.contains("socket = \"~/.rmcp_servers/rmcp-memex/sockets/main.sock\""));
+        assert!(config.contains("cmd = \"/usr/bin/rmcp-memex\""));
+        assert!(config.contains("--http-port"));
+        assert!(config.contains("8765"));
+        assert!(config.contains("status_file = \"~/.rmcp_servers/rmcp-memex/status/main.json\""));
+        assert!(config.contains("service_name = \"rmcp-memex\""));
+        assert!(config.contains("max_request_bytes = 4194304"));
     }
 
     #[test]
