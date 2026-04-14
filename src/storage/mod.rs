@@ -1359,10 +1359,20 @@ impl StorageManager {
     pub async fn garbage_collect(&self, config: &GcConfig) -> Result<GcStats> {
         let mut stats = GcStats::default();
 
-        // Get all documents for analysis
-        let all_docs = self
-            .all_documents(config.namespace.as_deref(), 1_000_000)
-            .await?;
+        const PAGE_SIZE: usize = 5000;
+        let mut all_docs: Vec<ChromaDocument> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .all_documents_page(config.namespace.as_deref(), offset, PAGE_SIZE)
+                .await?;
+            let page_len = page.len();
+            all_docs.extend(page);
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
+        }
 
         if all_docs.is_empty() {
             return Ok(stats);
@@ -1539,15 +1549,23 @@ impl StorageManager {
 
     /// List all unique namespaces in the database
     pub async fn list_namespaces(&self) -> Result<Vec<(String, usize)>> {
-        // Namespace inventory is a control-plane truth surface. Re-open the table
-        // before scanning so listings can observe writes made by other processes.
         self.refresh().await?;
-        let all_docs = self.all_documents(None, 1_000_000).await?;
 
         let mut namespace_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for doc in &all_docs {
-            *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+
+        const PAGE_SIZE: usize = 5000;
+        let mut offset = 0;
+        loop {
+            let page = self.all_documents_page(None, offset, PAGE_SIZE).await?;
+            let page_len = page.len();
+            for doc in &page {
+                *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
         }
 
         let mut namespaces: Vec<(String, usize)> = namespace_counts.into_iter().collect();
