@@ -340,6 +340,19 @@ async fn run_reprocess_documents(
 
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+
+    {
+        let mut guard = embedding_client.lock().await;
+        guard.embed("healthcheck").await.map_err(|e| {
+            anyhow!(
+                "Embedding server preflight failed: {}. \
+                 Fix the embedding server before reprocessing to avoid partial data loss.",
+                e
+            )
+        })?;
+        eprintln!("  Preflight:    embedding server OK");
+    }
+
     let rag = RAGPipeline::new(embedding_client, storage).await?;
     let preprocessor = preprocess.then(|| Preprocessor::new(PreprocessingConfig::default()));
     let min_length = PreprocessingConfig::default().min_content_length;
@@ -673,25 +686,60 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
         db_path,
     } = config;
 
+    if source_namespace == target_namespace {
+        return Err(anyhow!(
+            "Source and target namespace are the same ('{}'). \
+             In-place reindex risks data loss if the embedding server fails mid-operation. \
+             Use a different target namespace, or pass --force-in-place if you have a backup.",
+            source_namespace
+        ));
+    }
+
     let storage = StorageManager::new_lance_only(&db_path).await?;
-    let docs = storage
-        .all_documents(Some(&source_namespace), 1_000_000)
-        .await?;
-    if docs.is_empty() {
+
+    if !dry_run {
+        let target_count = storage.count_namespace(&target_namespace).await?;
+        if target_count > 0 && !skip_existing {
+            return Err(anyhow!(
+                "Target namespace '{}' already contains {} documents. \
+                 Pass --skip-existing to resume, or use a fresh target namespace.",
+                target_namespace,
+                target_count
+            ));
+        }
+    }
+
+    const PAGE_SIZE: usize = 5000;
+    let mut records: Vec<ExportRecord> = Vec::new();
+    let mut offset = 0;
+
+    loop {
+        let page = storage
+            .all_documents_page(Some(&source_namespace), offset, PAGE_SIZE)
+            .await?;
+        let page_len = page.len();
+        eprintln!("  Loading source: fetched {} documents (offset {})", page_len, offset);
+
+        for doc in page {
+            records.push(ExportRecord {
+                id: doc.id,
+                text: doc.document,
+                metadata: doc.metadata,
+                content_hash: doc.content_hash,
+                embeddings: None,
+            });
+        }
+
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        offset += page_len;
+    }
+
+    if records.is_empty() {
         eprintln!("No documents found in namespace '{}'", source_namespace);
         return Ok(());
     }
-
-    let records = docs
-        .into_iter()
-        .map(|doc| ExportRecord {
-            id: doc.id,
-            text: doc.document,
-            metadata: doc.metadata,
-            content_hash: doc.content_hash,
-            embeddings: None,
-        })
-        .collect::<Vec<_>>();
 
     let source_records = records.len();
     let collapsed = collapse_export_records(records);
