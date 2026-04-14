@@ -463,9 +463,9 @@ impl StorageManager {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
 
         let mut query = table.query().limit(limit).offset(offset);
@@ -495,9 +495,9 @@ impl StorageManager {
     }
 
     pub async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(None),
         };
         let filter = format!(
             "{} AND {}",
@@ -520,27 +520,47 @@ impl StorageManager {
     }
 
     pub async fn delete_document(&self, namespace: &str, id: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
         };
         let predicate = format!(
             "{} AND {}",
             self.namespace_filter(namespace),
             self.id_filter(id)
         );
-        let deleted = table.delete(predicate.as_str()).await?;
-        Ok(deleted.version as usize)
+        let pre_count = table
+            .query()
+            .only_if(predicate.as_str())
+            .execute()
+            .await?
+            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .await?;
+        if pre_count == 0 {
+            return Ok(0);
+        }
+        table.delete(predicate.as_str()).await?;
+        Ok(pre_count)
     }
 
     pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
         };
         let predicate = self.namespace_filter(namespace);
-        let deleted = table.delete(predicate.as_str()).await?;
-        Ok(deleted.version as usize)
+        let pre_count = table
+            .query()
+            .only_if(predicate.as_str())
+            .execute()
+            .await?
+            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .await?;
+        if pre_count == 0 {
+            return Ok(0);
+        }
+        table.delete(predicate.as_str()).await?;
+        Ok(pre_count)
     }
 
     pub fn get_collection_name(&self) -> &str {
@@ -583,8 +603,50 @@ impl StorageManager {
         Ok(table)
     }
 
+    /// Try to open the table without creating it.
+    /// Returns `Ok(None)` when the table genuinely does not exist.
+    /// Propagates real errors (I/O, corruption, permission) as `Err`.
+    async fn open_table_if_exists(&self) -> Result<Option<Table>> {
+        let mut guard = self.table.lock().await;
+        if let Some(table) = guard.as_ref() {
+            return Ok(Some(table.clone()));
+        }
+
+        match self
+            .lance
+            .open_table(self.collection_name.as_str())
+            .execute()
+            .await
+        {
+            Ok(tbl) => {
+                *guard = Some(tbl.clone());
+                Ok(Some(tbl))
+            }
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("not found")
+                    || msg.contains("does not exist")
+                    || msg.contains("no such file")
+                {
+                    Ok(None)
+                } else {
+                    tracing::warn!(
+                        "LanceDB error opening table '{}': {}",
+                        self.collection_name,
+                        e
+                    );
+                    Err(anyhow!(
+                        "LanceDB error on table '{}': {}",
+                        self.collection_name,
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
     async fn open_existing_table(&self) -> Result<Table> {
-        self.ensure_table(0).await.map_err(|_| {
+        self.open_table_if_exists().await?.ok_or_else(|| {
             anyhow!(
                 "Vector table '{}' not found at {}. Index data first so rmcp-memex can use the stored embedding dimension instead of guessing.",
                 self.collection_name,
@@ -825,9 +887,9 @@ impl StorageManager {
         namespace: &str,
         filter: &str,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
         let combined = format!("{} AND ({})", self.namespace_filter(namespace), filter);
         let mut stream = table.query().only_if(combined.as_str()).execute().await?;
@@ -890,11 +952,9 @@ impl StorageManager {
         namespace: &str,
         parent_id: &str,
     ) -> Result<Vec<ChromaDocument>> {
-        // Ensure table exists
-        let _ = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
-        };
+        if self.open_table_if_exists().await?.is_none() {
+            return Ok(vec![]);
+        }
 
         // First get the parent document to find children IDs
         if let Some(parent) = self.get_document(namespace, parent_id).await? {
@@ -965,9 +1025,9 @@ impl StorageManager {
     /// - Table doesn't exist yet
     /// - Table has old schema without content_hash column (graceful degradation)
     pub async fn has_content_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(false), // Table doesn't exist yet, no duplicates possible
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(false),
         };
 
         // Graceful handling of old schema without content_hash column
@@ -1013,9 +1073,9 @@ impl StorageManager {
             return Ok(vec![]);
         }
 
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(hashes.iter().collect()), // Table doesn't exist, all are new
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(hashes.iter().collect()),
         };
 
         // Graceful handling of old schema without content_hash column
@@ -1131,9 +1191,9 @@ impl StorageManager {
 
     /// Count rows in a specific namespace
     pub async fn count_namespace(&self, namespace: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(table) => table,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(table) => table,
+            None => return Ok(0),
         };
         let filter = self.namespace_filter(namespace);
         let count = table.count_rows(Some(filter)).await?;
@@ -1145,9 +1205,9 @@ impl StorageManager {
     /// Note: This uses a full table scan with namespace filter.
     /// For very large namespaces, consider batching.
     pub async fn get_all_in_namespace(&self, namespace: &str) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]), // Table doesn't exist
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
 
         let filter = self.namespace_filter(namespace);
