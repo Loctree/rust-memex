@@ -3,7 +3,7 @@
 # Reindex all memories after fixing timestamp preservation (P0)
 #
 # Created by M&K (c)2025 The LibraxisAI Team
-# Part of rmcp-memex P4 fix
+# Part of rust-memex P4 fix
 
 set -e
 
@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  rmcp-memex Memory Reindexing Script  ${NC}"
+echo -e "${BLUE}  rust-memex Memory Reindexing Script  ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
@@ -75,10 +75,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Check if rmcp-memex is available
-if ! command -v rmcp-memex &> /dev/null; then
-    echo -e "${RED}Error: rmcp-memex not found in PATH${NC}"
-    echo "Install with: cargo install --path ."
+# Check if rust-memex is available
+if ! command -v rust-memex &> /dev/null; then
+    echo -e "${RED}Error: rust-memex not found in PATH${NC}"
+    echo "Install the prebuilt release with: curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh"
+    echo "For development-only source builds: cargo install --path ."
     exit 1
 fi
 
@@ -130,7 +131,7 @@ if [ "$DRY_RUN" == "true" ]; then
     echo ""
     echo "Would execute:"
     [ "$SKIP_BACKUP" != "true" ] && echo "  cp -r $MEMEX_DB $BACKUP_PATH"
-    echo "  rmcp-memex purge -n $NAMESPACE --force"
+    echo "  rust-memex purge -n $NAMESPACE --force"
 
     # Find source files
     if [ -d "$MEMEX_SOURCES" ]; then
@@ -156,7 +157,7 @@ fi
 
 # Step 2: Purge namespace
 echo -e "${GREEN}[2/3] Purging namespace '$NAMESPACE'...${NC}"
-rmcp-memex purge -n "$NAMESPACE" --force 2>/dev/null || echo "  (Namespace was already empty)"
+rust-memex purge -n "$NAMESPACE" --force 2>/dev/null || echo "  (Namespace was already empty)"
 
 # Step 3: Reindex from sources
 echo -e "${GREEN}[3/3] Reindexing with preserved timestamps...${NC}"
@@ -169,16 +170,16 @@ if [ -d "$MEMEX_SOURCES" ]; then
 
     if [ -f "$MERGED_JSONL" ]; then
         echo "  Found merged JSONL: $MERGED_JSONL"
-        rmcp-memex index "$MERGED_JSONL" -n "$NAMESPACE"
+        rust-memex index "$MERGED_JSONL" -n "$NAMESPACE"
     elif [ -f "$MERGED_FILE" ]; then
         echo "  Found merged JSON: $MERGED_FILE"
-        rmcp-memex index "$MERGED_FILE" -n "$NAMESPACE"
+        rust-memex index "$MERGED_FILE" -n "$NAMESPACE"
     else
         # Index individual files
         echo "  Indexing individual source files..."
         find "$MEMEX_SOURCES" -type f \( -name "*.json" -o -name "*.jsonl" -o -name "*.md" \) | while read -r file; do
             echo "    Indexing: $(basename "$file")"
-            rmcp-memex index "$file" -n "$NAMESPACE" 2>/dev/null || echo "      (skipped: $file)"
+            rust-memex index "$file" -n "$NAMESPACE" 2>/dev/null || echo "      (skipped: $file)"
         done
     fi
 else
@@ -196,7 +197,7 @@ echo -e "${BLUE}Verifying timestamps preserved...${NC}"
 # Test search for year references
 for year in 2024 2025; do
     echo -n "  Searching for '$year': "
-    RESULT=$(rmcp-memex search -n "$NAMESPACE" -q "$year" -k 1 2>/dev/null || echo "error")
+    RESULT=$(rust-memex search -n "$NAMESPACE" -q "$year" -k 1 2>/dev/null || echo "error")
     if echo "$RESULT" | grep -q "$year"; then
         echo -e "${GREEN}FOUND${NC}"
     elif echo "$RESULT" | grep -q "error\|No results"; then

@@ -1,6 +1,6 @@
 //! Health Check Module for TUI Wizard
 //!
-//! Performs comprehensive health checks for the rmcp-memex configuration:
+//! Performs comprehensive health checks for the rust-memex configuration:
 //! - Embedder endpoint connectivity
 //! - Test embedding generation and dimension verification
 //! - Database path writability
@@ -189,7 +189,7 @@ impl HealthChecker {
         if path.exists() {
             if path.is_dir() {
                 // Try to write a test file
-                let test_file = path.join(".rmcp_memex_write_test");
+                let test_file = path.join(".rust_memex_write_test");
                 match std::fs::write(&test_file, "test") {
                     Ok(_) => {
                         let _ = std::fs::remove_file(&test_file);
@@ -385,7 +385,7 @@ mod tests {
 
         // Test with unique temp directory (avoids predictable temp path)
         let tmp = tempfile::tempdir().unwrap();
-        let temp_path = tmp.path().join("rmcp_memex_test");
+        let temp_path = tmp.path().join("rust_memex_test");
         let item = checker.check_db_path(temp_path.to_str().unwrap());
         // Should either pass (writable) or indicate will create
         assert!(item.status.is_pass() || matches!(item.status, CheckStatus::Fail(_)));

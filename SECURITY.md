@@ -11,7 +11,7 @@
 ## Reporting a Vulnerability
 
 Please use GitHub Security Advisories for responsible disclosure:
-https://github.com/VetCoders/rmcp-memex/security/advisories/new
+https://github.com/Loctree/rust-memex/security/advisories/new
 
 If GitHub Advisories are unavailable, email security@vetcoders.io with a
 summary, affected version, reproduction steps, and expected impact.

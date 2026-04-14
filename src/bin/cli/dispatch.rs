@@ -1,10 +1,13 @@
 use anyhow::Result;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
-use rmcp_memex::{
+use rust_memex::{
     EmbeddingClient, QueryRouter, RAGPipeline, SearchMode, SearchModeRecommendation, SliceLayer,
     SliceMode, StorageManager, WizardConfig, create_server, run_wizard,
 };
@@ -16,8 +19,128 @@ use crate::cli::inspection::*;
 use crate::cli::maintenance::*;
 use crate::cli::search::*;
 
+fn resolve_http_server_config(
+    cli: &Cli,
+    file_cfg: &FileConfig,
+) -> rust_memex::http::HttpServerConfig {
+    let auth_token = cli
+        .auth_token
+        .clone()
+        .or_else(|| std::env::var("MEMEX_AUTH_TOKEN").ok())
+        .or_else(|| file_cfg.auth_token.clone());
+    let bind_addr_str = cli
+        .bind_address
+        .clone()
+        .or_else(|| file_cfg.bind_address.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_address: IpAddr = bind_addr_str.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "Invalid bind address '{}', falling back to 127.0.0.1",
+            bind_addr_str
+        );
+        Ipv4Addr::LOCALHOST.into()
+    });
+    let cors_origins: Vec<String> = cli
+        .cors_origins
+        .clone()
+        .or_else(|| file_cfg.cors_origins.clone())
+        .map(|s| {
+            s.split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    rust_memex::http::HttpServerConfig {
+        auth_token,
+        cors_origins,
+        bind_address,
+    }
+}
+
+fn dashboard_browser_url(bind_address: IpAddr, port: u16) -> String {
+    let host = match bind_address {
+        IpAddr::V4(addr) if addr.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) if addr.is_unspecified() => format!("[{}]", Ipv6Addr::LOCALHOST),
+        IpAddr::V6(addr) => format!("[{addr}]"),
+    };
+
+    format!("http://{host}:{port}/")
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        ProcessCommand::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        ProcessCommand::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "Automatic browser open is not supported on this platform"
+    ))
+}
+
+async fn run_http_only_command(cli: Cli, port: u16, auto_open_browser: bool) -> Result<()> {
+    let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
+    let http_server_config = resolve_http_server_config(&cli, &file_cfg);
+    let dashboard_url = dashboard_browser_url(http_server_config.bind_address, port);
+
+    let mut config = cli.into_server_config()?;
+    config.hybrid.bm25.read_only = true;
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(config.log_level)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    info!("Starting RMCP Memex");
+    info!("Cache: {}MB", config.cache_mb);
+    info!("DB Path: {}", config.db_path);
+
+    let server = create_server(config).await?;
+    let mcp_core = server.mcp_core();
+
+    if auto_open_browser {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            if let Err(err) = open_browser(&dashboard_url) {
+                eprintln!("Warning: failed to open dashboard browser: {}", err);
+            }
+        });
+    }
+
+    rust_memex::http::start_server(mcp_core, port, http_server_config).await
+}
+
 pub async fn run_command(cli: Cli) -> Result<()> {
     match cli.command {
+        Some(Commands::Dashboard { port, no_open }) => {
+            let port = port.or(cli.http_port).unwrap_or(DEFAULT_DASHBOARD_PORT);
+            run_http_only_command(cli, port, !no_open).await
+        }
+        Some(Commands::Sse { port }) => {
+            let port = port.or(cli.http_port).unwrap_or(DEFAULT_SSE_PORT);
+            run_http_only_command(cli, port, false).await
+        }
         Some(Commands::Wizard { dry_run }) => {
             let wizard_config = WizardConfig {
                 config_path: cli.config,
@@ -43,7 +166,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             let _cache_mb = cli.cache_mb.or(cfg.file_cfg.cache_mb).unwrap_or(4096);
             let preprocess = preprocess || cfg.file_cfg.preprocessing_enabled.unwrap_or(false);
-            let slice_mode: SliceMode = slice_mode.parse().unwrap_or_default();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
 
             let result = run_batch_index(BatchIndexConfig {
                 path,
@@ -146,7 +274,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
                 }
             } else {
-                mode.parse().unwrap_or_default()
+                mode.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid search mode '{}'. Use one of: vector, keyword, hybrid, auto",
+                        mode
+                    )
+                })?
             };
 
             run_search(SearchConfig {
@@ -361,11 +494,11 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 ));
             }
             let older_than_duration = if let Some(dur_str) = older_than {
-                Some(rmcp_memex::parse_duration_string(&dur_str)?)
+                Some(rust_memex::parse_duration_string(&dur_str)?)
             } else {
                 None
             };
-            let gc_config = rmcp_memex::GcConfig {
+            let gc_config = rust_memex::GcConfig {
                 remove_orphans,
                 remove_empty,
                 older_than: older_than_duration,
@@ -373,6 +506,14 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 namespace,
             };
             run_gc(gc_config, cfg.db_path, json).await
+        }
+        Some(Commands::RepairWrites {
+            namespace,
+            execute,
+            json,
+        }) => {
+            let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
+            run_repair_writes(cfg.db_path, namespace, execute, json).await
         }
         Some(Commands::CrossSearch {
             query,
@@ -453,6 +594,80 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = shellexpand::tilde(&db_path).to_string();
             run_import(namespace, input, skip_existing, db_path, &embedding_config).await
         }
+        Some(Commands::Reprocess {
+            namespace,
+            input,
+            slice_mode,
+            preprocess,
+            skip_existing,
+            dry_run,
+            db_path: cmd_db_path,
+        }) => {
+            let file_cfg = load_or_discover_config(cli.config.as_deref())?.0;
+            let embedding_config = file_cfg.resolve_embedding_config();
+            let db_path = cmd_db_path
+                .or(cli.db_path)
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
+            run_reprocess(
+                ReprocessConfig {
+                    namespace,
+                    input,
+                    slice_mode,
+                    preprocess,
+                    skip_existing,
+                    dry_run,
+                    db_path,
+                },
+                &embedding_config,
+            )
+            .await
+        }
+        Some(Commands::Reindex {
+            namespace,
+            target_namespace,
+            slice_mode,
+            preprocess,
+            skip_existing,
+            dry_run,
+            db_path: cmd_db_path,
+        }) => {
+            let file_cfg = load_or_discover_config(cli.config.as_deref())?.0;
+            let embedding_config = file_cfg.resolve_embedding_config();
+            let db_path = cmd_db_path
+                .or(cli.db_path)
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
+            let target_namespace =
+                target_namespace.unwrap_or_else(|| default_reindexed_namespace(&namespace));
+            run_reindex(
+                ReindexConfig {
+                    source_namespace: namespace,
+                    target_namespace,
+                    slice_mode,
+                    preprocess,
+                    skip_existing,
+                    dry_run,
+                    db_path,
+                },
+                &embedding_config,
+            )
+            .await
+        }
         Some(Commands::Audit {
             namespace,
             threshold,
@@ -479,39 +694,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 ));
             }
             let (file_cfg_ref, _) = load_or_discover_config(cli.config.as_deref())?;
-            let auth_token = cli
-                .auth_token
-                .clone()
-                .or_else(|| std::env::var("MEMEX_AUTH_TOKEN").ok())
-                .or_else(|| file_cfg_ref.auth_token.clone());
-            let bind_addr_str = cli
-                .bind_address
-                .clone()
-                .or_else(|| file_cfg_ref.bind_address.clone())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let bind_address: std::net::IpAddr = bind_addr_str.parse().unwrap_or_else(|_| {
-                eprintln!(
-                    "Invalid bind address '{}', falling back to 127.0.0.1",
-                    bind_addr_str
-                );
-                std::net::Ipv4Addr::LOCALHOST.into()
-            });
-            let cors_origins: Vec<String> = cli
-                .cors_origins
-                .clone()
-                .or_else(|| file_cfg_ref.cors_origins.clone())
-                .map(|s| {
-                    s.split(',')
-                        .map(|o| o.trim().to_string())
-                        .filter(|o| !o.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let http_server_config = rmcp_memex::http::HttpServerConfig {
-                auth_token,
-                cors_origins,
-                bind_address,
-            };
+            let http_server_config = resolve_http_server_config(&cli, &file_cfg_ref);
             let mut config = cli.into_server_config()?;
             if http_only {
                 config.hybrid.bm25.read_only = true;
@@ -523,7 +706,6 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)?;
             info!("Starting RMCP Memex");
-            info!("Features (informational): {:?}", config.features);
             info!("Cache: {}MB", config.cache_mb);
             info!("DB Path: {}", config.db_path);
             let server = create_server(config).await?;
@@ -531,7 +713,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 let port = http_port.expect("validated above");
                 let mcp_core = server.mcp_core();
                 info!("Starting HTTP-only server on port {} (no MCP stdio)", port);
-                rmcp_memex::http::start_server(mcp_core, port, http_server_config).await?;
+                rust_memex::http::start_server(mcp_core, port, http_server_config).await?;
                 return Ok(());
             }
             if let Some(port) = http_port {
@@ -539,7 +721,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 info!("Starting HTTP/SSE server on port {}", port);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        rmcp_memex::http::start_server(mcp_core, port, http_server_config).await
+                        rust_memex::http::start_server(mcp_core, port, http_server_config).await
                     {
                         tracing::error!("HTTP server error: {}", e);
                     }

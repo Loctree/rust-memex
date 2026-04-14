@@ -1,4 +1,4 @@
-# rmcp-memex Makefile
+# rust-memex Makefile
 # ============================================================================
 # Service management, build, and maintenance targets
 # Created by M&K (c)2026 VetCoders
@@ -12,9 +12,9 @@
 # ============================================================================
 
 SHELL := /bin/bash
-BINARY := rmcp-memex
+BINARY := rust-memex
 INSTALL_PATH := $(HOME)/.cargo/bin/$(BINARY)
-LAUNCHD_PLIST := $(HOME)/Library/LaunchAgents/ai.libraxis.rmcp-memex.plist
+LAUNCHD_PLIST := $(HOME)/Library/LaunchAgents/ai.libraxis.rust-memex.plist
 
 # Disk paths
 DB_PATH_DISK := $(HOME)/.ai-memories/lancedb
@@ -39,7 +39,7 @@ DB_PATH := $(shell if [ -d "$(RAMDISK_MOUNT)" ]; then echo "$(DB_PATH_RAM)"; els
 # ============================================================================
 
 help: ## Show this help
-	@echo "rmcp-memex Management"
+	@echo "rust-memex Management"
 	@echo "===================="
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
@@ -63,14 +63,14 @@ start: ## Start memex service via launchd
 		echo "Service already running on port $(HTTP_PORT)"; \
 	else \
 		launchctl bootstrap gui/$$(id -u) $(LAUNCHD_PLIST) 2>/dev/null || \
-		launchctl kickstart gui/$$(id -u)/ai.libraxis.rmcp-memex 2>/dev/null || \
+		launchctl kickstart gui/$$(id -u)/ai.libraxis.rust-memex 2>/dev/null || \
 		$(INSTALL_PATH) serve --db-path $(DB_PATH) --http-port $(HTTP_PORT) --http-only & \
 		sleep 3; \
 		echo "Started memex on port $(HTTP_PORT)"; \
 	fi
 
 stop: ## Stop memex service
-	@-launchctl bootout gui/$$(id -u)/ai.libraxis.rmcp-memex 2>/dev/null
+	@-launchctl bootout gui/$$(id -u)/ai.libraxis.rust-memex 2>/dev/null
 	@-pkill -f "$(BINARY) serve" 2>/dev/null
 	@echo "Stopped memex service"
 
@@ -92,10 +92,10 @@ health: ## Quick health check
 	@curl -s --max-time 3 http://localhost:$(HTTP_PORT)/health | jq . 2>/dev/null || echo "Server not responding"
 
 logs: ## Tail server logs
-	@tail -f $(LOG_DIR)/rmcp-memex.stderr.log
+	@tail -f $(LOG_DIR)/rust-memex.stderr.log
 
 logs-error: ## Show recent errors in logs
-	@grep -iE "error|panic|fail" $(LOG_DIR)/rmcp-memex.stderr.log | tail -20
+	@grep -iE "error|panic|fail" $(LOG_DIR)/rust-memex.stderr.log | tail -20
 
 # ============================================================================
 # DASHBOARD & UI

@@ -523,7 +523,7 @@ impl EmbeddingClient {
         // All providers failed
         Err(anyhow!(
             "No embedding provider passed validation for required_dimension={}. \
-             Each provider must succeed on its configured embedding endpoint before rmcp-memex will start.\nTried:\n{}",
+             Each provider must succeed on its configured embedding endpoint before rust-memex will start.\nTried:\n{}",
             config.required_dimension,
             tried.join("\n")
         ))

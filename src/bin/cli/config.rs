@@ -1,18 +1,9 @@
 use anyhow::Result;
 
-use rmcp_memex::{
+use rust_memex::{
     DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, MlxConfig, ProviderConfig, RerankerConfig,
     path_utils,
 };
-
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
 
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
@@ -72,7 +63,9 @@ pub fn load_or_discover_config(
 
 #[derive(serde::Deserialize, Default, Clone)]
 pub struct FileConfig {
+    /// Legacy compatibility field. Parsed but ignored when building ServerConfig.
     pub mode: Option<String>,
+    /// Legacy compatibility field. Parsed but ignored when building ServerConfig.
     pub features: Option<String>,
     pub cache_mb: Option<usize>,
     pub db_path: Option<String>,
@@ -175,7 +168,7 @@ impl MlxFileConfig {
     /// Convert legacy config to MlxConfig for backward compat
     pub fn to_mlx_config(&self) -> MlxConfig {
         let mut config = MlxConfig::from_env();
-        config.merge_file_config(rmcp_memex::MlxMergeOptions {
+        config.merge_file_config(rust_memex::MlxMergeOptions {
             disabled: Some(self.disabled),
             local_port: self.local_port,
             dragon_url: self.dragon_url.clone(),
@@ -268,7 +261,7 @@ pub struct ResolvedConfig {
     pub file_cfg: FileConfig,
     pub config_path: Option<String>,
     pub db_path: String,
-    pub embedding_config: rmcp_memex::EmbeddingConfig,
+    pub embedding_config: rust_memex::EmbeddingConfig,
     pub maintenance_config: Option<MaintenanceFileConfig>,
 }
 

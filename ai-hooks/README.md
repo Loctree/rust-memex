@@ -1,6 +1,6 @@
-# rmcp-memex AI Hooks
+# rust-memex AI Hooks
 
-Claude Code hooks for rmcp-memex integration.
+Claude Code hooks for rust-memex integration.
 
 ## Hooks
 

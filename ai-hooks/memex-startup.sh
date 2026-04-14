@@ -32,7 +32,7 @@ CACHE_FILE="/tmp/memex-startup-$(echo "$PWD" | md5 2>/dev/null || echo "$PWD" | 
 CACHE_TTL=3600  # 1 hour
 
 # Quick exits
-command -v rmcp-memex &>/dev/null || exit 0
+command -v rust-memex &>/dev/null || exit 0
 [[ ! -d "$MEMEX_DB_PATH" ]] && exit 0
 
 # ============================================================================
@@ -59,7 +59,7 @@ PROJECT_NAME=$(echo "$PROJECT_NAME" | tr '-_' ' ')
 # ============================================================================
 # MEMEX SEARCH (via CLI)
 # ============================================================================
-SEARCH_RESULT=$(rmcp-memex search \
+SEARCH_RESULT=$(rust-memex search \
     -n "$MEMEX_NAMESPACE" \
     -q "$PROJECT_NAME" \
     -k "$MEMEX_LIMIT" \
@@ -81,7 +81,7 @@ Loaded from institutional memory ($(date '+%H:%M')):
 $SEARCH_RESULT
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Use 'rmcp-memex search' for more. Loads once per session.
+Use 'rust-memex search' for more. Loads once per session.
 "
 
 touch "$CACHE_FILE"

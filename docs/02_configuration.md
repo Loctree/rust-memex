@@ -2,7 +2,7 @@
 
 ## Przegląd
 
-rmcp-memex można skonfigurować na trzy sposoby (w kolejności priorytetu):
+rust-memex można skonfigurować na trzy sposoby (w kolejności priorytetu):
 1. **Flagi CLI** - najwyższy priorytet
 2. **Plik konfiguracyjny TOML** - średni priorytet
 3. **Wartości domyślne** - najniższy priorytet
@@ -10,7 +10,7 @@ rmcp-memex można skonfigurować na trzy sposoby (w kolejności priorytetu):
 ## Opcje CLI
 
 ```bash
-rmcp-memex [OPTIONS] [COMMAND]
+rust-memex [OPTIONS] [COMMAND]
 ```
 
 ### Komendy
@@ -26,59 +26,48 @@ rmcp-memex [OPTIONS] [COMMAND]
 | Flaga | Opis | Domyślnie |
 |-------|------|-----------|
 | `--config <PATH>` | Ścieżka do pliku konfiguracyjnego TOML | brak |
-| `--mode <MODE>` | Tryb serwera: `memory` lub `full` | `full` |
-| `--features <LIST>` | Lista funkcji (comma-separated) | `filesystem,memory,search` |
 | `--cache-mb <SIZE>` | Rozmiar cache w MB | `4096` |
-| `--db-path <PATH>` | Ścieżka do LanceDB | `~/.rmcp-servers/rmcp-memex/lancedb` |
+| `--db-path <PATH>` | Ścieżka do LanceDB | `~/.rmcp-servers/rust-memex/lancedb` |
 | `--max-request-bytes <SIZE>` | Max rozmiar requestu | `5242880` (5MB) |
 | `--log-level <LEVEL>` | Poziom logowania | `info` |
 | `--allowed-paths <PATH>` | Dozwolone ścieżki (można powtórzyć) | `$HOME`, `cwd` |
 | `--security-enabled` | Włącz namespace security | `false` |
-| `--token-store-path <PATH>` | Ścieżka do token store | `~/.rmcp-servers/rmcp-memex/tokens.json` |
+| `--token-store-path <PATH>` | Ścieżka do token store | `~/.rmcp-servers/rust-memex/tokens.json` |
 
 ### Przykłady CLI
 
 ```bash
 # Podstawowe uruchomienie
-rmcp-memex serve
-
-# Tryb memory-only (bez dostępu do filesystem)
-rmcp-memex serve --mode memory
+rust-memex serve
 
 # Z własną konfiguracją
-rmcp-memex serve --config ~/.rmcp-servers/config/rmcp-memex.toml
+rust-memex serve --config ~/.rmcp-servers/rust-memex/config.toml
 
 # Z security i custom paths
-rmcp-memex serve \
+rust-memex serve \
   --security-enabled \
   --allowed-paths ~ \
   --allowed-paths /Volumes/Data \
   --log-level debug
 
 # Batch indexing
-rmcp-memex index ./documents --namespace docs --recursive --glob "*.md"
+rust-memex index ./documents --namespace docs --recursive --glob "*.md"
 ```
 
 ## Plik Konfiguracyjny (TOML)
 
 ### Lokalizacja
 
-Domyślna lokalizacja: `~/.rmcp-servers/config/rmcp-memex.toml`
+Domyślna lokalizacja: `~/.rmcp-servers/rust-memex/config.toml`
 
 ### Pełny Przykład
 
 ```toml
-# Tryb serwera: "memory" lub "full"
-mode = "full"
-
-# Lista włączonych funkcji
-features = "filesystem,memory,search"
-
 # Rozmiar cache w MB
 cache_mb = 4096
 
 # Ścieżka do LanceDB vector store
-db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
+db_path = "~/.rmcp-servers/rust-memex/lancedb"
 
 # Maksymalny rozmiar requestu JSON-RPC (bytes)
 max_request_bytes = 5242880
@@ -98,47 +87,26 @@ allowed_paths = [
 security_enabled = true
 
 # Ścieżka do pliku z tokenami namespace'ów
-token_store_path = "~/.rmcp-servers/rmcp-memex/tokens.json"
+token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 ```
 
 ### Minimalna Konfiguracja
 
 ```toml
 # Tylko niezbędne ustawienia
-db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
+db_path = "~/.rmcp-servers/rust-memex/lancedb"
 security_enabled = true
 ```
 
 ## Tryby Serwera
 
-### Full Mode (domyślny)
+`rust-memex` udostępnia jeden kanoniczny MCP surface. Nie ma już osobnego
+przełącznika `memory/full`, bo nie zmieniał on realnie kontraktu serwera.
 
-Wszystkie funkcje włączone:
-- RAG indexing z plików
-- Memory operations
-- Semantic search
-
-```bash
-rmcp-memex serve --mode full
-# lub
-rmcp-memex serve  # domyślnie full
-```
-
-### Memory Mode
-
-Tylko operacje pamięciowe, bez dostępu do filesystem:
-- Memory upsert/get/search/delete
-- Semantic search
-- Brak rag_index (tylko rag_index_text)
-
-```bash
-rmcp-memex serve --mode memory
-```
-
-Użyj tego trybu gdy:
-- Serwer nie powinien mieć dostępu do plików
-- Tylko vector memory jest potrzebne
-- Zwiększone bezpieczeństwo
+Jeśli chcesz zawęzić runtime:
+- użyj `allowed_paths`, aby ograniczyć dostęp do filesystem
+- ustaw `--security-enabled`, aby chronić namespace'y tokenami
+- ustaw `--auth-token`, jeśli wystawiasz mutujące endpointy HTTP
 
 ## Zmienne Środowiskowe
 
@@ -157,9 +125,9 @@ Użyj tego trybu gdy:
 ```json
 {
   "mcpServers": {
-    "rmcp-memex": {
-      "command": "rmcp-memex",
-      "args": ["serve", "--config", "~/.rmcp-servers/config/rmcp-memex.toml"]
+    "rust-memex": {
+      "command": "rust-memex",
+      "args": ["serve", "--config", "~/.rmcp-servers/rust-memex/config.toml"]
     }
   }
 }
@@ -170,8 +138,8 @@ Użyj tego trybu gdy:
 ```json
 {
   "mcpServers": {
-    "rmcp-memex": {
-      "command": "rmcp-memex",
+    "rust-memex": {
+      "command": "rust-memex",
       "args": [
         "serve",
         "--security-enabled",
@@ -190,7 +158,7 @@ Komenda `index` pozwala na masowe indeksowanie dokumentów.
 ### Składnia
 
 ```bash
-rmcp-memex index <PATH> [OPTIONS]
+rust-memex index <PATH> [OPTIONS]
 ```
 
 ### Opcje
@@ -206,16 +174,16 @@ rmcp-memex index <PATH> [OPTIONS]
 
 ```bash
 # Indeksuj pojedynczy plik
-rmcp-memex index ./README.md
+rust-memex index ./README.md
 
 # Indeksuj folder rekursywnie
-rmcp-memex index ./docs --recursive --namespace documentation
+rust-memex index ./docs --recursive --namespace documentation
 
 # Tylko pliki markdown
-rmcp-memex index ./notes --recursive --glob "*.md" --namespace notes
+rust-memex index ./notes --recursive --glob "*.md" --namespace notes
 
 # Z limitem głębokości
-rmcp-memex index ./project --recursive --max-depth 3
+rust-memex index ./project --recursive --max-depth 3
 ```
 
 ## Wizard (Kreator Konfiguracji)
@@ -223,10 +191,10 @@ rmcp-memex index ./project --recursive --max-depth 3
 Interaktywny kreator do generowania konfiguracji.
 
 ```bash
-rmcp-memex wizard
+rust-memex wizard
 
 # Dry run - pokaż zmiany bez zapisywania
-rmcp-memex wizard --dry-run
+rust-memex wizard --dry-run
 ```
 
 Wizard pomoże skonfigurować:
@@ -248,7 +216,7 @@ Przykład:
 # Config file: log_level = "info"
 # CLI: --log-level debug
 # Wynik: debug (CLI wygrywa)
-rmcp-memex serve --config config.toml --log-level debug
+rust-memex serve --config ~/.rmcp-servers/rust-memex/config.toml --log-level debug
 ```
 
 ## Walidacja Konfiguracji
@@ -278,20 +246,20 @@ allowed_paths = [
 
 Sprawdź czy plik konfiguracyjny istnieje:
 ```bash
-ls -la ~/.rmcp-servers/config/rmcp-memex.toml
+ls -la ~/.rmcp-servers/rust-memex/config.toml
 ```
 
 ### "Token store not found"
 
 Przy pierwszym uruchomieniu z `--security-enabled`, token store jest tworzony automatycznie. Upewnij się że katalog nadrzędny istnieje:
 ```bash
-mkdir -p ~/.rmcp-servers/rmcp-memex
+mkdir -p ~/.rmcp-servers/rust-memex
 ```
 
 ### Logi debugowania
 
 ```bash
-rmcp-memex serve --log-level trace
+rust-memex serve --log-level trace
 ```
 
 ---

@@ -1,14 +1,14 @@
-# Loctree + rmcp-memex Integration Proposal
+# Loctree + rust-memex Integration Proposal
 
 **Date:** December 2025  
 **Status:** Draft  
-**Authors:** rmcp-memex team  
+**Authors:** rust-memex team  
 
 ---
 
 ## Executive Summary
 
-This proposal outlines a semantic search integration between **loctree** (AI-oriented static code analyzer) and **rmcp-memex** (MCP-based RAG/memory server). The integration would enable AI agents to perform semantic queries over code analysis reports, dead code detection, and structural insights.
+This proposal outlines a semantic search integration between **loctree** (AI-oriented static code analyzer) and **rust-memex** (MCP-based RAG/memory server). The integration would enable AI agents to perform semantic queries over code analysis reports, dead code detection, and structural insights.
 
 ---
 
@@ -30,7 +30,7 @@ Currently, loctree generates excellent reports (SARIF, JSON, HTML), but they're 
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│    loctree      │────▶│   rmcp-memex     │◀────│   AI Agent      │
+│    loctree      │────▶│   rust-memex     │◀────│   AI Agent      │
 │  (analyzer)     │     │  (RAG + memory)  │     │ (Claude, etc.)  │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
         │                        │
@@ -43,7 +43,7 @@ Currently, loctree generates excellent reports (SARIF, JSON, HTML), but they're 
 ### Data Flow
 
 1. **loctree** runs `loct scan` / `loct report` → generates JSON/SARIF
-2. **rmcp-memex** ingests reports via new `loctree_index` tool
+2. **rust-memex** ingests reports via new `loctree_index` tool
 3. **AI Agent** queries via `rag_search` / `memory_search` tools
 4. Results include relevant code findings with semantic ranking
 
@@ -173,7 +173,7 @@ visibility.
 ## Implementation Phases
 
 ### Phase 1: Basic Integration (MVP)
-- [ ] Add `loctree_index` tool to rmcp-memex
+- [ ] Add `loctree_index` tool to rust-memex
 - [ ] Parse `analysis.json` and `report.sarif`
 - [ ] Store findings with namespace `loctree:{project_id}`
 - [ ] Query via existing `rag_search` tool
@@ -198,7 +198,7 @@ visibility.
 ## Technical Considerations
 
 ### Dependencies
-- rmcp-memex already has: LanceDB, fastembed, serde_json
+- rust-memex already has: LanceDB, fastembed, serde_json
 - No new deps needed for basic integration
 
 ### Performance
@@ -214,10 +214,10 @@ visibility.
 
 ## Benefits for Loctree
 
-1. **AI Agent Ecosystem**: rmcp-memex is MCP-compatible → works with Claude, Cursor, etc.
+1. **AI Agent Ecosystem**: rust-memex is MCP-compatible → works with Claude, Cursor, etc.
 2. **Semantic Queries**: Beyond regex, natural language understanding
 3. **Memory Persistence**: Findings available across AI sessions
-4. **Low Integration Effort**: Just output JSON, rmcp-memex handles the rest
+4. **Low Integration Effort**: Just output JSON, rust-memex handles the rest
 
 ---
 
@@ -279,5 +279,5 @@ visibility.
 ## Contact
 
 For questions or collaboration:
-- Repository: https://github.com/Loctree/rmcp-memex
+- Repository: https://github.com/Loctree/rust-memex
 - Branch: `rebranding-and-improvements`

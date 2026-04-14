@@ -7,7 +7,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use rmcp_memex::{
+use rust_memex::{
     ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager,
 };
 use serde::Deserialize;
@@ -305,7 +305,7 @@ async fn test_e2e_deduplication() {
         return;
     }
 
-    use rmcp_memex::compute_content_hash;
+    use rust_memex::compute_content_hash;
 
     let tmp = TempDir::new().expect("Failed to create temp dir");
     let db_path = tmp.path().join("lancedb");

@@ -2,7 +2,7 @@
 
 ## Problem
 
-W środowisku multi-agent, gdzie wiele AI agentów może korzystać z tego samego serwera rmcp-memex, potrzebna jest izolacja danych między agentami. Bez mechanizmu kontroli dostępu:
+W środowisku multi-agent, gdzie wiele AI agentów może korzystać z tego samego serwera rust-memex, potrzebna jest izolacja danych między agentami. Bez mechanizmu kontroli dostępu:
 - Agent A może odczytać dane Agenta B
 - Brak możliwości ochrony wrażliwych namespace'ów
 - Trudność w audycie dostępu do danych
@@ -18,7 +18,7 @@ Zaimplementowano dwupoziomowy system bezpieczeństwa:
 Zamiast hardcoded ograniczenia do `$HOME` i `cwd`, wprowadzono konfigurowalną listę dozwolonych ścieżek.
 
 ```toml
-# ~/.rmcp-servers/config/rmcp-memex.toml
+# ~/.rmcp-servers/rust-memex/config.toml
 allowed_paths = [
     "~",                              # Home directory
     "/Volumes/LibraxisShare/data",    # External volume
@@ -61,11 +61,11 @@ Token-based access control dla namespace'ów. Chronione namespace'y wymagają to
 
 ```bash
 # CLI
-rmcp-memex serve --security-enabled
+rust-memex serve --security-enabled
 
 # Lub w config.toml
 security_enabled = true
-token_store_path = "~/.rmcp-servers/rmcp-memex/tokens.json"
+token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 ```
 
 ### Tworzenie Tokena dla Namespace
@@ -176,7 +176,7 @@ Po odwołaniu tokena, namespace staje się ponownie publiczny.
 {
   "content": [{
     "type": "text",
-    "text": "{\"enabled\":true,\"token_store_path\":\"~/.rmcp-servers/rmcp-memex/tokens.json\"}"
+    "text": "{\"enabled\":true,\"token_store_path\":\"~/.rmcp-servers/rust-memex/tokens.json\"}"
   }]
 }
 
@@ -197,7 +197,7 @@ Tokeny mają format: `rmx_<32 znaki hex>`
 rmx_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
 │   └─────────────────────────────────┘
 │              32 znaki hex (128 bit)
-└── prefix "rmx_" (rmcp-memex)
+└── prefix "rmx_" (rust-memex)
 ```
 
 Tokeny są generowane kryptograficznie bezpiecznie (`rand::thread_rng()`).
@@ -207,7 +207,7 @@ Tokeny są generowane kryptograficznie bezpiecznie (`rand::thread_rng()`).
 Tokeny są przechowywane w pliku JSON:
 
 ```json
-// ~/.rmcp-servers/rmcp-memex/tokens.json
+// ~/.rmcp-servers/rust-memex/tokens.json
 {
   "pamietnik": {
     "token_hash": "5e884898da28047d...",
@@ -255,10 +255,10 @@ sd"/etc/passwd"             // Outside allowed paths
 
 | Plik | Opis |
 |------|------|
-| `rmcp-memex/src/security/mod.rs` | `NamespaceAccessManager`, `TokenStore`, token generation/verification |
-| `rmcp-memex/src/handlers/mod.rs` | `validate_path()`, integration z access manager |
-| `rmcp-memex/src/lib.rs` | `NamespaceSecurityConfig`, re-exports |
-| `rmcp-memex/src/bin/rmcp-memex.rs` | CLI flags `--security-enabled`, `--token-store-path` |
+| `rust-memex/src/security/mod.rs` | `NamespaceAccessManager`, `TokenStore`, token generation/verification |
+| `rust-memex/src/handlers/mod.rs` | `validate_path()`, integration z access manager |
+| `rust-memex/src/lib.rs` | `NamespaceSecurityConfig`, re-exports |
+| `rust-memex/src/bin/rust-memex.rs` | CLI flags `--security-enabled`, `--token-store-path` |
 
 ### Kluczowe struktury
 
@@ -292,7 +292,7 @@ pub struct TokenEntry {
 ### Testy
 
 ```bash
-cd rmcp-memex && cargo test security
+cd rust-memex && cargo test security
 ```
 
 Testy pokrywają:

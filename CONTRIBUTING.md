@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2025-2026 VetCoders (https://vetcoders.io) -->
 # Contributing
 
-Thanks for helping improve `rmcp-memex`.
+Thanks for helping improve `rust-memex`.
 
 ## Prerequisites
 
@@ -12,16 +12,27 @@ Thanks for helping improve `rmcp-memex`.
 
 ```bash
 cargo build
-cargo test
 ```
 
 ## Quality Gate
 
 ```bash
+cargo fmt --check
 cargo clippy -- -D warnings
+cargo test
+cargo check --no-default-features
+cargo package --allow-dirty
 ```
 
 Use the default `rustfmt` style before opening a pull request.
+
+If you have a local Ollama instance with the release embedding model pulled, also
+run the ignored transport parity integration suite before changing MCP request
+routing or transport behavior:
+
+```bash
+cargo test --test transport_parity -- --ignored
+```
 
 ## Pull Requests
 

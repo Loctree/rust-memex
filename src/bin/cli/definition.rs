@@ -4,16 +4,10 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use walkdir::WalkDir;
 
-use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
+use rust_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
+pub const DEFAULT_SSE_PORT: u16 = 8997;
 
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
@@ -72,10 +66,12 @@ fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, O
 use crate::cli::config::*;
 #[derive(Parser, Debug)]
 #[command(
+    name = "rust-memex",
+    bin_name = "rust-memex",
     author,
     version,
-    about = "rmcp-memex: Custom Rust MCP kernel for RAG and long-term memory.\nPrimary entrypoint. Supports stdio (native MCP) & SSE/HTTP (multi-agent) transports.\n(Aliases: rust-memex, rmmx, rmemex)",
-    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nNote: rust-memex, rmmx, and rmemex are strictly convenience aliases for this identical kernel, not separate products."
+    about = "rust-memex: custom Rust MCP kernel for RAG and long-term memory.\nCanonical entrypoint for stdio (native MCP) and HTTP/SSE (multi-agent) transports.",
+    long_about = "rust-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nrust-memex is the only supported binary name. The GitHub installer may also create rmcp_memex as a legacy compatibility symlink for older scripts."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -85,12 +81,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Server mode: "memory" (memory-only, no filesystem) or "full" (all features)
-    #[arg(long, value_parser = ["memory", "full"], global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, value_parser = ["memory", "full"], global = true, hide = true)]
     pub mode: Option<String>,
 
-    /// Enable specific features (comma-separated). Overrides --mode if set.
-    #[arg(long, global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, global = true, hide = true)]
     pub features: Option<String>,
 
     /// Cache size in MB
@@ -128,7 +124,7 @@ pub struct Cli {
     /// HTTP/SSE server port for multi-agent access.
     /// When set, starts an HTTP server alongside MCP stdio.
     /// Agents can query via HTTP instead of holding LanceDB lock directly.
-    /// Example: --http-port 6660
+    /// Example: --http-port 8997
     #[arg(long, global = true)]
     pub http_port: Option<u16>,
 
@@ -159,6 +155,24 @@ pub enum Commands {
     /// Run the MCP server (default if no subcommand specified)
     Serve,
 
+    /// Run the local dashboard server and open it in the default browser.
+    Dashboard {
+        /// Dashboard HTTP port (default: 8987)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+
+        /// Do not open the dashboard in a browser after startup
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Run the HTTP/SSE daemon on the agent-facing port.
+    Sse {
+        /// HTTP/SSE port (default: 8997)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+    },
+
     /// Launch interactive configuration wizard
     #[command(alias = "config")]
     Wizard {
@@ -172,8 +186,8 @@ pub enum Commands {
     /// Shows chunk count, date range, top topics, and storage info.
     ///
     /// Examples:
-    ///   rmcp-memex overview           # All namespaces
-    ///   rmcp-memex overview memories  # Specific namespace
+    ///   rust-memex overview           # All namespaces
+    ///   rust-memex overview memories  # Specific namespace
     Overview {
         /// Namespace to get overview for (optional, shows all if not specified)
         namespace: Option<String>,
@@ -189,8 +203,8 @@ pub enum Commands {
     /// full metadata, and related chunks.
     ///
     /// Examples:
-    ///   rmcp-memex dive -n memories -q "dragon"
-    ///   rmcp-memex dive -n memories -q "dragon" --verbose
+    ///   rust-memex dive -n memories -q "dragon"
+    ///   rust-memex dive -n memories -q "dragon" --verbose
     Dive {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -260,13 +274,13 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
-        /// Show smart progress bar with ETA based on calibration.
-        /// Displays three phases: pre-scan, calibration, and indexing progress.
+        /// Show progress bar with ETA when running in an interactive terminal.
+        /// Non-interactive runs fall back to line logs.
         #[arg(long)]
         progress: bool,
 
         /// Resume from last checkpoint if interrupted.
-        /// Saves progress after each file to .index-checkpoint.json.
+        /// Saves progress after each committed file to .index-checkpoint-<namespace>.json.
         /// On restart, skips already indexed files and continues.
         #[arg(long)]
         resume: bool,
@@ -274,7 +288,7 @@ pub enum Commands {
         /// Enable async pipeline mode for concurrent indexing.
         /// Runs file reading, chunking, embedding, and storage in parallel
         /// using tokio channels. Can significantly speed up large batch operations.
-        /// Note: Pipeline mode ignores --progress and --resume flags.
+        /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
 
@@ -292,10 +306,10 @@ pub enum Commands {
     /// defaults. Results include relevance scores, timestamps, and metadata.
     ///
     /// Examples:
-    ///   rmcp-memex search -n memories -q "when did we buy dragon"
-    ///   rmcp-memex search -n memories -q "dragon" --deep
-    ///   rmcp-memex search -n memories -q "dragon" -l 20
-    ///   rmcp-memex search -n memories -q "dragon" --mode hybrid
+    ///   rust-memex search -n memories -q "when did we buy dragon"
+    ///   rust-memex search -n memories -q "dragon" --deep
+    ///   rust-memex search -n memories -q "dragon" -l 20
+    ///   rust-memex search -n memories -q "dragon" --mode hybrid
     Search {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -402,8 +416,8 @@ pub enum Commands {
     /// and optionally embeddings. Use with 'import' command for backup/restore.
     ///
     /// Examples:
-    ///   rmcp-memex export -n memories -o backup.jsonl
-    ///   rmcp-memex export -n memories --include-embeddings -o full-backup.jsonl
+    ///   rust-memex export -n memories -o backup.jsonl
+    ///   rust-memex export -n memories --include-embeddings -o full-backup.jsonl
     Export {
         /// Namespace to export
         #[arg(long, short = 'n', required = true)]
@@ -454,9 +468,9 @@ pub enum Commands {
     /// and provides maintenance recommendations.
     ///
     /// Examples:
-    ///   rmcp-memex health            # Full health check
-    ///   rmcp-memex health --quick    # Skip embedder check (faster)
-    ///   rmcp-memex health --json     # JSON output for scripting
+    ///   rust-memex health            # Full health check
+    ///   rust-memex health --quick    # Skip embedder check (faster)
+    ///   rust-memex health --json     # JSON output for scripting
     Health {
         /// Skip embedder connectivity check (faster, DB-only)
         #[arg(long, short = 'q')]
@@ -473,9 +487,9 @@ pub enum Commands {
     /// using the onion slice architecture (outer layers = summaries).
     ///
     /// Examples:
-    ///   rmcp-memex recall "Vista architecture"          # Search all namespaces
-    ///   rmcp-memex recall "dragon setup" -n memories    # Specific namespace
-    ///   rmcp-memex recall "auth flow" --limit 20        # More sources
+    ///   rust-memex recall "Vista architecture"          # Search all namespaces
+    ///   rust-memex recall "dragon setup" -n memories    # Specific namespace
+    ///   rust-memex recall "auth flow" --limit 20        # More sources
     Recall {
         /// What to recall (search query)
         query: String,
@@ -499,10 +513,10 @@ pub enum Commands {
     /// Useful for understanding temporal coverage of your memory.
     ///
     /// Examples:
-    ///   rmcp-memex timeline                           # All namespaces
-    ///   rmcp-memex timeline -n memories               # Specific namespace
-    ///   rmcp-memex timeline -n memories --since 30d   # Last 30 days
-    ///   rmcp-memex timeline --gaps                    # Show only gaps
+    ///   rust-memex timeline                           # All namespaces
+    ///   rust-memex timeline -n memories               # Specific namespace
+    ///   rust-memex timeline -n memories --since 30d   # Last 30 days
+    ///   rust-memex timeline --gaps                    # Show only gaps
     Timeline {
         /// Filter to specific namespace (default: all namespaces)
         #[arg(long, short = 'n')]
@@ -548,11 +562,11 @@ pub enum Commands {
     /// Always runs in dry-run mode unless you pass the --execute flag.
     ///
     /// Examples:
-    ///   rmcp-memex gc --remove-orphans                    # Dry run: show orphans
-    ///   rmcp-memex gc --remove-orphans --execute          # Actually remove orphans
-    ///   rmcp-memex gc --older-than 90d                    # Dry run: docs older than 90 days
-    ///   rmcp-memex gc --older-than 6m --namespace logs    # Only in 'logs' namespace
-    ///   rmcp-memex gc --remove-orphans --remove-empty --older-than 1y --execute
+    ///   rust-memex gc --remove-orphans                    # Dry run: show orphans
+    ///   rust-memex gc --remove-orphans --execute          # Actually remove orphans
+    ///   rust-memex gc --older-than 90d                    # Dry run: docs older than 90 days
+    ///   rust-memex gc --older-than 6m --namespace logs    # Only in 'logs' namespace
+    ///   rust-memex gc --remove-orphans --remove-empty --older-than 1y --execute
     Gc {
         /// Remove orphan embeddings (documents with parent_id pointing to non-existent documents)
         #[arg(long)]
@@ -579,14 +593,39 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Inspect or repair pending Lance/BM25 recovery ledgers
+    ///
+    /// This is the explicit recovery contract for partial cross-store writes.
+    /// It does not claim crash-safe atomicity. Instead it inspects persisted
+    /// batch ledgers, reports divergence, and can replay BM25 writes to match
+    /// current Lance truth.
+    ///
+    /// Examples:
+    ///   rust-memex repair-writes
+    ///   rust-memex repair-writes --execute
+    ///   rust-memex repair-writes -n memories --json
+    RepairWrites {
+        /// Limit inspection/repair to a single namespace
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Actually execute reconciliation. Default is dry-run/report-only.
+        #[arg(long)]
+        execute: bool,
+
+        /// Output results as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Search across all namespaces
     ///
     /// Performs a unified search across every namespace, merging and ranking results.
     ///
     /// Examples:
-    ///   rmcp-memex cross-search "error handling"
-    ///   rmcp-memex cross-search "config" --mode hybrid --limit 5 --total-limit 20
-    ///   rmcp-memex cross-search "memory leak" --json
+    ///   rust-memex cross-search "error handling"
+    ///   rust-memex cross-search "config" --mode hybrid --limit 5 --total-limit 20
+    ///   rust-memex cross-search "memory leak" --json
     CrossSearch {
         /// The search query
         query: String,
@@ -614,10 +653,10 @@ pub enum Commands {
     /// Useful for consolidating memory across machines or instances.
     ///
     /// Examples:
-    ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged
-    ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged --dedup
-    ///   rmcp-memex merge --source ~/dragon-db --target ~/merged --namespace-prefix "dragon:"
-    ///   rmcp-memex merge --source ~/db1 --target ~/merged --dry-run
+    ///   rust-memex merge --source ~/db1 --source ~/db2 --target ~/merged
+    ///   rust-memex merge --source ~/db1 --source ~/db2 --target ~/merged --dedup
+    ///   rust-memex merge --source ~/dragon-db --target ~/merged --namespace-prefix "dragon:"
+    ///   rust-memex merge --source ~/db1 --target ~/merged --dry-run
     Merge {
         /// Source database paths (can specify multiple times)
         #[arg(long, short = 's', required = true, action = clap::ArgAction::Append)]
@@ -650,11 +689,11 @@ pub enum Commands {
     /// document per unique content based on the --keep strategy.
     ///
     /// Examples:
-    ///   rmcp-memex dedup                          # All namespaces, dry-run
-    ///   rmcp-memex dedup -n memories              # Specific namespace
-    ///   rmcp-memex dedup --dry-run false          # Actually remove duplicates
-    ///   rmcp-memex dedup --keep newest            # Keep newest duplicates
-    ///   rmcp-memex dedup --cross-namespace        # Dedup across all namespaces
+    ///   rust-memex dedup                          # All namespaces, dry-run
+    ///   rust-memex dedup -n memories              # Specific namespace
+    ///   rust-memex dedup --dry-run false          # Actually remove duplicates
+    ///   rust-memex dedup --keep newest            # Keep newest duplicates
+    ///   rust-memex dedup --cross-namespace        # Dedup across all namespaces
     Dedup {
         /// Specific namespace to deduplicate (if not set, processes all namespaces separately)
         #[arg(long, short = 'n')]
@@ -687,10 +726,10 @@ pub enum Commands {
     /// namespaces or consolidating data.
     ///
     /// Examples:
-    ///   rmcp-memex migrate-namespace --from old-name --to new-name
-    ///   rmcp-memex migrate-namespace --from old --to new --merge
-    ///   rmcp-memex migrate-namespace --from old --to new --dry-run
-    ///   rmcp-memex migrate-namespace --from old --to new --delete-source false
+    ///   rust-memex migrate-namespace --from old-name --to new-name
+    ///   rust-memex migrate-namespace --from old --to new --merge
+    ///   rust-memex migrate-namespace --from old --to new --dry-run
+    ///   rust-memex migrate-namespace --from old --to new --delete-source false
     #[command(alias = "mv-namespace")]
     MigrateNamespace {
         /// Source namespace name
@@ -724,8 +763,8 @@ pub enum Commands {
     /// This action cannot be undone - use with caution!
     ///
     /// Examples:
-    ///   rmcp-memex purge-namespace -n garbage
-    ///   rmcp-memex purge-namespace -n old-data --confirm
+    ///   rust-memex purge-namespace -n garbage
+    ///   rust-memex purge-namespace -n old-data --confirm
     #[command(alias = "purge")]
     PurgeNamespace {
         /// Namespace to purge
@@ -747,8 +786,8 @@ pub enum Commands {
     /// Can re-embed text if embeddings were not included in export.
     ///
     /// Examples:
-    ///   rmcp-memex import -n memories -i backup.jsonl
-    ///   rmcp-memex import -n new-namespace -i backup.jsonl --skip-existing
+    ///   rust-memex import -n memories -i backup.jsonl
+    ///   rust-memex import -n new-namespace -i backup.jsonl --skip-existing
     Import {
         /// Target namespace (can differ from original export)
         #[arg(long, short = 'n', required = true)]
@@ -767,16 +806,98 @@ pub enum Commands {
         db_path: Option<String>,
     },
 
+    /// Reprocess exported JSONL into a fresh namespace using the current chunker
+    ///
+    /// Useful when the original source files are gone but the namespace export is valuable.
+    /// The command collapses onion families back to a single canonical document, optionally
+    /// preprocesses the text, and re-indexes it with the requested slice mode.
+    ///
+    /// Examples:
+    ///   rust-memex export -n kodowanie -o kodowanie.jsonl
+    ///   rust-memex reprocess -i kodowanie.jsonl -n kodowanie-v2 --slice-mode onion-fast
+    ///   rust-memex reprocess -i memories.jsonl -n memories-v2 --preprocess --dry-run
+    #[command(alias = "reindex-export")]
+    Reprocess {
+        /// Target namespace for rebuilt documents
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Input JSONL file produced by 'export'
+        #[arg(long, short = 'i', required = true)]
+        input: PathBuf,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
+    /// Reindex an existing rust-memex namespace into '<namespace>-reindexed'
+    ///
+    /// This is the in-database equivalent of 'export -> reprocess' for namespaced
+    /// rust-memex stores. It reads the existing namespace, collapses onion families
+    /// back to canonical documents, and writes a rebuilt namespace without touching
+    /// the source data.
+    ///
+    /// Examples:
+    ///   rust-memex reindex -n kodowanie
+    ///   rust-memex reindex -n kodowanie --dry-run
+    ///   rust-memex reindex -n kodowanie --target-namespace kodowanie-v2 --slice-mode onion-fast
+    Reindex {
+        /// Source namespace to rebuild
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Target namespace override (default: '<namespace>-reindexed')
+        #[arg(long)]
+        target_namespace: Option<String>,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
     /// Audit database quality and text integrity
     ///
     /// Analyzes namespaces for embedding quality, text integrity (>90% target),
     /// and provides recommendations for cleanup.
     ///
     /// Examples:
-    ///   rmcp-memex audit                    # Audit all namespaces
-    ///   rmcp-memex audit -n memories        # Audit specific namespace
-    ///   rmcp-memex audit --threshold 85     # Custom quality threshold
-    ///   rmcp-memex audit --json             # JSON output for scripting
+    ///   rust-memex audit                    # Audit all namespaces
+    ///   rust-memex audit -n memories        # Audit specific namespace
+    ///   rust-memex audit --threshold 85     # Custom quality threshold
+    ///   rust-memex audit --json             # JSON output for scripting
     #[command(alias = "quality")]
     Audit {
         /// Specific namespace to audit (default: all namespaces)
@@ -802,9 +923,9 @@ pub enum Commands {
     /// Always runs in dry-run mode unless --confirm is passed.
     ///
     /// Examples:
-    ///   rmcp-memex purge-quality                      # Dry run with 90% threshold
-    ///   rmcp-memex purge-quality --threshold 80      # Lower threshold
-    ///   rmcp-memex purge-quality --confirm           # Actually delete
+    ///   rust-memex purge-quality                      # Dry run with 90% threshold
+    ///   rust-memex purge-quality --threshold 80      # Lower threshold
+    ///   rust-memex purge-quality --confirm           # Actually delete
     #[command(alias = "purge-low-quality")]
     PurgeQuality {
         /// Minimum quality threshold (0-100, default: 90)
@@ -828,57 +949,50 @@ impl Cli {
             eprintln!("Using config: {}", path);
         }
 
+        let legacy_mode = self.mode.clone().or_else(|| file_cfg.mode.clone());
+        let legacy_features = self.features.clone().or_else(|| file_cfg.features.clone());
+        if legacy_mode.is_some() || legacy_features.is_some() {
+            eprintln!(
+                "Warning: legacy mode/features settings are ignored. rust-memex now exposes one canonical MCP surface; constrain access with --allowed-paths, HTTP auth, or namespace security instead."
+            );
+        }
+
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.resolve_embedding_config();
-
-        // Determine base config from mode (CLI > file > default)
-        let mode = self.mode.as_deref().or(file_cfg.mode.as_deref());
-        let base_cfg = match mode {
-            Some("memory") => ServerConfig::for_memory_only(),
-            Some("full") => ServerConfig::for_full_rag(),
-            _ => ServerConfig::default(),
-        };
-
-        // CLI --features overrides mode-derived features
-        let features = self
-            .features
-            .or(file_cfg.features)
-            .map(|s| parse_features(&s))
-            .unwrap_or(base_cfg.features);
+        let default_cfg = ServerConfig::default();
 
         // Build security config from CLI and file settings
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
         Ok(ServerConfig {
-            features,
             cache_mb: self
                 .cache_mb
                 .or(file_cfg.cache_mb)
-                .unwrap_or(base_cfg.cache_mb),
+                .unwrap_or(default_cfg.cache_mb),
             db_path: self
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or(base_cfg.db_path),
+                .unwrap_or(default_cfg.db_path),
             max_request_bytes: self
                 .max_request_bytes
                 .or(file_cfg.max_request_bytes)
-                .unwrap_or(base_cfg.max_request_bytes),
+                .unwrap_or(default_cfg.max_request_bytes),
             log_level: self
                 .log_level
                 .or(file_cfg.log_level)
                 .map(|s| parse_log_level(&s))
-                .unwrap_or(base_cfg.log_level),
+                .unwrap_or(default_cfg.log_level),
             allowed_paths: self
                 .allowed_paths
                 .or(file_cfg.allowed_paths)
-                .unwrap_or(base_cfg.allowed_paths),
+                .unwrap_or(default_cfg.allowed_paths),
             security: NamespaceSecurityConfig {
                 enabled: security_enabled,
                 token_store_path,
             },
             embeddings,
-            hybrid: base_cfg.hybrid,
+            hybrid: default_cfg.hybrid,
         })
     }
 }
@@ -949,4 +1063,80 @@ pub fn collect_files(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_mode_and_features_flags_parse_but_do_not_change_server_shape() {
+        let tmp = tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "mode = \"memory\"\nfeatures = \"memory,search\"\n",
+        )
+        .unwrap();
+
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--mode",
+            "full",
+            "--features",
+            "filesystem,memory,search",
+            "serve",
+        ]);
+        let config = cli.into_server_config().unwrap();
+        let defaults = ServerConfig::default();
+
+        assert_eq!(config.db_path, defaults.db_path);
+        assert_eq!(config.cache_mb, defaults.cache_mb);
+        assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
+        assert_eq!(config.allowed_paths, defaults.allowed_paths);
+    }
+
+    #[test]
+    fn dashboard_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rust-memex", "dashboard"]);
+
+        match cli.command {
+            Some(Commands::Dashboard { port, no_open }) => {
+                assert_eq!(port, None);
+                assert!(!no_open);
+            }
+            other => panic!("expected dashboard command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sse_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rust-memex", "sse"]);
+
+        match cli.command {
+            Some(Commands::Sse { port }) => assert_eq!(port, None),
+            other => panic!("expected sse command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn repair_writes_command_parses() {
+        let cli = Cli::parse_from(["rust-memex", "repair-writes", "--execute", "-n", "memories"]);
+
+        match cli.command {
+            Some(Commands::RepairWrites {
+                namespace,
+                execute,
+                json,
+            }) => {
+                assert_eq!(namespace.as_deref(), Some("memories"));
+                assert!(execute);
+                assert!(!json);
+            }
+            other => panic!("expected repair-writes command, got {:?}", other),
+        }
+    }
 }

@@ -29,7 +29,7 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 #   MEMEX_LIMIT=3          - Max memories to return
 #
 # REQUIRES:
-#   - rmcp-memex CLI installed (auto-detected in ~/.cargo/bin, /opt/homebrew/bin)
+#   - rust-memex CLI installed (auto-detected in ~/.cargo/bin, /opt/homebrew/bin)
 #   - jq for JSON parsing (optional)
 #
 # ============================================================================
@@ -48,7 +48,7 @@ MEMEX_LIMIT="${MEMEX_LIMIT:-3}"
 
 # Quick exits
 [[ "$MEMEX_AUGMENT" == "0" ]] && exit 0
-command -v rmcp-memex &>/dev/null || exit 0
+command -v rust-memex &>/dev/null || exit 0
 [[ ! -d "$MEMEX_DB_PATH" ]] && exit 0
 
 # ============================================================================
@@ -81,7 +81,7 @@ fi
 # ============================================================================
 # MEMEX SEARCH (via CLI)
 # ============================================================================
-SEARCH_RESULT=$(rmcp-memex search \
+SEARCH_RESULT=$(rust-memex search \
     -n "$MEMEX_NAMESPACE" \
     -q "$QUERY" \
     -k "$MEMEX_LIMIT" \

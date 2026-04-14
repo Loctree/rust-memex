@@ -19,7 +19,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use rmcp_memex::query::{detect_intent, QueryIntent, QueryRouter};
+//! use rust_memex::query::{detect_intent, QueryIntent, QueryRouter};
 //!
 //! // Quick intent detection
 //! let intent = detect_intent("when did we buy dragon");
@@ -28,8 +28,8 @@
 //! // Full routing with recommendations
 //! let router = QueryRouter::new();
 //! let decision = router.route("what imports main.rs");
-//! if decision.delegate_to_loctree {
-//!     println!("Suggested: {}", decision.loctree_suggestion.unwrap().command);
+//! if let Some(suggestion) = decision.loctree_suggestion {
+//!     println!("Suggested: {}", suggestion.command);
 //! }
 //! ```
 

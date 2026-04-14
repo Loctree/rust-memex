@@ -1,6 +1,6 @@
 # Schema Migration Guide
 
-This document describes how to handle schema changes in rmcp-memex storage layers.
+This document describes how to handle schema changes in rust-memex storage layers.
 
 ## Schema Versioning
 
@@ -50,11 +50,11 @@ Increment this version whenever you make breaking changes to:
 
 1. **Backup your data**:
    ```bash
-   cp -r ~/.rmcp-servers/rmcp-memex/lancedb ~/.rmcp-servers/rmcp-memex/lancedb.backup
+   cp -r ~/.rmcp-servers/rust-memex/lancedb ~/.rmcp-servers/rust-memex/lancedb.backup
    cp -r ~/.rmcp-servers/sled ~/.rmcp-servers/sled.backup
    ```
 
-2. **Stop all rmcp-memex instances**
+2. **Stop all rust-memex instances**
 
 ### Migration Strategies
 
@@ -64,10 +64,10 @@ Best for datasets < 100K documents or when embeddings model changes.
 
 ```bash
 # 1. Backup
-cp -r ~/.rmcp-servers/rmcp-memex/lancedb ~/.rmcp-servers/rmcp-memex/lancedb.backup
+cp -r ~/.rmcp-servers/rust-memex/lancedb ~/.rmcp-servers/rust-memex/lancedb.backup
 
 # 2. Delete old data
-rm -rf ~/.rmcp-servers/rmcp-memex/lancedb
+rm -rf ~/.rmcp-servers/rust-memex/lancedb
 
 # 3. Re-index your documents
 # (Use your indexing scripts or MCP tools)
@@ -79,7 +79,7 @@ For large datasets where re-indexing is expensive.
 
 ```rust
 // Example migration script (pseudocode)
-use rmcp_memex::storage::StorageManager;
+use rust_memex::storage::StorageManager;
 
 async fn migrate_v2_to_v3(storage: &StorageManager) -> Result<()> {
     // 1. Read all documents from old schema
@@ -98,7 +98,7 @@ Added `content_hash` field for exact-match deduplication. Documents without this
 
 ```bash
 # Simple migration: just restart - new documents get content_hash
-rmcp-memex serve --db-path ~/.rmcp-servers/rmcp-memex/lancedb
+rust-memex serve --db-path ~/.rmcp-servers/rust-memex/lancedb
 ```
 
 ## Adding a Migration
@@ -127,13 +127,13 @@ If migration fails:
 
 ```bash
 # Restore from backup
-rm -rf ~/.rmcp-servers/rmcp-memex/lancedb
-cp -r ~/.rmcp-servers/rmcp-memex/lancedb.backup ~/.rmcp-servers/rmcp-memex/lancedb
+rm -rf ~/.rmcp-servers/rust-memex/lancedb
+cp -r ~/.rmcp-servers/rust-memex/lancedb.backup ~/.rmcp-servers/rust-memex/lancedb
 ```
 
 ## FAQ
 
-**Q: Do I need to migrate if I only update rmcp-memex?**
+**Q: Do I need to migrate if I only update rust-memex?**
 
 A: Only if the SCHEMA_VERSION changes. Check the CHANGELOG for "breaking: schema change" entries.
 
@@ -143,4 +143,4 @@ A: Not recommended. Use separate `--db-path` for each version during testing.
 
 **Q: How do I check my current schema version?**
 
-A: Currently there's no runtime check. The schema version is implied by the rmcp-memex version you're running. Future versions may store schema version in the database.
+A: Currently there's no runtime check. The schema version is implied by the rust-memex version you're running. Future versions may store schema version in the database.

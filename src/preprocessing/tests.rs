@@ -100,10 +100,10 @@ fn test_remove_cargo_output() {
     let preprocessor = Preprocessor::with_defaults();
 
     let input = r#"Building the project:
-   Compiling rmcp-memex v0.1.0
+   Compiling rust-memex v0.1.0
    Compiling tokio v1.0.0
     Finished release [optimized] target(s) in 2.34s
-     Running target/release/rmcp_memex
+     Running target/release/rust_memex
 
 Build complete!"#;
 

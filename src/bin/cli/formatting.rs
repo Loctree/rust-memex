@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use rmcp_memex::{HybridSearchResult, SearchMode, SliceLayer, path_utils};
+use rust_memex::{HybridSearchResult, SearchMode, SliceLayer, path_utils};
 
 #[allow(dead_code)]
 fn parse_features(raw: &str) -> Vec<String> {
@@ -70,7 +70,7 @@ use crate::cli::config::*;
 pub fn display_search_results(
     query: &str,
     namespace: Option<&str>,
-    results: &[rmcp_memex::SearchResult],
+    results: &[rust_memex::SearchResult],
     layer_filter: Option<SliceLayer>,
 ) {
     let ns_display = namespace.unwrap_or("all namespaces");
@@ -130,7 +130,7 @@ pub fn display_search_results(
 pub fn json_search_results(
     query: &str,
     namespace: Option<&str>,
-    results: &[rmcp_memex::SearchResult],
+    results: &[rust_memex::SearchResult],
     layer_filter: Option<SliceLayer>,
 ) -> serde_json::Value {
     serde_json::json!({

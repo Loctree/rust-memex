@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Rebranded: `rmcp-memex` → `rust-memex`.** Crate name on crates.io, binary name `rmcp-memex` → `rust-memex`, library path `rmcp_memex` → `rust_memex`, and all internal imports `use rmcp_memex::` → `use rust_memex::`. User-facing `RMCP_MEMEX_*` environment variables preserved as-is for backward compatibility.
+- **Moved to Loctree org:** `https://github.com/VetCoders/rmcp-memex` → `https://github.com/Loctree/rust-memex`. Docs, install CTAs, and issue tracker URLs updated across README, docs/, install.sh, and Makefile.
+- **Authors + license unchanged.** Maciej Gad & Monika Szymanska remain the Cargo authors; dual MIT OR Apache-2.0 license retained for library-friendly downstream use.
+
+### Added
+- `rust-memex reindex` subcommand for rebuilding namespace contents with paginated source reads, preflight embedding checks, and target-namespace safety guards
+- Paginated `all_documents_page(offset, limit)` on `StorageManager` for bounded full-table scans
+- Regression coverage for BM25 rollback so a failed keyword-index write does not leave ghost LanceDB rows behind
+- Regression coverage for the SSE search `k` alias so transport-level top-k requests stay aligned with HTTP and MCP
+
+### Changed
+- `MemexEngine::delete_by_filter` now paginates the full namespace before deleting, preventing missed records in large datasets
+- `run_export` now paginates with 5000-doc pages instead of a hard 100K limit, preventing silent truncation on large namespaces
+- `collapse_export_records` now prefers longest text over highest layer rank when deduplicating, preventing loss of content from historical multi-slicer namespaces
+- Invalid `--search-mode` values now return an error instead of silently falling back to the default mode
+- Import with missing `content_hash` now computes the hash from text instead of using an empty string that would cause false-positive dedup matches
+- Reprocess progress now reports total progress including skipped documents, and logs failed document IDs instead of aborting on the first embedding error
+
+### Breaking
+- Tool names renamed: `memory_search` → `search_documents`, `memory_upsert` → `upsert_document`, and other `memory_*` → `*_document` renames. See `src/handlers/mod.rs` for the full mapping
+- `mcp_protocol::*` types moved under `mcp_core::*`
+- `ServerConfig::features` field removed
+- `maintenance::new` signature changed to `new(namespace, db_path)`
+
+## [0.5.0] - 2026-04-10
+
+### Added
+- Regression coverage for BM25 rollback so a failed keyword-index write does not leave ghost LanceDB rows behind
+- Regression coverage for the SSE search `k` alias so transport-level top-k requests stay aligned with HTTP and MCP
+
+## [0.5.0] - 2026-04-10
+
+### Added
+- Release-facing landing page source under `docs/` with a GitHub Pages workflow and social preview asset
+- Release runbook documenting preflight checks, tagging flow, smoke tests, and post-publish verification
+- SHA256 checksum generation for GitHub release artifacts and installer-side checksum verification
+- Host-local `scripts/build-release-bundle.sh` helper for producing the signed prebuilt tarballs shipped in GitHub Releases
+- Local `scripts/release-local.sh` operator flow for build, macOS signing, and optional `gh release` upload
+
+### Changed
+- Resolved the shared MCP transport merge so `mcp_core` remains the single public dispatch surface
+- Hardened CI with library-only and `cargo package` smoke checks in addition to the existing lint/test gates
+- Aligned release automation, install scripts, and docs around the canonical `rust-memex` binary name and documented aliases
+- Switched the direct `reqwest` client to Rustls so release binaries are more self-contained and do not pull `native-tls` from the top-level crate
+- Clarified that GitHub Release bundles are the canonical install path, but they are built and signed locally before upload rather than compiled inside GitHub Actions
+
 ## [0.4.0] - 2026-03-09
 
 ### Changed
@@ -36,13 +85,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - **Database Management Commands** - Full CRUD for namespaces and documents
-  - `rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged` - Merge multiple LanceDB databases with optional deduplication
-  - `rmcp-memex dedup -n memories` - Find and remove duplicate documents by content_hash
-  - `rmcp-memex migrate-namespace --from old --to new` - Move/rename namespaces with optional merge
-  - `rmcp-memex import -n memories -i backup.jsonl` - Import documents from JSONL with optional re-embedding
-  - `rmcp-memex export -n memories -o backup.jsonl` - Export namespace to portable JSONL format
-  - `rmcp-memex gc --older-than 30d` - Garbage collection for orphans, empty namespaces, old docs
-  - `rmcp-memex cross-search -q "query"` - Search across all namespaces at once
+  - `rust-memex merge --source ~/db1 --source ~/db2 --target ~/merged` - Merge multiple LanceDB databases with optional deduplication
+  - `rust-memex dedup -n memories` - Find and remove duplicate documents by content_hash
+  - `rust-memex migrate-namespace --from old --to new` - Move/rename namespaces with optional merge
+  - `rust-memex import -n memories -i backup.jsonl` - Import documents from JSONL with optional re-embedding
+  - `rust-memex export -n memories -o backup.jsonl` - Export namespace to portable JSONL format
+  - `rust-memex gc --older-than 30d` - Garbage collection for orphans, empty namespaces, old docs
+  - `rust-memex cross-search -q "query"` - Search across all namespaces at once
 - **HTTP/SSE Server** - Multi-agent access without LanceDB lock conflicts
   - `--http-port 6660` flag to start HTTP server alongside MCP stdio
   - `--http-only` flag for daemon mode (HTTP only, no MCP stdio)
@@ -78,14 +127,14 @@ All notable changes to this project will be documented in this file.
 - **TUI Wizard Runtime Panic** - "Cannot start a runtime from within a runtime"
   - Use `tokio::task::block_in_place()` when calling `block_on()` from async context
   - `Handle::try_current()` to get existing runtime handle instead of creating new one
-  - Fixes crash when running `rmcp-memex wizard` from `#[tokio::main]` async context
+  - Fixes crash when running `rust-memex wizard` from `#[tokio::main]` async context
 
 ### Added
 - **LanceDB Maintenance Commands** (from 0.3.2-dev)
-  - `rmcp-memex optimize` - Run all optimizations (compact + prune old versions)
-  - `rmcp-memex compact` - Merge small fragment files into larger ones
-  - `rmcp-memex cleanup --older-than-days N` - Remove old versions (default: 7 days)
-  - `rmcp-memex stats` - Show database statistics (row count, version count)
+  - `rust-memex optimize` - Run all optimizations (compact + prune old versions)
+  - `rust-memex compact` - Merge small fragment files into larger ones
+  - `rust-memex cleanup --older-than-days N` - Remove old versions (default: 7 days)
+  - `rust-memex stats` - Show database statistics (row count, version count)
   - Fixes "too many open files" errors from LanceDB fragment accumulation
   - Library API: `StorageManager::optimize()`, `compact()`, `cleanup()`, `stats()`
   - New type: `TableStats` exported from lib.rs
@@ -98,7 +147,7 @@ All notable changes to this project will be documented in this file.
   - Uses `tokio::sync::mpsc` channels with bounded buffers (100 items) for backpressure
   - Each stage runs in its own `tokio::spawn` for maximum concurrency
   - Ideal for large batch operations with significant I/O and GPU overlap
-  - Example: `rmcp-memex index ~/documents -n docs --pipeline`
+  - Example: `rust-memex index ~/documents -n docs --pipeline`
   - Library API: `run_pipeline()`, `PipelineConfig`, `PipelineResult`, `PipelineStats`
   - Note: `--progress` and `--resume` flags are not supported in pipeline mode
 - **Parallel File Processing** - `--parallel N` flag for concurrent file indexing
@@ -107,7 +156,7 @@ All notable changes to this project will be documented in this file.
   - Uses atomic counters (`AtomicUsize`, `AtomicBool`) for thread-safe progress tracking
   - Preserves checkpoint/resume functionality with `Arc<Mutex<IndexCheckpoint>>`
   - One file failure doesn't stop others - graceful error handling
-  - Example: `rmcp-memex index ~/documents -n docs --parallel 8`
+  - Example: `rust-memex index ~/documents -n docs --parallel 8`
   - Combines with all existing flags: `--dedup`, `--resume`, `--progress`, `--preprocess`
   - Note: Ignored when `--pipeline` is enabled (pipeline has its own concurrency model)
 
@@ -122,7 +171,7 @@ All notable changes to this project will be documented in this file.
 - **CLI `--auto-route` flag** - Automatic search mode selection for `search` command
   - Analyzes query intent and selects optimal mode (vector/bm25/hybrid)
   - Displays intent, confidence, and loctree suggestions when applicable
-  - Example: `rmcp-memex search -n memories -q "when did we buy dragon" --auto-route`
+  - Example: `rust-memex search -n memories -q "when did we buy dragon" --auto-route`
 - **MCP `auto_route` parameter** - Added to `rag_search` and `memory_search` tools
   - When `true`, QueryRouter overrides explicit `mode` parameter
   - Enables intelligent mode selection for AI agents
@@ -139,7 +188,7 @@ All notable changes to this project will be documented in this file.
   - Saves checkpoint after each file to `.index-checkpoint-{namespace}.json`
   - On restart with `--resume`, skips already-indexed files
   - Checkpoint auto-deleted on successful completion
-  - Failed files preserved for retry: `rmcp-memex index ... --resume`
+  - Failed files preserved for retry: `rust-memex index ... --resume`
 - **OnionFast mode** - 2x faster indexing for large datasets
   - `--slice-mode onion-fast` or `--slice-mode fast`
   - Creates only outer+core layers (2 instead of 4)
@@ -252,7 +301,7 @@ All notable changes to this project will be documented in this file.
 - **Release Workflow** - GitHub Actions for multi-platform binary releases.
 - **Install Script** - `curl | sh` installer with platform detection.
   ```bash
-  curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+  curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
   ```
 
 ## [0.2.1] - 2025-12-26
@@ -277,9 +326,9 @@ All notable changes to this project will be documented in this file.
 ## [0.2.0] - 2025-12-26
 
 ### Breaking Changes
-- **Binary renamed** from `rmcp_memex` to `rmcp-memex` (hyphenated).
-- **Default paths changed** from `~/.rmcp_servers/rmcp_memex/` to `~/.rmcp-servers/rmcp-memex/`.
-- **MCP server name** changed from `rmcp_memex` to `rmcp-memex`.
+- **Binary renamed** from `rust_memex` to `rust-memex` (hyphenated).
+- **Default paths changed** from `~/.rmcp_servers/rust_memex/` to `~/.rmcp-servers/rust-memex/`.
+- **MCP server name** changed from `rust_memex` to `rust-memex`.
 
 ### Added
 - **Namespace Security** - Token-based access control for protected namespaces.

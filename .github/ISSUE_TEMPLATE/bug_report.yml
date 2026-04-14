@@ -1,6 +1,6 @@
 # Copyright (c) 2025-2026 VetCoders (https://vetcoders.io)
 name: Bug Report
-description: Report a reproducible problem in rmcp-memex
+description: Report a reproducible problem in rust-memex
 title: "[Bug]: "
 labels: ["bug"]
 body:

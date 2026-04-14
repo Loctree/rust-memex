@@ -1,17 +1,44 @@
-# rmcp-memex
-[![Crates.io](https://img.shields.io/crates/v/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![License](https://img.shields.io/crates/l/rmcp-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![CI](https://github.com/VetCoders/rmcp-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/VetCoders/rmcp-memex/actions)
+# rust-memex
+[![Crates.io](https://img.shields.io/crates/v/rust-memex)](https://crates.io/crates/rust-memex) [![License](https://img.shields.io/crates/l/rust-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rust-memex)](https://crates.io/crates/rust-memex) [![CI](https://github.com/Loctree/rust-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/Loctree/rust-memex/actions)
 
-`rmcp-memex` is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.
+`rust-memex` is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.
 
 It exposes two explicit transport modes from a single canonical surface:
 1.  **`stdio` (Standard MCP)**: Native MCP integration for local agents (e.g., Claude Desktop).
 2.  **`HTTP/SSE` (Multi-Agent Daemon)**: A central daemon mode allowing concurrent AI agents to access the same memory pool over the network, resolving LanceDB's exclusive lock constraints.
 
-> **Note on Aliases:** The published package and primary entrypoint is `rmcp-memex`. For operational convenience, it installs the aliases `rust-memex`, `rmmx`, and `rmemex`. These are strictly convenience links to the identical `rmcp-memex` kernel, not separate products.
+> **Binary Name:** `rust-memex` is the only supported binary name. The GitHub installer also creates `rust_memex` as a legacy compatibility symlink for older scripts.
+>
+> **MCP Contract:** The current MCP surface is intentionally tools-only. `initialize` advertises `tools`, while `resources/*` is not implemented yet.
+
+## Release Surface
+
+- Quick install: `curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh`
+- Prebuilt binary bundles: [GitHub Releases](https://github.com/Loctree/rust-memex/releases) uploaded from locally built and signed artifacts
+- Release runbook: [docs/RELEASE.md](docs/RELEASE.md)
+- Configuration guide: [docs/02_configuration.md](docs/02_configuration.md)
+- HTTP/SSE reference: [docs/HTTP_API.md](docs/HTTP_API.md)
+- Static launch page source: `docs/index.html` published by `.github/workflows/pages.yml`
+
+## Quick Start
+
+```bash
+# Install from the latest GitHub Release
+curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
+
+# Start the MCP server
+rust-memex serve
+
+# Open the local dashboard in your browser
+rust-memex dashboard
+
+# Or run the multi-agent HTTP/SSE daemon
+rust-memex sse
+```
 
 ## Overview
 
-As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
+As an MCP (Model Context Protocol) server, `rust-memex` provides:
 - **RAG (Retrieval-Augmented Generation)** - document indexing and semantic search
 - **Hybrid Search** - BM25 keyword + semantic vector search (Tantivy-based)
 - **Vector Memory** - semantic storage and retrieval of text chunks
@@ -25,7 +52,7 @@ As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      rmcp-memex                              │
+│                      rust-memex                              │
 ├─────────────────────────────────────────────────────────────┤
 │  MCP Server (JSON-RPC over stdio)                           │
 │  ├── handlers/mod.rs    - Request routing & validation      │
@@ -73,22 +100,22 @@ As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
 
 ## Library Usage
 
-`rmcp-memex` can be used as a library in your Rust applications. It provides a high-level `MemexEngine` API for vector storage operations.
+`rust-memex` can be used as a library in your Rust applications. It provides a high-level `MemexEngine` API for vector storage operations.
 
 ### Add to Cargo.toml
 
 ```toml
 # Full library with CLI
-rmcp-memex = "0.4"
+rust-memex = "0.5"
 
 # Library only (no CLI dependencies)
-rmcp-memex = { version = "0.4", default-features = false }
+rust-memex = { version = "0.5", default-features = false }
 ```
 
 ### Basic Usage
 
 ```rust
-use rmcp_memex::{MemexEngine, MemexConfig, MetaFilter, StoreItem};
+use rust_memex::{MemexEngine, MemexConfig, MetaFilter, StoreItem};
 use serde_json::json;
 
 #[tokio::main]
@@ -126,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
 For Vista PIMS, use the optimized constructor:
 
 ```rust
-use rmcp_memex::MemexEngine;
+use rust_memex::MemexEngine;
 
 // Vista-optimized: 1024 dims, qwen3-embedding:0.6b model
 let engine = MemexEngine::for_vista().await?;
@@ -142,7 +169,7 @@ engine.store(
 ### Batch Operations
 
 ```rust
-use rmcp_memex::{MemexEngine, StoreItem};
+use rust_memex::{MemexEngine, StoreItem};
 use serde_json::json;
 
 let engine = MemexEngine::for_app("my-app", "notes").await?;
@@ -160,7 +187,7 @@ println!("Stored {} documents", result.success_count);
 ### GDPR-Compliant Deletion
 
 ```rust
-use rmcp_memex::{MemexEngine, MetaFilter};
+use rust_memex::{MemexEngine, MetaFilter};
 
 let engine = MemexEngine::for_app("my-app", "patients").await?;
 
@@ -173,7 +200,7 @@ println!("Deleted {} documents", deleted);
 ### Hybrid Search (BM25 + Vector)
 
 ```rust
-use rmcp_memex::{MemexEngine, SearchMode};
+use rust_memex::{MemexEngine, SearchMode};
 
 let engine = MemexEngine::for_app("my-app", "documents").await?;
 
@@ -190,24 +217,26 @@ let results = engine.search_with_mode("semantic concept", 10, SearchMode::Vector
 let results = engine.search_with_mode("best of both", 10, SearchMode::Hybrid).await?;
 ```
 
-### Agent Tools API
+### MCP Contract and In-Process Helpers
 
-For MCP-compatible AI agents:
+Use `tool_definitions()` when you need the exact MCP tool metadata exposed by
+the stdio and HTTP/SSE transports. The helper functions below are for in-process
+Rust callers; they are a local convenience layer, not a second public MCP
+contract. Their names intentionally differ from MCP tool names so the two
+surfaces do not drift together by accident.
 
 ```rust
-use rmcp_memex::{MemexEngine, tool_definitions, memory_store, memory_search};
+use rust_memex::{MemexEngine, search_documents, store_document, tool_definitions};
 use serde_json::json;
 
 let engine = MemexEngine::for_app("agent", "memory").await?;
 
-// Get tool definitions for MCP registration
+// Canonical MCP tool surface exposed by rust-memex transports
 let tools = tool_definitions();
-for tool in &tools {
-    println!("Tool: {} - {}", tool.name, tool.description);
-}
+assert!(tools.iter().any(|tool| tool.name == "memory_upsert"));
 
-// Use tool functions
-let result = memory_store(
+// Local Rust helpers for in-process callers
+let result = store_document(
     &engine,
     "mem-1".to_string(),
     "Important information to remember".to_string(),
@@ -215,7 +244,7 @@ let result = memory_store(
 ).await?;
 assert!(result.success);
 
-let results = memory_search(&engine, "important".to_string(), 5, None).await?;
+let results = search_documents(&engine, "important".to_string(), 5, None).await?;
 ```
 
 ### Feature Flags
@@ -237,7 +266,7 @@ cargo build --features cli
 
 ## Configuration Guide
 
-Complete guide for integrating rmcp-memex as a library in any Rust project.
+Complete guide for integrating rust-memex as a library in any Rust project.
 
 ### Prerequisites
 
@@ -294,7 +323,7 @@ MEMEX_BM25_PATH=~/.rmcp-servers/myapp/bm25
 ### Quick Start (Auto-config)
 
 ```rust
-use rmcp_memex::MemexEngine;
+use rust_memex::MemexEngine;
 use serde_json::json;
 
 // Auto-configures from defaults + environment
@@ -307,8 +336,8 @@ let results = engine.search("content", 10).await?;
 ### Custom Configuration
 
 ```rust
-use rmcp_memex::{MemexConfig, MemexEngine};
-use rmcp_memex::embeddings::{EmbeddingConfig, ProviderConfig};
+use rust_memex::{MemexConfig, MemexEngine};
+use rust_memex::embeddings::{EmbeddingConfig, ProviderConfig};
 
 // Read from your app's environment
 let ollama_url = std::env::var("OLLAMA_BASE_URL")
@@ -350,7 +379,7 @@ let engine = MemexEngine::new(config).await?;
 Configure multiple providers - library tries them in priority order:
 
 ```rust
-use rmcp_memex::embeddings::{EmbeddingConfig, ProviderConfig};
+use rust_memex::embeddings::{EmbeddingConfig, ProviderConfig};
 
 let config = EmbeddingConfig {
     required_dimension: 1024,
@@ -468,10 +497,13 @@ MLX_MAX_BATCH_ITEMS=32
 
 **Quick install (recommended):**
 ```bash
-curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
 ```
 
-**From source:**
+Prebuilt GitHub Release bundles are the canonical install path and avoid compiling
+the full LanceDB-heavy Rust dependency graph on the target machine.
+
+**From source (development only):**
 ```bash
 cargo install --path .
 ```
@@ -479,21 +511,22 @@ cargo install --path .
 ### Running
 
 ```bash
-# Default mode (all features)
-rmcp-memex serve
-
-# Memory-only mode (no filesystem access)
-rmcp-memex serve --mode memory
+# Canonical MCP surface
+rust-memex serve
 
 # With security enabled
-rmcp-memex serve --security-enabled
+rust-memex serve --security-enabled
 
 # With HTTP/SSE server for multi-agent access
-rmcp-memex serve --http-port 6660
+rust-memex serve --http-port 8997
 
 # HTTP-only daemon mode (no MCP stdio)
-rmcp-memex serve --http-port 6660 --http-only
+rust-memex serve --http-port 8997 --http-only
 ```
+
+`rust-memex` always exposes one canonical MCP tool surface. To narrow runtime
+access, use `--allowed-paths`, HTTP auth, or namespace security rather than a
+separate "memory/full" mode switch.
 
 ## HTTP/SSE Server (Multi-Agent Access)
 
@@ -504,10 +537,10 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     rmcp-memex daemon                        │
+│                     rust-memex daemon                        │
 │  ┌─────────────────┐    ┌─────────────────┐                 │
 │  │   MCP Server    │    │   HTTP/SSE      │                 │
-│  │   (stdio)       │    │   (port 6660)   │                 │
+│  │   (stdio)       │    │   (port 8997)   │                 │
 │  └────────┬────────┘    └────────┬────────┘                 │
 │           │                      │                          │
 │           └──────────┬───────────┘                          │
@@ -531,8 +564,8 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (status, db_path, embedding_provider) |
-| `/search` | POST | Vector search with optional layer filter |
-| `/sse/search` | GET | SSE streaming search (real-time results) |
+| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported) |
+| `/sse/search` | GET | SSE streaming search with optional `project`, `layer`, and `deep` filters |
 | `/upsert` | POST | Add/update document |
 | `/index` | POST | Full pipeline indexing with onion slices |
 | `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |
@@ -552,9 +585,9 @@ Configure in `~/.claude.json`:
 ```json
 {
   "mcpServers": {
-    "rmcp-memex": {
+    "rust-memex": {
       "type": "sse",
-      "url": "http://localhost:6660/sse/"
+      "url": "http://localhost:8997/sse/"
     }
   }
 }
@@ -563,24 +596,27 @@ Configure in `~/.claude.json`:
 ### Usage Examples
 
 ```bash
+# Open the local dashboard
+rust-memex dashboard --db-path ~/.ai-memories/lancedb
+
 # Start daemon
-rmcp-memex serve --http-port 6660 --http-only --db-path ~/.ai-memories/lancedb &
+rust-memex sse --db-path ~/.ai-memories/lancedb &
 
 # Health check
-curl http://localhost:6660/health
+curl http://localhost:8997/health
 
 # Store document
-curl -X POST http://localhost:6660/upsert \
+curl -X POST http://localhost:8997/upsert \
   -H "Content-Type: application/json" \
   -d '{"namespace": "agent1", "id": "mem1", "content": "Important context..."}'
 
 # Search
-curl -X POST http://localhost:6660/search \
+curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "context", "namespace": "agent1", "limit": 10}'
+  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5"
+curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
 ```
 
 ### Multi-Host Database Paths
@@ -589,10 +625,10 @@ For setups with multiple machines (e.g., dragon, mgbook16), use per-host databas
 
 ```bash
 # Per-host paths (each machine gets own database)
-rmcp-memex serve --db-path ~/.ai-memories/lancedb.$(hostname -s)
+rust-memex serve --db-path ~/.ai-memories/lancedb.$(hostname -s)
 
 # Or use the wizard for machine-agnostic configuration
-rmcp-memex wizard
+rust-memex wizard
 ```
 
 The TUI wizard auto-detects hostname and offers:
@@ -602,10 +638,9 @@ The TUI wizard auto-detects hostname and offers:
 ### Configuration (TOML)
 
 ```toml
-# ~/.rmcp-servers/config/rmcp-memex.toml
+# ~/.rmcp-servers/rust-memex/config.toml
 
-mode = "full"
-db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
+db_path = "~/.rmcp-servers/rust-memex/lancedb"
 cache_mb = 4096
 log_level = "info"
 
@@ -617,7 +652,7 @@ allowed_paths = [
 
 # Security
 security_enabled = true
-token_store_path = "~/.rmcp-servers/rmcp-memex/tokens.json"
+token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 ```
 
 ## Documentation
@@ -627,7 +662,7 @@ token_store_path = "~/.rmcp-servers/rmcp-memex/tokens.json"
 
 ## Onion Slice Architecture
 
-Instead of traditional flat chunking, rmcp-memex offers hierarchical "onion slices":
+Instead of traditional flat chunking, rust-memex offers hierarchical "onion slices":
 
 ```
 ┌─────────────────────────────────────────┐
@@ -650,17 +685,17 @@ Intelligent query intent detection for automatic search mode selection:
 
 ```bash
 # Auto-detect query intent and select optimal mode
-rmcp-memex search -n memories -q "when did we buy dragon" --auto-route
+rust-memex search -n memories -q "when did we buy dragon" --auto-route
 # Output: Query intent: temporal (confidence: 0.70)
 #         Selects: hybrid mode with date boosting
 
 # Structural queries suggest loctree
-rmcp-memex search -n code -q "who imports main.rs" --auto-route
+rust-memex search -n code -q "who imports main.rs" --auto-route
 # Output: Query intent: structural (confidence: 0.80)
 #         Consider: loctree query --kind who-imports --target main.rs
 
 # Deep exploration with all onion layers
-rmcp-memex dive -n memories -q "dragon" --verbose
+rust-memex dive -n memories -q "dragon" --verbose
 ```
 
 **Intent Types:**
@@ -676,34 +711,34 @@ rmcp-memex dive -n memories -q "dragon" --verbose
 
 ```bash
 # Index with onion slicing (default)
-rmcp-memex index -n memories /path/to/data/ --slice-mode onion
+rust-memex index -n memories /path/to/data/ --slice-mode onion
 
 # Index with progress bar and ETA
-rmcp-memex index -n memories /path/to/data/ --progress
+rust-memex index -n memories /path/to/data/ --progress
 
 # Index with flat chunking (backward compatible)
-rmcp-memex index -n memories /path/to/data/ --slice-mode flat
+rust-memex index -n memories /path/to/data/ --slice-mode flat
 
 # Search in namespace
-rmcp-memex search -n memories -q "best moments" --limit 10
+rust-memex search -n memories -q "best moments" --limit 10
 
 # Search only in specific layer
-rmcp-memex search -n memories -q "query" --layer outer
+rust-memex search -n memories -q "query" --layer outer
 
 # Drill down in hierarchy (expand children)
-rmcp-memex expand -n memories -i "slice_id_here"
+rust-memex expand -n memories -i "slice_id_here"
 
 # Get chunk by ID
-rmcp-memex get -n memories -i "chunk_abc123"
+rust-memex get -n memories -i "chunk_abc123"
 
 # RAG search (cross-namespace)
-rmcp-memex rag-search -q "search term" --limit 5
+rust-memex rag-search -q "search term" --limit 5
 
 # List namespaces with stats
-rmcp-memex namespaces --stats
+rust-memex namespaces --stats
 
 # Export namespace to JSON
-rmcp-memex export -n memories -o backup.json --include-embeddings
+rust-memex export -n memories -o backup.json --include-embeddings
 ```
 
 ### Preprocessing (Noise Filtering)
@@ -716,7 +751,7 @@ Automatic removal of ~36-40% noise from conversation exports:
 
 ```bash
 # Index with preprocessing
-rmcp-memex index -n memories /path/to/export.json --preprocess
+rust-memex index -n memories /path/to/export.json --preprocess
 ```
 
 ### Exact-Match Deduplication
@@ -725,10 +760,10 @@ SHA256-based dedup for overlapping exports (e.g., quarterly exports containing 6
 
 ```bash
 # Dedup enabled (default)
-rmcp-memex index -n memories /path/to/data/
+rust-memex index -n memories /path/to/data/
 
 # Disable dedup
-rmcp-memex index -n memories /path/to/data/ --no-dedup
+rust-memex index -n memories /path/to/data/ --no-dedup
 ```
 
 **Output with statistics:**
@@ -743,11 +778,11 @@ Indexing complete:
 ## Code Structure
 
 ```
-rmcp-memex/
+rust-memex/
 ├── src/
 │   ├── lib.rs              # Public API & ServerConfig
 │   ├── bin/
-│   │   └── rmcp-memex.rs   # CLI binary (serve, index, search, get, expand, etc.)
+│   │   └── rust-memex.rs   # CLI binary (serve, index, search, get, expand, etc.)
 │   ├── handlers/
 │   │   └── mod.rs          # MCP request handlers
 │   ├── security/
@@ -772,8 +807,8 @@ Add to `~/.claude.json`:
 ```json
 {
   "mcpServers": {
-    "rmcp-memex": {
-      "command": "rmcp-memex",
+    "rust-memex": {
+      "command": "rust-memex",
       "args": ["serve", "--security-enabled"]
     }
   }

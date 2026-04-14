@@ -1,4 +1,4 @@
-# rmcp-memex Indexing Guide
+# rust-memex Indexing Guide
 
 > Przewodnik dla agentów AI do indeksowania wspomnień i dokumentów.
 
@@ -6,13 +6,13 @@
 
 ```bash
 # Indeksuj pojedynczy plik
-rmcp-memex index --db-path /path/to/lancedb --namespace moje-wspomnienia /path/to/file.json
+rust-memex index --db-path /path/to/lancedb --namespace moje-wspomnienia /path/to/file.json
 
 # Indeksuj cały folder
-rmcp-memex index --db-path /path/to/lancedb --namespace pamietnik /path/to/folder/
+rust-memex index --db-path /path/to/lancedb --namespace pamietnik /path/to/folder/
 
 # Z filtrem na rozszerzenia
-rmcp-memex index --db-path /path/to/lancedb --namespace rozmowy --glob "*.json" /path/to/folder/
+rust-memex index --db-path /path/to/lancedb --namespace rozmowy --glob "*.json" /path/to/folder/
 ```
 
 ## Wymagania
@@ -36,8 +36,8 @@ Namespace to logiczna izolacja danych. Wybieraj nazwy mówiące o zawartości:
 
 ```bash
 # Różne namespace'y dla różnych typów danych
-rmcp-memex index --namespace rozmowy-2024 /data/conversations_2024.json
-rmcp-memex index --namespace rozmowy-2025 /data/conversations_2025.json
+rust-memex index --namespace rozmowy-2024 /data/conversations_2024.json
+rust-memex index --namespace rozmowy-2025 /data/conversations_2025.json
 ```
 
 ## Obsługiwane formaty
@@ -51,7 +51,7 @@ rmcp-memex index --namespace rozmowy-2025 /data/conversations_2025.json
 
 ## Chunking
 
-rmcp-memex automatycznie dzieli tekst na chunki:
+rust-memex automatycznie dzieli tekst na chunki:
 - **Rozmiar:** 512 znaków
 - **Overlap:** 128 znaków (kontekst między chunkami)
 
@@ -62,13 +62,13 @@ rmcp-memex automatycznie dzieli tekst na chunki:
 find /path/to/data -type f \( -name "*.json" -o -name "*.md" \) | wc -l
 
 # 2. Zacznij od małej próbki
-rmcp-memex index --namespace test --glob "*.json" /path/to/data/sample/
+rust-memex index --namespace test --glob "*.json" /path/to/data/sample/
 
 # 3. Sprawdź wyniki przez MCP
 # (użyj rag_search z namespace="test")
 
 # 4. Jeśli OK - indeksuj wszystko
-rmcp-memex index --namespace produkcja /path/to/data/
+rust-memex index --namespace produkcja /path/to/data/
 ```
 
 ## Szukanie po zaindeksowaniu

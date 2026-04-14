@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```rust
-//! use rmcp_memex::query::{QueryIntent, detect_intent, QueryRouter, RoutingDecision};
+//! use rust_memex::query::{QueryIntent, detect_intent, QueryRouter, RoutingDecision};
 //!
 //! let intent = detect_intent("when did we buy dragon");
 //! assert!(matches!(intent, QueryIntent::Temporal));
@@ -235,7 +235,7 @@ fn semantic_keywords() -> &'static HashSet<&'static str> {
 /// # Example
 ///
 /// ```rust
-/// use rmcp_memex::query::detect_intent;
+/// use rust_memex::query::detect_intent;
 ///
 /// let intent = detect_intent("when did we buy dragon");
 /// // Returns QueryIntent::Temporal
