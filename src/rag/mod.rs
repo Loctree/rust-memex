@@ -14,7 +14,7 @@ use crate::{
     embeddings::MLXBridge,
     preprocessing::{PreprocessingConfig, Preprocessor},
     search::BM25Index,
-    storage::{ChromaDocument, StorageManager},
+    storage::{ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryStatus, StorageManager},
 };
 
 // Async pipeline module for concurrent indexing
@@ -200,6 +200,228 @@ impl IndexResult {
             IndexResult::Skipped { content_hash, .. } => content_hash,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossStoreRecoveryState {
+    Clean,
+    Divergent,
+    RolledBack,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossStoreRecoveryBatchReport {
+    pub batch_id: String,
+    pub namespace: String,
+    pub created_at: String,
+    pub state: CrossStoreRecoveryState,
+    pub status: CrossStoreRecoveryStatus,
+    pub document_count: usize,
+    pub lance_documents: usize,
+    pub bm25_documents: usize,
+    pub missing_bm25_ids: Vec<String>,
+    pub missing_lance_ids: Vec<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CrossStoreRecoveryReport {
+    pub recovery_dir: String,
+    pub pending_batches: usize,
+    pub clean_batches: usize,
+    pub divergent_batches: usize,
+    pub rolled_back_batches: usize,
+    pub stale_batches: usize,
+    pub documents_examined: usize,
+    pub documents_missing_bm25: usize,
+    pub documents_missing_lance: usize,
+    pub repaired_documents: usize,
+    pub skipped_documents: usize,
+    pub cleared_batches: usize,
+    pub batches_repaired: usize,
+    pub batches: Vec<CrossStoreRecoveryBatchReport>,
+}
+
+impl CrossStoreRecoveryReport {
+    pub fn is_clean(&self) -> bool {
+        self.pending_batches == 0
+            || (self.divergent_batches == 0
+                && self.rolled_back_batches == 0
+                && self.stale_batches == 0)
+    }
+}
+
+async fn run_cross_store_recovery(
+    storage: &StorageManager,
+    bm25: &BM25Index,
+    namespace: Option<&str>,
+    execute: bool,
+) -> Result<CrossStoreRecoveryReport> {
+    let recovery_dir = storage.cross_store_recovery_dir();
+    let mut report = CrossStoreRecoveryReport {
+        recovery_dir: recovery_dir.display().to_string(),
+        ..Default::default()
+    };
+
+    let batches = storage
+        .list_cross_store_recovery_batches()?
+        .into_iter()
+        .filter(|batch| {
+            namespace.is_none_or(|expected| {
+                batch
+                    .documents
+                    .iter()
+                    .any(|document| document.namespace == expected)
+            })
+        })
+        .collect::<Vec<_>>();
+    report.pending_batches = batches.len();
+
+    if batches.is_empty() {
+        return Ok(report);
+    }
+
+    let mut lance_cache: HashMap<String, HashMap<String, ChromaDocument>> = HashMap::new();
+    let mut bm25_cache: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for batch in batches {
+        let namespace_name = batch
+            .documents
+            .first()
+            .map(|document| document.namespace.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let lance_documents = if let Some(documents) = lance_cache.get(&namespace_name) {
+            documents
+        } else {
+            let documents = storage
+                .get_all_in_namespace(&namespace_name)
+                .await?
+                .into_iter()
+                .map(|document| (document.id.clone(), document))
+                .collect::<HashMap<_, _>>();
+            lance_cache.insert(namespace_name.clone(), documents);
+            lance_cache
+                .get(&namespace_name)
+                .expect("just inserted lance cache")
+        };
+
+        let bm25_documents = if let Some(ids) = bm25_cache.get(&namespace_name) {
+            ids
+        } else {
+            let ids = bm25
+                .document_keys(Some(&namespace_name))?
+                .into_iter()
+                .filter_map(|(doc_namespace, id)| (doc_namespace == namespace_name).then_some(id))
+                .collect::<HashSet<_>>();
+            bm25_cache.insert(namespace_name.clone(), ids);
+            bm25_cache
+                .get(&namespace_name)
+                .expect("just inserted bm25 cache")
+        };
+
+        let mut missing_bm25_ids = Vec::new();
+        let mut missing_lance_ids = Vec::new();
+        let mut repair_documents = Vec::new();
+        let mut lance_present = 0usize;
+        let mut bm25_present = 0usize;
+
+        for document_ref in &batch.documents {
+            report.documents_examined += 1;
+
+            if let Some(document) = lance_documents.get(&document_ref.id) {
+                lance_present += 1;
+                if bm25_documents.contains(&document_ref.id) {
+                    bm25_present += 1;
+                } else {
+                    missing_bm25_ids.push(document_ref.id.clone());
+                    repair_documents.push((
+                        document.id.clone(),
+                        document.namespace.clone(),
+                        document.document.clone(),
+                    ));
+                }
+            } else {
+                missing_lance_ids.push(document_ref.id.clone());
+            }
+        }
+
+        report.documents_missing_bm25 += missing_bm25_ids.len();
+        report.documents_missing_lance += missing_lance_ids.len();
+
+        let state = if !missing_bm25_ids.is_empty() {
+            report.divergent_batches += 1;
+            CrossStoreRecoveryState::Divergent
+        } else if batch.status == CrossStoreRecoveryStatus::RolledBack {
+            report.rolled_back_batches += 1;
+            CrossStoreRecoveryState::RolledBack
+        } else if !missing_lance_ids.is_empty() || lance_present == 0 {
+            report.stale_batches += 1;
+            CrossStoreRecoveryState::Stale
+        } else {
+            report.clean_batches += 1;
+            CrossStoreRecoveryState::Clean
+        };
+
+        if execute {
+            match state {
+                CrossStoreRecoveryState::Divergent => {
+                    bm25.add_documents(&repair_documents).await?;
+                    if let Some(ids) = bm25_cache.get_mut(&namespace_name) {
+                        for (id, _, _) in &repair_documents {
+                            ids.insert(id.clone());
+                        }
+                    }
+                    report.repaired_documents += repair_documents.len();
+                    report.skipped_documents += missing_lance_ids.len();
+                    report.batches_repaired += 1;
+                    storage.clear_cross_store_recovery_batch(&batch.batch_id)?;
+                    report.cleared_batches += 1;
+                }
+                CrossStoreRecoveryState::RolledBack
+                | CrossStoreRecoveryState::Stale
+                | CrossStoreRecoveryState::Clean => {
+                    report.skipped_documents += missing_lance_ids.len();
+                    storage.clear_cross_store_recovery_batch(&batch.batch_id)?;
+                    report.cleared_batches += 1;
+                }
+            }
+        }
+
+        report.batches.push(CrossStoreRecoveryBatchReport {
+            batch_id: batch.batch_id,
+            namespace: namespace_name,
+            created_at: batch.created_at,
+            state,
+            status: batch.status,
+            document_count: batch.documents.len(),
+            lance_documents: lance_present,
+            bm25_documents: bm25_present,
+            missing_bm25_ids,
+            missing_lance_ids,
+            last_error: batch.last_error,
+        });
+    }
+
+    Ok(report)
+}
+
+pub async fn inspect_cross_store_recovery(
+    storage: &StorageManager,
+    bm25: &BM25Index,
+    namespace: Option<&str>,
+) -> Result<CrossStoreRecoveryReport> {
+    run_cross_store_recovery(storage, bm25, namespace, false).await
+}
+
+pub async fn repair_cross_store_recovery(
+    storage: &StorageManager,
+    bm25: &BM25Index,
+    namespace: Option<&str>,
+) -> Result<CrossStoreRecoveryReport> {
+    run_cross_store_recovery(storage, bm25, namespace, true).await
 }
 
 /// Compute SHA256 hash of content and return as hex string
@@ -1467,6 +1689,16 @@ impl RAGPipeline {
         self.storage.refresh().await
     }
 
+    /// Best-effort cross-store write:
+    /// 1. persist a recovery ledger for the batch,
+    /// 2. write LanceDB,
+    /// 3. sync BM25,
+    /// 4. clear the ledger on success.
+    ///
+    /// Same-process BM25 failures still trigger Lance rollback, but this is not
+    /// crash-safe atomicity. If the process dies between steps, operators must
+    /// reconcile with the explicit `repair-writes` surface rather than assuming
+    /// rollback already made both stores truthful.
     async fn persist_documents(&self, documents: Vec<ChromaDocument>) -> Result<()> {
         if documents.is_empty() {
             return Ok(());
@@ -1512,18 +1744,70 @@ impl RAGPipeline {
             .iter()
             .map(|doc| (doc.namespace.clone(), doc.id.clone()))
             .collect();
+        let mut recovery_batch = self
+            .bm25_writer
+            .as_ref()
+            .map(|_| CrossStoreRecoveryBatch::from_documents(&documents));
+        let recovery_path = if let Some(batch) = recovery_batch.as_ref() {
+            Some(self.storage.persist_cross_store_recovery_batch(batch)?)
+        } else {
+            None
+        };
 
-        self.storage.add_to_store(documents).await?;
-
-        if let Some(bm25_writer) = &self.bm25_writer
-            && let Err(error) = bm25_writer.add_documents(&bm25_documents).await
-        {
-            for (namespace, id) in &inserted_ids {
-                let _ = self.storage.delete_document(namespace, id).await;
+        if let Err(error) = self.storage.add_to_store(documents).await {
+            if let (Some(batch), Some(path)) = (recovery_batch.as_mut(), recovery_path.as_ref()) {
+                batch.last_error = Some(format!("Lance write failed: {error}"));
+                let _ = self.storage.update_cross_store_recovery_batch(batch);
+                return Err(anyhow!(
+                    "Lance write failed while cross-store recovery ledger was active at {}: {}. \
+                     This path is not crash-safe; run `rmcp-memex repair-writes --execute` to reconcile Lance/BM25 truth after investigating the primary failure.",
+                    path.display(),
+                    error
+                ));
             }
             return Err(error);
         }
 
+        if let Some(bm25_writer) = &self.bm25_writer
+            && let Err(error) = bm25_writer.add_documents(&bm25_documents).await
+        {
+            let mut rollback_failures = 0usize;
+            for (namespace, id) in &inserted_ids {
+                if self.storage.delete_document(namespace, id).await.is_err() {
+                    rollback_failures += 1;
+                }
+            }
+
+            if let Some(batch) = recovery_batch.as_mut() {
+                batch.status = if rollback_failures == 0 {
+                    CrossStoreRecoveryStatus::RolledBack
+                } else {
+                    CrossStoreRecoveryStatus::Pending
+                };
+                batch.last_error = Some(format!(
+                    "BM25 write failed after Lance persist: {error}; lance_rollback_failures={rollback_failures}"
+                ));
+                let _ = self.storage.update_cross_store_recovery_batch(batch);
+            }
+
+            return Err(anyhow!(
+                "BM25 write failed after Lance persist: {}. Recovery ledger preserved at {}. \
+                 Same-process rollback attempted for {} documents and {} rollback operations failed. \
+                 This remains recoverable through `rmcp-memex repair-writes --execute`, but it is not the same as crash-safe cross-store atomicity.",
+                error,
+                recovery_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<not-recorded>".to_string()),
+                inserted_ids.len(),
+                rollback_failures
+            ));
+        }
+
+        if let Some(batch) = recovery_batch {
+            self.storage
+                .clear_cross_store_recovery_batch(&batch.batch_id)?;
+        }
         Ok(())
     }
 

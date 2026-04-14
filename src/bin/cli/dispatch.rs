@@ -166,7 +166,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             let _cache_mb = cli.cache_mb.or(cfg.file_cfg.cache_mb).unwrap_or(4096);
             let preprocess = preprocess || cfg.file_cfg.preprocessing_enabled.unwrap_or(false);
-            let slice_mode: SliceMode = slice_mode.parse().unwrap_or_default();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
 
             let result = run_batch_index(BatchIndexConfig {
                 path,
@@ -269,7 +274,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
                 }
             } else {
-                mode.parse().unwrap_or_default()
+                mode.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid search mode '{}'. Use one of: vector, keyword, hybrid, auto",
+                        mode
+                    )
+                })?
             };
 
             run_search(SearchConfig {
@@ -497,6 +507,14 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             };
             run_gc(gc_config, cfg.db_path, json).await
         }
+        Some(Commands::RepairWrites {
+            namespace,
+            execute,
+            json,
+        }) => {
+            let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
+            run_repair_writes(cfg.db_path, namespace, execute, json).await
+        }
         Some(Commands::CrossSearch {
             query,
             limit,
@@ -592,7 +610,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 .or(file_cfg.db_path)
                 .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
-            let slice_mode = slice_mode.parse().unwrap_or_default();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
             run_reprocess(
                 ReprocessConfig {
                     namespace,
@@ -623,7 +646,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 .or(file_cfg.db_path)
                 .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
-            let slice_mode = slice_mode.parse().unwrap_or_default();
+            let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid slice mode '{}'. Use one of: flat, onion, onion-fast",
+                    slice_mode
+                )
+            })?;
             let target_namespace =
                 target_namespace.unwrap_or_else(|| default_reindexed_namespace(&namespace));
             run_reindex(
