@@ -274,7 +274,12 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     SearchModeRecommendation::Hybrid => SearchMode::Hybrid,
                 }
             } else {
-                mode.parse().unwrap_or_default()
+                mode.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid search mode '{}'. Use one of: vector, keyword, hybrid, auto",
+                        mode
+                    )
+                })?
             };
 
             run_search(SearchConfig {
