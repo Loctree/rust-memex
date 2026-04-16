@@ -33,8 +33,8 @@ detect_target() {
 }
 
 default_sign_identity() {
-  if [[ -n "${RMCP_MEMEX_SIGN_IDENTITY:-}" ]]; then
-    printf "%s" "$RMCP_MEMEX_SIGN_IDENTITY"
+  if [[ -n "${RUST_MEMEX_SIGN_IDENTITY:-}" ]]; then
+    printf "%s" "$RUST_MEMEX_SIGN_IDENTITY"
     return
   fi
 
@@ -131,7 +131,7 @@ if [[ "$SIGN_MACOS" -eq 1 && "$TARGET" == *apple-darwin* ]]; then
     exit 1
   fi
   if [[ -z "$SIGN_IDENTITY" ]]; then
-    echo "error: no signing identity configured; set RMCP_MEMEX_SIGN_IDENTITY or ~/.keys/signing-identity.txt" >&2
+    echo "error: no signing identity configured; set RUST_MEMEX_SIGN_IDENTITY or ~/.keys/signing-identity.txt" >&2
     exit 1
   fi
 

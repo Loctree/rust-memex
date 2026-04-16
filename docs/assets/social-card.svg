@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
-  <title id="title">rmcp-memex social card</title>
-  <desc id="desc">Release-ready MCP memory kernel by VetCoders.</desc>
+  <title id="title">rust-memex social card</title>
+  <desc id="desc">Release-ready MCP memory kernel by Loctree.</desc>
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#101523"/>
@@ -17,7 +17,7 @@
   <circle cx="1040" cy="110" r="150" fill="#88b2d8" opacity="0.13"/>
   <rect x="84" y="92" width="1032" height="446" rx="28" fill="#141b2b" opacity="0.88" stroke="rgba(255,255,255,0.16)"/>
   <text x="120" y="170" fill="#f2a365" font-family="Avenir Next, Segoe UI, sans-serif" font-size="26" letter-spacing="6">RUST MCP KERNEL FOR SHARED AGENT MEMORY</text>
-  <text x="120" y="286" fill="#f4efe4" font-family="Georgia, serif" font-size="78">rmcp-memex</text>
+  <text x="120" y="286" fill="#f4efe4" font-family="Georgia, serif" font-size="78">rust-memex</text>
   <text x="120" y="360" fill="#d9d0c3" font-family="Avenir Next, Segoe UI, sans-serif" font-size="34">
     One canonical transport surface for stdio and HTTP/SSE.
   </text>
@@ -26,6 +26,6 @@
   </text>
   <rect x="120" y="470" width="420" height="54" rx="27" fill="url(#accent)"/>
   <text x="150" y="505" fill="#131017" font-family="Avenir Next, Segoe UI, sans-serif" font-size="28" font-weight="700">
-    github.com/VetCoders/rmcp-memex
+    github.com/Loctree/rust-memex
   </text>
 </svg>

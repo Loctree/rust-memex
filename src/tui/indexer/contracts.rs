@@ -159,7 +159,7 @@ pub struct WarningEntry {
 
 /// Shared watch sender for the latest telemetry snapshot.
 ///
-/// This mirrors the rmcp-mux `publish_status` pattern: writers can emit
+/// This mirrors the rust-mux `publish_status` pattern: writers can emit
 /// frequently while consumers always observe the newest coalesced snapshot.
 pub type SharedIndexTelemetry = watch::Sender<IndexTelemetrySnapshot>;
 

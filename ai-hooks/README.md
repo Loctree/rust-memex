@@ -48,4 +48,4 @@ Add to `~/.claude/settings.json`:
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 The LibraxisAI Team
+Vibecrafted with AI Agents by Loctree (c)2026 The LibraxisAI Team

@@ -1,4 +1,4 @@
-<!-- Copyright (c) 2025-2026 VetCoders (https://vetcoders.io) -->
+<!-- Copyright (c) 2025-2026 Loctree (https://loct.io) -->
 # Contributing
 
 Thanks for helping improve `rust-memex`.

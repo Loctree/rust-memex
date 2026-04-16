@@ -1,7 +1,7 @@
 # rust-memex Makefile
 # ============================================================================
 # Service management, build, and maintenance targets
-# Created by M&K (c)2026 VetCoders
+# Created by M&K (c)2026 Loctree
 # ============================================================================
 #
 # RAM DISK MODE (Dragon 512GB):

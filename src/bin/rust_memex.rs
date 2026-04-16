@@ -8,12 +8,12 @@
 // - HTTP/SSE: Multi-agent daemon mode
 //
 // `rust-memex` is the only supported binary name. The GitHub installer may
-// also create `rmcp_memex` as a legacy compatibility symlink for older scripts.
+// also create `rust_memex` as a legacy compatibility symlink for older scripts.
 //
 // Usage:
 //   rust-memex <command> [args]
 //
-// Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+// Vibecrafted with AI Agents by Vetcoders (c)2024-2026 Loctree
 
 use anyhow::Result;
 use clap::Parser;

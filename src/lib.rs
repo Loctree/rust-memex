@@ -30,8 +30,8 @@ use tracing::Level;
 pub use embeddings::{
     DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
     MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
-    cross_dimension_search_adapt, estimate_tokens, infer_embedding_dimension, safe_chunk_size,
-    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size, truncate_to_token_limit,
+    validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
 pub use mcp_core::{
@@ -61,6 +61,7 @@ pub use rag::{
     OnionSliceConfig,
     PipelineConfig,
     PipelineEvent,
+    PipelineGovernorConfig,
     PipelineResult,
     PipelineSnapshot,
     PipelineStats,
@@ -138,7 +139,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             cache_mb: 4096,
-            db_path: "~/.rmcp-servers/rmcp-memex/lancedb".to_string(),
+            db_path: "~/.rmcp-servers/rust-memex/lancedb".to_string(),
             max_request_bytes: 5 * 1024 * 1024,
             log_level: Level::INFO,
             allowed_paths: vec![],
@@ -176,7 +177,7 @@ mod lib_tests {
     fn default_config_has_expected_values() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.cache_mb, 4096);
-        assert_eq!(cfg.db_path, "~/.rmcp-servers/rmcp-memex/lancedb");
+        assert_eq!(cfg.db_path, "~/.rmcp-servers/rust-memex/lancedb");
         assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);
     }
 }

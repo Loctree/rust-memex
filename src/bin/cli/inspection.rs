@@ -20,16 +20,16 @@ fn parse_features(raw: &str) -> Vec<String> {
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
-    "~/.rmcp-servers/rmcp-memex/config.toml",
-    "~/.config/rmcp-memex/config.toml",
-    "~/.rmcp_servers/rmcp_memex/config.toml", // legacy underscore path
+    "~/.rmcp-servers/rust-memex/config.toml",
+    "~/.config/rust-memex/config.toml",
+    "~/.rmcp_servers/rust_memex/config.toml", // legacy underscore path
 ];
 
 /// Discover config file from standard locations
 #[allow(dead_code)]
 fn discover_config() -> Option<String> {
     // 1. Environment variable takes priority
-    if let Ok(path) = std::env::var("RMCP_MEMEX_CONFIG") {
+    if let Ok(path) = std::env::var("RUST_MEMEX_CONFIG") {
         let expanded = shellexpand::tilde(&path).to_string();
         if std::path::Path::new(&expanded).exists() {
             return Some(path);
@@ -203,7 +203,7 @@ pub async fn run_overview(
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
-        eprintln!("\n=== RMCP-MEMEX OVERVIEW ===\n");
+        eprintln!("\n=== RUST-MEMEX OVERVIEW ===\n");
         eprintln!("Database: {}", db_path);
         eprintln!("Total chunks: {}", all_docs.len());
         eprintln!("Namespaces: {}\n", stats_list.len());

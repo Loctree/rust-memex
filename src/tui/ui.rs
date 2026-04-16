@@ -221,7 +221,7 @@ fn settings_fields(app: &App) -> Vec<(&'static str, String, &'static str)> {
             if app.mux_proxy_on_path() {
                 "direct stdio or shared mux"
             } else {
-                "shared mux requires rmcp_mux_proxy on PATH"
+                "shared mux requires rust_mux_proxy on PATH"
             },
         ),
     ];
@@ -327,7 +327,7 @@ fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{:<20}", kind.label()), style),
                 Span::styled(
                     format!(" {} ", detection.status_text()),
-                    if detection.has_rmcp_memex {
+                    if detection.has_rust_memex {
                         Style::default().fg(Color::Green)
                     } else if detection.exists {
                         Style::default().fg(Color::Yellow)
@@ -631,10 +631,7 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
                     ProviderStatus::Offline => Color::DarkGray,
                 };
 
-                let dimension_note = provider
-                    .inferred_dimension()
-                    .map(|dim| format!("{dim} inferred"))
-                    .unwrap_or_else(|| "dimension probe required".to_string());
+                let dimension_note = "probe required".to_string();
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),

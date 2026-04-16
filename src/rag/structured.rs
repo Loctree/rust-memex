@@ -641,7 +641,7 @@ mod tests {
             "format": "claude_web",
             "role": "assistant",
             "title": "Pipeline progress",
-            "project": "VetCoders/rust-memex"
+            "project": "Loctree/rust-memex"
         });
         let content = "Decision: use semantic cards for outer retrieval. Next action: add JSON regression tests and keep plain-text fallback.";
 

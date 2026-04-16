@@ -2,12 +2,12 @@
 # rust-memex installer for prebuilt GitHub Release bundles
 # curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
 # or with a specific release tag:
-# RMCP_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
+# RUST_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/Loctree/rust-memex/main/install.sh | sh
 
 set -euo pipefail
 
-VERSION="${RMCP_MEMEX_VERSION:-latest}"
-INSTALL_DIR="${RMCP_MEMEX_INSTALL_DIR:-$HOME/.cargo/bin}"
+VERSION="${RUST_MEMEX_VERSION:-latest}"
+INSTALL_DIR="${RUST_MEMEX_INSTALL_DIR:-$HOME/.cargo/bin}"
 GITHUB_REPO="Loctree/rust-memex"
 BINARY_NAME="rust-memex"
 CHECKSUM_FILE="rust-memex-sha256sums.txt"
@@ -210,7 +210,7 @@ main() {
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
     install_compat_aliases "$INSTALL_DIR/$BINARY_NAME"
     success "Installed ${BINARY_NAME} to $INSTALL_DIR/$BINARY_NAME"
-    info "Legacy compatibility alias: $INSTALL_DIR/rust_memex"
+    info "Legacy compatibility alias: $INSTALL_DIR/rmcp_memex"
 
     installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null || echo "unknown")
     info "Installed version: $installed_version"

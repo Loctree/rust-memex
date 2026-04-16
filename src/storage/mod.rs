@@ -223,7 +223,7 @@ impl StorageManager {
         // Embedded LanceDB path (expand ~, allow override via env)
         let lance_env = std::env::var("LANCEDB_PATH").unwrap_or_else(|_| db_path.to_string());
         let lance_path = if lance_env.trim().is_empty() {
-            shellexpand::tilde("~/.rmcp-servers/rmcp-memex/lancedb").to_string()
+            shellexpand::tilde("~/.rmcp-servers/rust-memex/lancedb").to_string()
         } else {
             shellexpand::tilde(&lance_env).to_string()
         };

@@ -8,16 +8,16 @@ use rust_memex::{
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
-    "~/.rmcp-servers/rmcp-memex/config.toml",
-    "~/.config/rmcp-memex/config.toml",
-    "~/.rmcp_servers/rmcp_memex/config.toml", // legacy underscore path
+    "~/.rmcp-servers/rust-memex/config.toml",
+    "~/.config/rust-memex/config.toml",
+    "~/.rmcp_servers/rust_memex/config.toml", // legacy underscore path
 ];
 
 /// Discover config file from standard locations
 #[allow(dead_code)]
 fn discover_config() -> Option<String> {
     // 1. Environment variable takes priority
-    if let Ok(path) = std::env::var("RMCP_MEMEX_CONFIG") {
+    if let Ok(path) = std::env::var("RUST_MEMEX_CONFIG") {
         let expanded = shellexpand::tilde(&path).to_string();
         if std::path::Path::new(&expanded).exists() {
             return Some(path);
@@ -278,7 +278,7 @@ impl ResolvedConfig {
         let db_path = cli_db_path
             .map(|s| s.to_string())
             .or_else(|| file_cfg.db_path.clone())
-            .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
         let db_path = shellexpand::tilde(&db_path).to_string();
 
         Ok(Self {

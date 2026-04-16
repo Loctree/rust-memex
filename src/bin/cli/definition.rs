@@ -8,20 +8,19 @@ use rust_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
-
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
-    "~/.rmcp-servers/rmcp-memex/config.toml",
-    "~/.config/rmcp-memex/config.toml",
-    "~/.rmcp_servers/rmcp_memex/config.toml", // legacy underscore path
+    "~/.rmcp-servers/rust-memex/config.toml",
+    "~/.config/rust-memex/config.toml",
+    "~/.rmcp_servers/rust_memex/config.toml", // legacy underscore path
 ];
 
 /// Discover config file from standard locations
 #[allow(dead_code)]
 fn discover_config() -> Option<String> {
     // 1. Environment variable takes priority
-    if let Ok(path) = std::env::var("RMCP_MEMEX_CONFIG") {
+    if let Ok(path) = std::env::var("RUST_MEMEX_CONFIG") {
         let expanded = shellexpand::tilde(&path).to_string();
         if std::path::Path::new(&expanded).exists() {
             return Some(path);
@@ -71,7 +70,7 @@ use crate::cli::config::*;
     author,
     version,
     about = "rust-memex: custom Rust MCP kernel for RAG and long-term memory.\nCanonical entrypoint for stdio (native MCP) and HTTP/SSE (multi-agent) transports.",
-    long_about = "rust-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nrust-memex is the only supported binary name. The GitHub installer may also create rmcp_memex as a legacy compatibility symlink for older scripts."
+    long_about = "rust-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nrust-memex is the only supported binary name. The GitHub installer may also create rust_memex as a legacy compatibility symlink for older scripts."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -117,7 +116,7 @@ pub struct Cli {
     pub security_enabled: bool,
 
     /// Path to token store file for namespace access tokens.
-    /// Defaults to ~/.rmcp-servers/rmcp-memex/tokens.json when security is enabled.
+    /// Defaults to ~/.rmcp-servers/rust-memex/tokens.json when security is enabled.
     #[arg(long, global = true)]
     pub token_store_path: Option<String>,
 
@@ -291,6 +290,17 @@ pub enum Commands {
         /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
+
+        /// Maximum number of embedding requests to keep in flight in pipeline mode.
+        /// With --pipeline-governor disabled this is a fixed concurrency limit.
+        /// With --pipeline-governor enabled this becomes the governor's ceiling.
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=8))]
+        pipeline_embed_concurrency: u8,
+
+        /// Enable adaptive pipeline flow control for embedding batch sizes and concurrency.
+        /// Uses embed latency and queue pressure to increase slowly and back off quickly.
+        #[arg(long)]
+        pipeline_governor: bool,
 
         /// Number of files to process in parallel (default: 4, max: 16).
         /// Higher values can speed up indexing on multi-core systems,
@@ -1098,7 +1108,6 @@ mod tests {
         assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
         assert_eq!(config.allowed_paths, defaults.allowed_paths);
     }
-
     #[test]
     fn dashboard_command_parses_without_explicit_port() {
         let cli = Cli::parse_from(["rust-memex", "dashboard"]);

@@ -29,7 +29,7 @@
 //! - GET  /mcp/             - SSE stream for MCP messages (sends endpoint event)
 //! - POST /mcp/messages/    - JSON-RPC POST endpoint with session_id
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Loctree (c)2026 Loctree
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -434,7 +434,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </div>
 
         <footer>
-            rust-memex v{VERSION} | Vibecrafted with AI Agents by VetCoders &copy;2026 VetCoders
+            rust-memex v{VERSION} | Vibecrafted with AI Agents by Loctree &copy;2026 Loctree
         </footer>
     </div>
 

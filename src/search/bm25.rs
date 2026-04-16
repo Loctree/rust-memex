@@ -76,7 +76,7 @@ pub struct BM25Config {
 }
 
 fn default_bm25_path() -> String {
-    "~/.rmcp-servers/rmcp-memex/bm25".to_string()
+    "~/.rmcp-servers/rust-memex/bm25".to_string()
 }
 
 fn default_heap_size() -> usize {

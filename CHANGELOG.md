@@ -370,4 +370,4 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
+Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team

@@ -21,8 +21,8 @@ use crate::{
 pub mod pipeline;
 pub mod structured;
 pub use pipeline::{
-    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineResult,
-    PipelineSnapshot, PipelineStats, run_pipeline,
+    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineGovernorConfig,
+    PipelineResult, PipelineSnapshot, PipelineStats, run_pipeline,
 };
 
 const DEFAULT_NAMESPACE: &str = "rag";
@@ -3814,7 +3814,7 @@ mod tests {
             "vista"
         ));
         assert!(metadata_matches_project(
-            &json!({"project_id": "VetCoders"}),
+            &json!({"project_id": "Loctree"}),
             "vetcoders"
         ));
         assert!(!metadata_matches_project(
@@ -3829,7 +3829,7 @@ mod tests {
 
     #[test]
     fn markdown_transcript_extraction_builds_role_aware_turn_docs() {
-        let raw = r#"[project: VetCoders/vibecrafted | agent: codex | date: 2026-03-30]
+        let raw = r#"[project: Loctree/vibecrafted | agent: codex | date: 2026-03-30]
 
 [signals]
 Results:
@@ -3852,7 +3852,7 @@ Results:
         assert!(docs[1].1.contains("Reasoning focus:"));
         assert_eq!(docs[1].2["format"], "markdown_transcript");
         assert_eq!(docs[1].2["type"], "transcript_turn");
-        assert_eq!(docs[1].2["project"], "VetCoders/vibecrafted");
+        assert_eq!(docs[1].2["project"], "Loctree/vibecrafted");
     }
 
     #[test]
@@ -3882,7 +3882,7 @@ Results:
         let metadata = json!({
             "type": "transcript_turn",
             "format": "markdown_transcript",
-            "project": "VetCoders/rust-memex",
+            "project": "Loctree/rust-memex",
             "agent": "codex"
         });
         let config = OnionSliceConfig {
@@ -3909,7 +3909,7 @@ Results:
     #[test]
     fn json_conversation_docs_flow_through_structured_semantic_slices() {
         let conversation = json!({
-            "project": "VetCoders/rust-memex",
+            "project": "Loctree/rust-memex",
             "sessions": [
                 {
                     "info": {

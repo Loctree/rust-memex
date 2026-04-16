@@ -161,6 +161,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             progress,
             resume,
             pipeline,
+            pipeline_embed_concurrency,
+            pipeline_governor,
             parallel,
         }) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
@@ -188,6 +190,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 show_progress: progress,
                 resume,
                 pipeline,
+                pipeline_embed_concurrency,
+                pipeline_governor,
                 parallel,
             })
             .await;
@@ -341,7 +345,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = cmd_db_path
                 .or(cli.db_path)
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
             run_export(namespace, output, include_embeddings, db_path).await
         }
@@ -590,7 +594,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = cmd_db_path
                 .or(cli.db_path)
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
             run_import(namespace, input, skip_existing, db_path, &embedding_config).await
         }
@@ -608,7 +612,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = cmd_db_path
                 .or(cli.db_path)
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
             let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
                 anyhow::anyhow!(
@@ -644,7 +648,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let db_path = cmd_db_path
                 .or(cli.db_path)
                 .or(file_cfg.db_path)
-                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+                .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
             let db_path = shellexpand::tilde(&db_path).to_string();
             let slice_mode: SliceMode = slice_mode.parse().map_err(|_| {
                 anyhow::anyhow!(

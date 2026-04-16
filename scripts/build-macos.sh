@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY_NAME="rust-memex"
-APP_DIR="${RMCP_MEMEX_APP_DIR:-$HOME/.mcp-servers/rust-memex.app}"
+APP_DIR="${RUST_MEMEX_APP_DIR:-$HOME/.mcp-servers/rust-memex.app}"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$REPO_ROOT/Cargo.toml")"
-SIGN_IDENTITY="${RMCP_MEMEX_SIGN_IDENTITY:-}"
+SIGN_IDENTITY="${RUST_MEMEX_SIGN_IDENTITY:-}"
 
 if [[ -z "$SIGN_IDENTITY" && -f "$HOME/.keys/signing-identity.txt" ]]; then
   SIGN_IDENTITY="$(head -n 1 "$HOME/.keys/signing-identity.txt")"

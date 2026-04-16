@@ -4,8 +4,7 @@
 //! Implements the new wizard flow with EmbedderSetup as the first configuration step.
 
 use crate::embeddings::{
-    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, infer_embedding_dimension,
-    probe_provider_dimension,
+    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, probe_provider_dimension,
 };
 use crate::tui::detection::{
     DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
@@ -38,7 +37,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 const DEFAULT_INDEX_PARALLELISM: usize = 4;
-const DEFAULT_MEMEX_CONFIG_PATH: &str = "~/.rmcp-servers/rmcp-memex/config.toml";
+const DEFAULT_MEMEX_CONFIG_PATH: &str = "~/.rmcp-servers/rust-memex/config.toml";
 
 /// Configuration for running the wizard.
 #[derive(Debug, Clone, Default)]
@@ -121,10 +120,8 @@ impl WizardStep {
 /// How trustworthy the currently selected embedding dimension is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DimensionTruth {
-    /// Built-in fallback only; no reliable model-specific signal yet.
-    Default,
-    /// Derived from a recognized model name.
-    Inferred,
+    /// No verified dimension yet — requires probe or manual entry.
+    Pending,
     /// Verified by a live embedding probe against the provider.
     Probed,
     /// Explicitly set by the operator.
@@ -167,7 +164,7 @@ impl Default for EmbedderState {
             manual_url: "http://localhost:11434".to_string(),
             manual_model: String::new(),
             dimension: DEFAULT_REQUIRED_DIMENSION,
-            dimension_truth: DimensionTruth::Default,
+            dimension_truth: DimensionTruth::Pending,
             dimension_probe_in_flight: false,
             dimension_probe_error: None,
             pending_dimension_probe: None,
@@ -209,20 +206,12 @@ impl EmbedderState {
     }
 
     pub fn dimension_display(&self) -> String {
-        if self.dimension_probe_in_flight && matches!(self.dimension_truth, DimensionTruth::Default)
-        {
+        if self.dimension_probe_in_flight {
             return "probing...".to_string();
         }
 
         let suffix = match self.dimension_truth {
-            DimensionTruth::Default => "placeholder",
-            DimensionTruth::Inferred => {
-                if self.dimension_probe_in_flight {
-                    "inferred; probing"
-                } else {
-                    "inferred"
-                }
-            }
+            DimensionTruth::Pending => "pending",
             DimensionTruth::Probed => "probed",
             DimensionTruth::Manual => "manual",
         };
@@ -233,55 +222,38 @@ impl EmbedderState {
     /// Get dimension explanation text
     pub fn dimension_hint(&self) -> String {
         if self.dimension_probe_in_flight {
-            return match self.dimension_truth {
-                DimensionTruth::Inferred => format!(
-                    "Inferred from the model name and now verifying against the live provider. {}",
-                    dimension_explanation(self.dimension, self.selected_model().as_deref())
-                ),
-                _ => "No reliable heuristic for this model yet; probing the provider for the actual vector size.".to_string(),
-            };
+            return "Probing the provider for the actual vector size.".to_string();
         }
 
         if let Some(error) = &self.dimension_probe_error {
             let concise_error = error.lines().next().unwrap_or(error).trim();
             return match self.dimension_truth {
-                DimensionTruth::Inferred => format!(
-                    "Live probe failed, so the wizard is keeping the inferred dimension for now. Re-run Health Check before shipping this config. Probe error: {concise_error}"
-                ),
                 DimensionTruth::Manual => format!(
                     "Manual override is active. Probe failed, but the operator-supplied dimension will be used. Probe error: {concise_error}"
                 ),
                 _ => format!(
-                    "Live probe failed and there is no trustworthy fallback yet. Run Health Check or set the dimension manually before writing config. Probe error: {concise_error}"
+                    "Live probe failed. Run Health Check or set the dimension manually before writing config. Probe error: {concise_error}"
                 ),
             };
         }
 
         match self.dimension_truth {
-            DimensionTruth::Default => {
+            DimensionTruth::Pending => {
                 if let Some(model) = self.selected_model() {
                     format!(
-                        "No trustworthy dimension has been established for `{model}` yet. {}",
-                        dimension_explanation(self.dimension, self.selected_model().as_deref())
+                        "No verified dimension for `{model}` yet. Run a probe or enter the dimension manually."
                     )
                 } else {
-                    format!(
-                        "Select an embedding model or enter one manually. {}",
-                        dimension_explanation(self.dimension, self.selected_model().as_deref())
-                    )
+                    "Select an embedding model or enter one manually.".to_string()
                 }
             }
-            DimensionTruth::Inferred => format!(
-                "Derived from the model name. Health Check can still verify it live. {}",
-                dimension_explanation(self.dimension, self.selected_model().as_deref())
-            ),
             DimensionTruth::Probed => format!(
-                "Verified live against the provider response. {}",
-                dimension_explanation(self.dimension, self.selected_model().as_deref())
+                "Verified live against the provider. {}",
+                dimension_explanation(self.dimension)
             ),
             DimensionTruth::Manual => format!(
                 "Set manually by the operator. {}",
-                dimension_explanation(self.dimension, self.selected_model().as_deref())
+                dimension_explanation(self.dimension)
             ),
         }
     }
@@ -294,10 +266,10 @@ impl EmbedderState {
         }
 
         match self.dimension_truth {
-            DimensionTruth::Default => Some(
-                "Embedding dimension is still a placeholder. Pick a recognized model, let the live probe succeed, or enter the dimension manually before writing config.".to_string(),
+            DimensionTruth::Pending => Some(
+                "Embedding dimension has not been verified. Let the live probe succeed or enter the dimension manually before writing config.".to_string(),
             ),
-            DimensionTruth::Inferred | DimensionTruth::Probed | DimensionTruth::Manual => None,
+            DimensionTruth::Probed | DimensionTruth::Manual => None,
         }
     }
 
@@ -340,22 +312,14 @@ impl EmbedderState {
     fn refresh_manual_dimension_state(&mut self) {
         self.selected_provider = None;
         self.dimension_probe_error = None;
+        self.dimension = DEFAULT_REQUIRED_DIMENSION;
+        self.dimension_truth = DimensionTruth::Pending;
 
         let model = self.manual_model.trim();
         if model.is_empty() {
-            self.dimension = DEFAULT_REQUIRED_DIMENSION;
-            self.dimension_truth = DimensionTruth::Default;
             self.pending_dimension_probe = None;
             self.dimension_probe_in_flight = false;
             return;
-        }
-
-        if let Some(dim) = infer_embedding_dimension(model) {
-            self.dimension = dim;
-            self.dimension_truth = DimensionTruth::Inferred;
-        } else {
-            self.dimension = DEFAULT_REQUIRED_DIMENSION;
-            self.dimension_truth = DimensionTruth::Default;
         }
 
         if let Some(provider) = self.current_provider_config() {
@@ -376,18 +340,8 @@ impl EmbedderState {
         self.use_manual = false;
         self.selected_provider = Some(provider);
         self.dimension_probe_error = None;
-
-        if let Some(dim) = self
-            .selected_provider
-            .as_ref()
-            .and_then(DetectedProvider::inferred_dimension)
-        {
-            self.dimension = dim;
-            self.dimension_truth = DimensionTruth::Inferred;
-        } else {
-            self.dimension = DEFAULT_REQUIRED_DIMENSION;
-            self.dimension_truth = DimensionTruth::Default;
-        }
+        self.dimension = DEFAULT_REQUIRED_DIMENSION;
+        self.dimension_truth = DimensionTruth::Pending;
 
         if let Some(provider) = self.current_provider_config() {
             self.schedule_dimension_probe(provider);
@@ -507,7 +461,7 @@ pub struct MemexCfg {
     pub db_path_mode: DbPathMode,
     /// HTTP/SSE server port (None = disabled, Some(port) = enabled)
     pub http_port: Option<u16>,
-    /// Whether hosts launch rust-memex directly or via rmcp_mux_proxy.
+    /// Whether hosts launch rust-memex directly or via rust_mux_proxy.
     pub deployment_mode: DeploymentMode,
 }
 
@@ -590,7 +544,7 @@ pub struct App {
 }
 
 fn which_mux_proxy() -> Option<String> {
-    which_binary(&["rmcp_mux_proxy", "rmcp-mux-proxy"])
+    which_binary(&["rust_mux_proxy", "rust-mux-proxy"])
 }
 
 impl App {
@@ -605,7 +559,7 @@ impl App {
     fn required_mux_proxy_command(&self) -> Result<&str> {
         self.mux_proxy_command().ok_or_else(|| {
             anyhow!(
-                "Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before writing host configs."
+                "Shared mux mode requires `rust_mux_proxy` or `rust-mux-proxy` on PATH before writing host configs."
             )
         })
     }
@@ -617,7 +571,7 @@ impl App {
                     DeploymentMode::SharedMux
                 } else {
                     self.messages.push(
-                        "[WARN] Shared mux mode is unavailable until `rmcp_mux_proxy` or `rmcp-mux-proxy` is on PATH.".to_string(),
+                        "[WARN] Shared mux mode is unavailable until `rust_mux_proxy` or `rust-mux-proxy` is on PATH.".to_string(),
                     );
                     DeploymentMode::PerHostStdio
                 }
@@ -741,7 +695,7 @@ impl App {
                             )
                         })
                         .unwrap_or_else(|| {
-                            "Shared mux unavailable: install `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before generating host snippets.".to_string()
+                            "Shared mux unavailable: install `rust_mux_proxy` or `rust-mux-proxy` on PATH before generating host snippets.".to_string()
                         }),
                 };
                 (*kind, snippet)
@@ -880,7 +834,7 @@ impl App {
                 }
                 Err(error) => {
                     self.messages
-                        .push(format!("[ERR] rmcp-mux service config failed: {}", error));
+                        .push(format!("[ERR] rust-mux service config failed: {}", error));
                     return Err(error);
                 }
             }
@@ -944,7 +898,7 @@ impl App {
             ));
             if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
                 self.messages.push(format!(
-                    "Start the shared daemon with: rmcp_mux --config {} --service {}",
+                    "Start the shared daemon with: rust_mux --config {} --service {}",
                     DEFAULT_MUX_CONFIG_PATH, DEFAULT_MUX_SERVICE_NAME
                 ));
             }
@@ -1990,12 +1944,12 @@ mod tests {
     }
 
     #[test]
-    fn detected_provider_selection_infers_dimension_and_queues_probe() {
+    fn detected_provider_selection_queues_probe_as_pending() {
         let mut state = EmbedderState::default();
         state.apply_detected_provider(detected_provider("qwen3-embedding:8b"));
 
-        assert_eq!(state.dimension, 4096);
-        assert_eq!(state.dimension_truth, DimensionTruth::Inferred);
+        assert_eq!(state.dimension, DEFAULT_REQUIRED_DIMENSION);
+        assert_eq!(state.dimension_truth, DimensionTruth::Pending);
         assert!(state.dimension_probe_in_flight);
         assert!(state.pending_dimension_probe.is_some());
         assert!(state.dimension_write_blocker().is_some());
@@ -2029,7 +1983,7 @@ mod tests {
 
         state.refresh_manual_dimension_state();
 
-        assert_eq!(state.dimension_truth, DimensionTruth::Default);
+        assert_eq!(state.dimension_truth, DimensionTruth::Pending);
         assert!(state.dimension_write_blocker().is_some());
     }
 
@@ -2068,7 +2022,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH")
+                .contains("Shared mux mode requires `rust_mux_proxy` or `rust-mux-proxy` on PATH")
         );
     }
 
@@ -2095,7 +2049,7 @@ mod tests {
     #[test]
     fn deployment_mode_toggle_with_proxy_enables_shared_mux() {
         let mut app = App::new(WizardConfig::default());
-        app.mux_proxy_command = Some("/usr/local/bin/rmcp-mux-proxy".to_string());
+        app.mux_proxy_command = Some("/usr/local/bin/rust-mux-proxy".to_string());
 
         app.set_field_value(6, String::new());
 

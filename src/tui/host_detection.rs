@@ -22,11 +22,11 @@ pub struct McpServerEntry {
     pub env: HashMap<String, String>,
 }
 
-pub const DEFAULT_MUX_SERVICE_NAME: &str = "rmcp-memex";
-pub const DEFAULT_MUX_SOCKET_PATH: &str = "~/.rmcp-servers/rmcp-memex/sockets/main.sock";
-pub const DEFAULT_MUX_CONFIG_PATH: &str = "~/.rmcp-servers/rmcp-memex/mux_config.toml";
-const DEFAULT_MUX_STATUS_PATH: &str = "~/.rmcp-servers/rmcp-memex/status/main.json";
-const RMCP_MEMEX_SERVER_NAME: &str = "rmcp_memex";
+pub const DEFAULT_MUX_SERVICE_NAME: &str = "rust-memex";
+pub const DEFAULT_MUX_SOCKET_PATH: &str = "~/.rmcp-servers/rust-memex/sockets/main.sock";
+pub const DEFAULT_MUX_CONFIG_PATH: &str = "~/.rmcp-servers/rust-memex/mux_config.toml";
+const DEFAULT_MUX_STATUS_PATH: &str = "~/.rmcp-servers/rust-memex/status/main.json";
+const RUST_MEMEX_SERVER_NAME: &str = "rust_memex";
 const MUX_MAX_ACTIVE_CLIENTS: usize = 5;
 const MUX_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const MUX_RESTART_BACKOFF_MS: u64 = 1_000;
@@ -62,7 +62,7 @@ pub struct HostDetection {
     pub path: PathBuf,
     pub format: HostFormat,
     pub exists: bool,
-    pub has_rmcp_memex: bool,
+    pub has_rust_memex: bool,
     pub servers: Vec<McpServerEntry>,
 }
 
@@ -70,7 +70,7 @@ impl HostDetection {
     pub fn status_icon(&self) -> &'static str {
         if !self.exists {
             "[ ]"
-        } else if self.has_rmcp_memex {
+        } else if self.has_rust_memex {
             "[x]"
         } else {
             "[~]"
@@ -80,7 +80,7 @@ impl HostDetection {
     pub fn status_text(&self) -> &'static str {
         if !self.exists {
             "Not found"
-        } else if self.has_rmcp_memex {
+        } else if self.has_rust_memex {
             "Configured"
         } else {
             "Detected (no memex server entry)"
@@ -89,10 +89,10 @@ impl HostDetection {
 }
 
 fn matches_memex_server(entry: &McpServerEntry) -> bool {
-    entry.name.contains("rmcp_memex")
-        || entry.name.contains("rmcp-memex")
-        || entry.command.contains("rmcp_memex")
-        || entry.command.contains("rmcp-memex")
+    entry.name.contains("rust_memex")
+        || entry.name.contains("rust-memex")
+        || entry.command.contains("rust_memex")
+        || entry.command.contains("rust-memex")
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -298,7 +298,7 @@ fn detect_single_host(kind: HostKind) -> Option<HostDetection> {
     let (path, format) = get_host_config_path(kind)?;
     let exists = path.exists();
 
-    let (has_rmcp_memex, servers) = if exists {
+    let (has_rust_memex, servers) = if exists {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let servers = match format {
                 HostFormat::Toml => parse_toml_mcp_servers(&content),
@@ -318,7 +318,7 @@ fn detect_single_host(kind: HostKind) -> Option<HostDetection> {
         path,
         format,
         exists,
-        has_rmcp_memex,
+        has_rust_memex,
         servers,
     })
 }
@@ -356,7 +356,7 @@ fn proxy_command_args(sock_path: &str) -> Vec<String> {
 
 fn build_server_entry(command: &str, args: Vec<String>) -> McpServerEntry {
     McpServerEntry {
-        name: RMCP_MEMEX_SERVER_NAME.to_string(),
+        name: RUST_MEMEX_SERVER_NAME.to_string(),
         command: command.to_string(),
         args,
         env: HashMap::new(),
@@ -376,8 +376,8 @@ fn build_mux_host_entry(proxy_command: &str, sock_path: &str) -> McpServerEntry 
 }
 
 fn entry_description(entry: &McpServerEntry) -> &'static str {
-    if entry.command.contains("rmcp_mux_proxy") || entry.command.contains("rmcp-mux-proxy") {
-        "RAG memory via shared rmcp-mux proxy"
+    if entry.command.contains("rust_mux_proxy") || entry.command.contains("rust-mux-proxy") {
+        "RAG memory via shared rust-mux proxy"
     } else {
         "RAG memory with vector search"
     }
@@ -526,7 +526,7 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
     Ok(safe_dst)
 }
 
-/// Merge the rmcp_memex host entry into existing JSON config.
+/// Merge the rust_memex host entry into existing JSON config.
 fn merge_json_config(existing_content: &str, entry: &McpServerEntry) -> Result<String> {
     let mut config: serde_json::Value = if existing_content.trim().is_empty() {
         serde_json::json!({})
@@ -540,13 +540,13 @@ fn merge_json_config(existing_content: &str, entry: &McpServerEntry) -> Result<S
         config["mcpServers"] = serde_json::json!({});
     }
 
-    // Add or update rmcp_memex entry
+    // Add or update rust_memex entry
     config["mcpServers"][entry.name.as_str()] = json_server_config(entry);
 
     serde_json::to_string_pretty(&config).with_context(|| "Failed to serialize JSON config")
 }
 
-/// Merge the rmcp_memex host entry into existing TOML config.
+/// Merge the rust_memex host entry into existing TOML config.
 fn merge_toml_config(existing_content: &str, entry: &McpServerEntry) -> Result<String> {
     let mut config: toml::Value = if existing_content.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
@@ -565,7 +565,7 @@ fn merge_toml_config(existing_content: &str, entry: &McpServerEntry) -> Result<S
         );
     }
 
-    // Add or update rmcp_memex entry
+    // Add or update rust_memex entry
     if let Some(mcp_servers) = table.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
         mcp_servers.insert(entry.name.clone(), toml_server_config(entry));
     }
@@ -671,7 +671,7 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
     for ext_kind in [ExtendedHostKind::ClaudeCode, ExtendedHostKind::Junie] {
         if let Some((path, format)) = get_extended_host_config_path(ext_kind) {
             let exists = path.exists();
-            let (has_rmcp_memex, servers) = if exists {
+            let (has_rust_memex, servers) = if exists {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let servers = parse_json_mcp_servers(&content);
                     let has_rmcp = servers.iter().any(matches_memex_server);
@@ -690,7 +690,7 @@ pub fn detect_extended_hosts() -> Vec<(ExtendedHostKind, HostDetection)> {
                     path,
                     format,
                     exists,
-                    has_rmcp_memex,
+                    has_rust_memex,
                     servers,
                 },
             ));
@@ -822,7 +822,7 @@ pub fn write_mux_service_config(
     })?;
 
     Ok(WriteResult {
-        host_name: "rmcp-mux service".to_string(),
+        host_name: "rust-mux service".to_string(),
         config_path: config_file,
         backup_path,
         created: !exists,
@@ -836,8 +836,8 @@ mod tests {
     #[test]
     fn test_parse_toml_mcp_servers() {
         let toml_content = r#"
-[mcp_servers.rmcp_memex]
-command = "/usr/local/bin/rmcp_memex"
+[mcp_servers.rust_memex]
+command = "/usr/local/bin/rust_memex"
 args = ["--db-path", "~/.rmcp/db"]
 
 [mcp_servers.other_server]
@@ -845,29 +845,29 @@ command = "other"
 "#;
         let servers = parse_toml_mcp_servers(toml_content);
         assert_eq!(servers.len(), 2);
-        assert!(servers.iter().any(|s| s.name == "rmcp_memex"));
+        assert!(servers.iter().any(|s| s.name == "rust_memex"));
     }
 
     #[test]
     fn test_parse_json_mcp_servers() {
         let json_content = r#"{
   "mcpServers": {
-    "rmcp_memex": {
-      "command": "/usr/local/bin/rmcp_memex",
+    "rust_memex": {
+      "command": "/usr/local/bin/rust_memex",
       "args": ["--db-path", "~/.rmcp/db"]
     }
   }
 }"#;
         let servers = parse_json_mcp_servers(json_content);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "rmcp_memex");
+        assert_eq!(servers[0].name, "rust_memex");
     }
 
     #[test]
     fn test_matches_memex_server_accepts_canonical_binary_name() {
         let entry = McpServerEntry {
             name: "custom".to_string(),
-            command: "/usr/local/bin/rmcp-memex".to_string(),
+            command: "/usr/local/bin/rust-memex".to_string(),
             args: vec!["serve".to_string()],
             env: HashMap::new(),
         };
@@ -879,12 +879,12 @@ command = "other"
     fn test_generate_toml_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Codex),
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             None,
         );
-        assert!(snippet.contains("[mcp_servers.rmcp_memex]"));
-        assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("[mcp_servers.rust_memex]"));
+        assert!(snippet.contains("/usr/bin/rust-memex"));
         assert!(snippet.contains("--config"));
     }
 
@@ -892,13 +892,13 @@ command = "other"
     fn test_generate_json_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Claude),
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             None,
         );
         assert!(snippet.contains("\"mcpServers\""));
-        assert!(snippet.contains("\"rmcp_memex\""));
-        assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("\"rust_memex\""));
+        assert!(snippet.contains("/usr/bin/rust-memex"));
         assert!(snippet.contains("--config"));
     }
 
@@ -906,13 +906,13 @@ command = "other"
     fn test_generate_extended_claude_code_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::ClaudeCode,
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             None,
         );
         assert!(snippet.contains("\"mcpServers\""));
-        assert!(snippet.contains("\"rmcp_memex\""));
-        assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("\"rust_memex\""));
+        assert!(snippet.contains("/usr/bin/rust-memex"));
         assert!(snippet.contains("--config"));
     }
 
@@ -920,13 +920,13 @@ command = "other"
     fn test_generate_extended_junie_snippet() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Junie,
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             None,
         );
         assert!(snippet.contains("\"mcpServers\""));
-        assert!(snippet.contains("\"rmcp_memex\""));
-        assert!(snippet.contains("/usr/bin/rmcp-memex"));
+        assert!(snippet.contains("\"rust_memex\""));
+        assert!(snippet.contains("/usr/bin/rust-memex"));
         assert!(snippet.contains("--config"));
     }
 
@@ -934,8 +934,8 @@ command = "other"
     fn test_generate_json_snippet_includes_http_port_when_requested() {
         let snippet = generate_extended_snippet(
             ExtendedHostKind::Standard(HostKind::Claude),
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             Some(8765),
         );
         assert!(snippet.contains("--http-port"));
@@ -947,18 +947,18 @@ command = "other"
         let result = merge_json_config(
             "",
             &build_direct_host_entry(
-                "/usr/bin/rmcp-memex",
-                "~/.rmcp-servers/rmcp-memex/config.toml",
+                "/usr/bin/rust-memex",
+                "~/.rmcp-servers/rust-memex/config.toml",
                 None,
             ),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
-            parsed["mcpServers"]["rmcp_memex"]["command"]
+            parsed["mcpServers"]["rust_memex"]["command"]
                 .as_str()
                 .unwrap()
-                .contains("rmcp-memex")
+                .contains("rust-memex")
         );
     }
 
@@ -967,14 +967,14 @@ command = "other"
         let result = merge_json_config(
             "",
             &build_direct_host_entry(
-                "/usr/bin/rmcp-memex",
-                "~/.rmcp-servers/rmcp-memex/config.toml",
+                "/usr/bin/rust-memex",
+                "~/.rmcp-servers/rust-memex/config.toml",
                 Some(8765),
             ),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let args = parsed["mcpServers"]["rmcp_memex"]["args"]
+        let args = parsed["mcpServers"]["rust_memex"]["args"]
             .as_array()
             .unwrap()
             .iter()
@@ -987,7 +987,7 @@ command = "other"
                 "--http-port",
                 "8765",
                 "--config",
-                "~/.rmcp-servers/rmcp-memex/config.toml"
+                "~/.rmcp-servers/rust-memex/config.toml"
             ]
         );
     }
@@ -1005,8 +1005,8 @@ command = "other"
         let result = merge_json_config(
             existing,
             &build_direct_host_entry(
-                "/usr/bin/rmcp-memex",
-                "~/.rmcp-servers/rmcp-memex/config.toml",
+                "/usr/bin/rust-memex",
+                "~/.rmcp-servers/rust-memex/config.toml",
                 None,
             ),
         )
@@ -1018,12 +1018,12 @@ command = "other"
                 .as_str()
                 .is_some()
         );
-        // Should add rmcp_memex
+        // Should add rust_memex
         assert!(
-            parsed["mcpServers"]["rmcp_memex"]["command"]
+            parsed["mcpServers"]["rust_memex"]["command"]
                 .as_str()
                 .unwrap()
-                .contains("rmcp-memex")
+                .contains("rust-memex")
         );
     }
 
@@ -1032,14 +1032,14 @@ command = "other"
         let result = merge_toml_config(
             "",
             &build_direct_host_entry(
-                "/usr/bin/rmcp-memex",
-                "~/.rmcp-servers/rmcp-memex/config.toml",
+                "/usr/bin/rust-memex",
+                "~/.rmcp-servers/rust-memex/config.toml",
                 None,
             ),
         )
         .unwrap();
-        assert!(result.contains("[mcp_servers.rmcp_memex]"));
-        assert!(result.contains("rmcp-memex"));
+        assert!(result.contains("[mcp_servers.rust_memex]"));
+        assert!(result.contains("rust-memex"));
         assert!(result.contains("--config"));
     }
 
@@ -1053,16 +1053,16 @@ args = []
         let result = merge_toml_config(
             existing,
             &build_direct_host_entry(
-                "/usr/bin/rmcp-memex",
-                "~/.rmcp-servers/rmcp-memex/config.toml",
+                "/usr/bin/rust-memex",
+                "~/.rmcp-servers/rust-memex/config.toml",
                 None,
             ),
         )
         .unwrap();
         // Should preserve existing server
         assert!(result.contains("other_server"));
-        // Should add rmcp_memex
-        assert!(result.contains("rmcp-memex"));
+        // Should add rust_memex
+        assert!(result.contains("rust-memex"));
         assert!(result.contains("--config"));
     }
 
@@ -1070,10 +1070,10 @@ args = []
     fn test_generate_mux_snippet_uses_proxy_command() {
         let snippet = generate_extended_snippet_mux(
             ExtendedHostKind::Standard(HostKind::Claude),
-            "/custom/bin/rmcp-mux-proxy",
+            "/custom/bin/rust-mux-proxy",
             DEFAULT_MUX_SOCKET_PATH,
         );
-        assert!(snippet.contains("/custom/bin/rmcp-mux-proxy"));
+        assert!(snippet.contains("/custom/bin/rust-mux-proxy"));
         assert!(snippet.contains("--socket"));
         assert!(snippet.contains(DEFAULT_MUX_SOCKET_PATH));
     }
@@ -1081,21 +1081,21 @@ args = []
     #[test]
     fn test_build_mux_service_config_toml_uses_shared_daemon_shape() {
         let config = build_mux_service_config_toml(
-            "/usr/bin/rmcp-memex",
-            "~/.rmcp-servers/rmcp-memex/config.toml",
+            "/usr/bin/rust-memex",
+            "~/.rmcp-servers/rust-memex/config.toml",
             Some(8765),
             4_194_304,
             "debug",
         )
         .unwrap();
 
-        assert!(config.contains("[servers.rmcp-memex]"));
-        assert!(config.contains("socket = \"~/.rmcp-servers/rmcp-memex/sockets/main.sock\""));
-        assert!(config.contains("cmd = \"/usr/bin/rmcp-memex\""));
+        assert!(config.contains("[servers.rust-memex]"));
+        assert!(config.contains("socket = \"~/.rmcp-servers/rust-memex/sockets/main.sock\""));
+        assert!(config.contains("cmd = \"/usr/bin/rust-memex\""));
         assert!(config.contains("--http-port"));
         assert!(config.contains("8765"));
-        assert!(config.contains("status_file = \"~/.rmcp-servers/rmcp-memex/status/main.json\""));
-        assert!(config.contains("service_name = \"rmcp-memex\""));
+        assert!(config.contains("status_file = \"~/.rmcp-servers/rust-memex/status/main.json\""));
+        assert!(config.contains("service_name = \"rust-memex\""));
         assert!(config.contains("max_request_bytes = 4194304"));
     }
 

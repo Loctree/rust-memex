@@ -1,11 +1,11 @@
 [package]
 name = "rust-memex"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
-build = "src/build.rs"
+rust-version = "1.88"
+description = "Operator CLI + MCP server: canonical corpus second: semantic index second to aicx"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
-description = "Local semantic retrieval library: embedding + BM25 over LanceDB (Rust)"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
 repository = "https://github.com/Loctree/rust-memex"
 homepage = "https://github.com/Loctree/rust-memex"
 documentation = "https://docs.rs/rust-memex"
