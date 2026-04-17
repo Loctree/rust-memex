@@ -912,7 +912,7 @@ mod tests {
         ));
         assert!(matches_project_filter(
             &json!({"project_id": "Loctree"}),
-            "vetcoders"
+            "loctree"
         ));
         assert!(!matches_project_filter(
             &json!({"project": "rust-memex"}),
