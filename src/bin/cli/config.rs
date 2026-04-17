@@ -89,10 +89,37 @@ pub struct FileConfig {
     pub maintenance: Option<MaintenanceFileConfig>,
     /// Bearer token for HTTP auth (mutating endpoints)
     pub auth_token: Option<String>,
+    /// Optional dashboard-only OIDC configuration
+    #[serde(default)]
+    pub dashboard_oidc: Option<DashboardOidcFileConfig>,
     /// Bind address for HTTP server (default: 127.0.0.1)
     pub bind_address: Option<String>,
     /// Allowed CORS origins (comma-separated list)
     pub cors_origins: Option<String>,
+    /// Auth mode: "mutating-only", "all-routes", or "namespace-acl"
+    pub auth_mode: Option<String>,
+    /// Allow ?token= query parameter on read GETs
+    pub allow_query_token: Option<bool>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+pub struct DashboardOidcFileConfig {
+    pub issuer_url: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default = "default_dashboard_oidc_scopes")]
+    pub scopes: Vec<String>,
+}
+
+pub fn default_dashboard_oidc_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+    ]
 }
 
 /// New embedding configuration from TOML

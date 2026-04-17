@@ -272,6 +272,7 @@ fn jsonrpc_error_omits_id_when_none() {
 /// Build a McpCore backed by a temporary LanceDB + the configured embedding server.
 /// Returns None if the embedding server is unreachable (test should skip).
 async fn try_build_mcp_core() -> Option<McpCore> {
+    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
     use crate::{
         EmbeddingClient, EmbeddingConfig, ProviderConfig,
         rag::RAGPipeline,
@@ -316,6 +317,7 @@ async fn try_build_mcp_core() -> Option<McpCore> {
             .ok()?,
     );
 
+    #[allow(deprecated)]
     let access_manager = Arc::new(NamespaceAccessManager::new(
         NamespaceSecurityConfig::default(),
     ));
@@ -609,6 +611,7 @@ async fn health_tool_transport_field_difference_is_intentional() {
 /// Build an McpCore with a stub embedding client.
 /// These tests cover protocol dispatch paths that don't touch embeddings.
 async fn build_mcp_core_stub() -> McpCore {
+    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
     use crate::{
         EmbeddingClient,
         rag::RAGPipeline,
@@ -636,6 +639,7 @@ async fn build_mcp_core_stub() -> McpCore {
             .expect("RAGPipeline::new"),
     );
 
+    #[allow(deprecated)]
     let access_manager = Arc::new(NamespaceAccessManager::new(
         NamespaceSecurityConfig::default(),
     ));

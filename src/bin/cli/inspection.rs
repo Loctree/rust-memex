@@ -154,7 +154,7 @@ pub async fn run_overview(
             }
         }
         let mut top_keywords: Vec<_> = keyword_counts.into_iter().collect();
-        top_keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        top_keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_keywords: Vec<(String, usize)> = top_keywords.into_iter().take(10).collect();
 
         // Check for timestamps in metadata (look for common timestamp patterns)
@@ -203,7 +203,7 @@ pub async fn run_overview(
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
-        eprintln!("\n=== RUST-MEMEX OVERVIEW ===\n");
+        eprintln!("\n=== RMCP-MEMEX OVERVIEW ===\n");
         eprintln!("Database: {}", db_path);
         eprintln!("Total chunks: {}", all_docs.len());
         eprintln!("Namespaces: {}\n", stats_list.len());

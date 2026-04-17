@@ -42,6 +42,49 @@ Default dashboard URL:
 http://localhost:8987/
 ```
 
+## Auth Model
+
+- Bearer is the canonical auth contract for API, SSE, and MCP routes.
+- If `auth_mode = "all-routes"`, read routes also require auth.
+- Optional dashboard OIDC adds browser sessions for dashboard-facing routes only:
+  - `/`
+  - `/api/*`
+  - `/search`
+  - `/cross-search`
+  - `/expand/*`
+  - `/parent/*`
+  - `/get/*`
+- OIDC does not unlock MCP or agent-facing SSE routes. Those stay Bearer-only.
+
+Dashboard OIDC is configured in TOML or env:
+
+```toml
+auth_token = "replace-me"
+
+[dashboard_oidc]
+issuer_url = "https://issuer.example"
+client_id = "rust-memex-dashboard"
+client_secret = "optional-confidential-client-secret"
+public_base_url = "https://memex.example.com"
+scopes = ["openid", "profile", "email"]
+```
+
+Equivalent env vars:
+
+- `MEMEX_DASHBOARD_OIDC_ISSUER_URL`
+- `MEMEX_DASHBOARD_OIDC_CLIENT_ID`
+- `MEMEX_DASHBOARD_OIDC_CLIENT_SECRET`
+- `MEMEX_DASHBOARD_OIDC_PUBLIC_BASE_URL`
+- `MEMEX_DASHBOARD_OIDC_SCOPES` as a comma-separated list
+
+Public browser auth endpoints:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/auth/login` | GET | Start OIDC authorization code flow |
+| `/auth/callback` | GET | Complete OIDC login and set dashboard session cookie |
+| `/auth/logout` | GET | Clear dashboard session cookie |
+
 ## Canonical Discovery
 
 ### `GET /api/discovery`

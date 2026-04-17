@@ -653,6 +653,17 @@ allowed_paths = [
 # Security
 security_enabled = true
 token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
+
+# Optional: dashboard-only OIDC for browser users.
+# API / SSE / MCP still stay Bearer-authenticated via auth_token.
+auth_token = "replace-me"
+
+[dashboard_oidc]
+issuer_url = "https://issuer.example"
+client_id = "rust-memex-dashboard"
+client_secret = "optional-confidential-client-secret"
+public_base_url = "https://memex.example.com"
+scopes = ["openid", "profile", "email"]
 ```
 
 ## Documentation
