@@ -2,13 +2,12 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 use crate::{
     ServerConfig,
+    auth::AuthManager,
     embeddings::EmbeddingClient,
     mcp_core::McpCore,
     search::{BM25Index, HybridSearcher},
-    security::NamespaceAccessManager,
     storage::StorageManager,
 };
 
@@ -54,10 +53,19 @@ pub async fn build_mcp_core(config: ServerConfig) -> Result<Arc<McpCore>> {
             .await?,
     );
 
-    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
-    let access_manager = NamespaceAccessManager::new(config.security.clone());
-    access_manager.init().await?;
-    let access_manager = Arc::new(access_manager);
+    // Track C: build AuthManager from NamespaceSecurityConfig. When security
+    // is disabled we still wire up a manager (it's effectively a no-op with
+    // an empty store), so the MCP core never needs to branch on presence.
+    let store_path = config
+        .security
+        .token_store_path
+        .clone()
+        .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/tokens.json".to_string());
+    let auth_manager = AuthManager::new(store_path, None);
+    if config.security.enabled {
+        auth_manager.init().await?;
+    }
+    let auth_manager = Arc::new(auth_manager);
 
     Ok(Arc::new(McpCore::new(
         rag,
@@ -65,6 +73,6 @@ pub async fn build_mcp_core(config: ServerConfig) -> Result<Arc<McpCore>> {
         embedding_client,
         config.max_request_bytes,
         config.allowed_paths,
-        access_manager,
+        auth_manager,
     )))
 }

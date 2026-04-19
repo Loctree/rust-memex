@@ -272,11 +272,8 @@ fn jsonrpc_error_omits_id_when_none() {
 /// Build a McpCore backed by a temporary LanceDB + the configured embedding server.
 /// Returns None if the embedding server is unreachable (test should skip).
 async fn try_build_mcp_core() -> Option<McpCore> {
-    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
     use crate::{
-        EmbeddingClient, EmbeddingConfig, ProviderConfig,
-        rag::RAGPipeline,
-        security::{NamespaceAccessManager, NamespaceSecurityConfig},
+        EmbeddingClient, EmbeddingConfig, ProviderConfig, auth::AuthManager, rag::RAGPipeline,
         storage::StorageManager,
     };
     use std::sync::Arc;
@@ -308,6 +305,7 @@ async fn try_build_mcp_core() -> Option<McpCore> {
     let db_path = tmp.path().join(".lancedb");
     // Leak the tempdir so it outlives the test — the OS cleans up /tmp anyway
     let db_path_str = db_path.to_string_lossy().to_string();
+    let tokens_path = tmp.path().join("tokens.json").to_string_lossy().to_string();
     std::mem::forget(tmp);
 
     let storage = Arc::new(StorageManager::new(&db_path_str).await.ok()?);
@@ -317,11 +315,10 @@ async fn try_build_mcp_core() -> Option<McpCore> {
             .ok()?,
     );
 
-    #[allow(deprecated)]
-    let access_manager = Arc::new(NamespaceAccessManager::new(
-        NamespaceSecurityConfig::default(),
-    ));
-    let _ = access_manager.init().await;
+    // Track C: AuthManager persists to `tokens.json` in the tempdir. Matches
+    // the legacy "security disabled, open access" default (empty store),
+    // while still allowing create_token to succeed.
+    let auth_manager = Arc::new(AuthManager::new(tokens_path, None));
 
     Some(McpCore::new(
         rag,
@@ -329,7 +326,7 @@ async fn try_build_mcp_core() -> Option<McpCore> {
         embedding_client,
         5 * 1024 * 1024,
         vec![],
-        access_manager,
+        auth_manager,
     ))
 }
 
@@ -611,13 +608,7 @@ async fn health_tool_transport_field_difference_is_intentional() {
 /// Build an McpCore with a stub embedding client.
 /// These tests cover protocol dispatch paths that don't touch embeddings.
 async fn build_mcp_core_stub() -> McpCore {
-    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
-    use crate::{
-        EmbeddingClient,
-        rag::RAGPipeline,
-        security::{NamespaceAccessManager, NamespaceSecurityConfig},
-        storage::StorageManager,
-    };
+    use crate::{EmbeddingClient, auth::AuthManager, rag::RAGPipeline, storage::StorageManager};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -626,6 +617,9 @@ async fn build_mcp_core_stub() -> McpCore {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join(".lancedb");
     let db_path_str = db_path.to_string_lossy().to_string();
+    // Track C: AuthManager persists tokens to disk on create/revoke — give it
+    // a real tempdir path so save() doesn't error with an empty string.
+    let tokens_path = tmp.path().join("tokens.json").to_string_lossy().to_string();
     std::mem::forget(tmp);
 
     let storage = Arc::new(
@@ -639,11 +633,7 @@ async fn build_mcp_core_stub() -> McpCore {
             .expect("RAGPipeline::new"),
     );
 
-    #[allow(deprecated)]
-    let access_manager = Arc::new(NamespaceAccessManager::new(
-        NamespaceSecurityConfig::default(),
-    ));
-    let _ = access_manager.init().await;
+    let auth_manager = Arc::new(AuthManager::new(tokens_path, None));
 
     McpCore::new(
         rag,
@@ -651,7 +641,7 @@ async fn build_mcp_core_stub() -> McpCore {
         embedding_client,
         5 * 1024 * 1024,
         vec![],
-        access_manager,
+        auth_manager,
     )
 }
 

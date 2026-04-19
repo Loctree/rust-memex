@@ -3179,23 +3179,33 @@ pub async fn start_server(
         );
     }
 
-    // Log namespace security status when --security-enabled is active
-    #[allow(deprecated)]
-    // NamespaceAccessManager deprecated by Track C; still needed for diagnostics
-    if let Some(access_mgr) = mcp_core.access_manager() {
-        let protected = access_mgr.list_protected_namespaces().await;
-        if protected.is_empty() {
+    // Log namespace security status. Track C: auth manager is always present;
+    // "enabled" means at least one token is configured.
+    let auth_mgr = mcp_core.auth_manager();
+    if auth_mgr.has_any_tokens().await {
+        let tokens = auth_mgr.list_tokens().await;
+        let protected_namespaces: std::collections::BTreeSet<String> = tokens
+            .iter()
+            .flat_map(|entry| entry.namespaces.iter().cloned())
+            .filter(|ns| ns != "*")
+            .collect();
+        if protected_namespaces.is_empty() {
             warn!(
-                "Namespace security enabled but NO namespaces have tokens. All namespaces are unprotected."
+                "Namespace security enabled but NO per-namespace tokens configured (wildcard-only). All namespaces are covered by wildcard tokens."
             );
         } else {
             info!(
                 "Namespace security: {} namespace(s) with tokens:",
-                protected.len()
+                protected_namespaces.len()
             );
-            for (ns_name, _created, desc) in &protected {
-                let label = desc.as_deref().unwrap_or("(no description)");
-                info!("  - '{}' {}", ns_name, label);
+            for ns_name in &protected_namespaces {
+                // Pick any token that references this namespace for its description.
+                let desc = tokens
+                    .iter()
+                    .find(|entry| entry.namespaces.iter().any(|ns| ns == ns_name))
+                    .map(|entry| entry.description.as_str())
+                    .unwrap_or("(no description)");
+                info!("  - '{}' {}", ns_name, desc);
             }
         }
     }
@@ -3312,14 +3322,9 @@ pub async fn start_server(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::{
-        embeddings::EmbeddingClient,
-        security::{NamespaceAccessManager, NamespaceSecurityConfig},
-        storage::StorageManager,
-    };
+    use crate::{auth::AuthManager, embeddings::EmbeddingClient, storage::StorageManager};
     use axum::body::{Body, to_bytes};
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -3333,9 +3338,17 @@ mod tests {
                 .await
                 .expect("rag"),
         );
-        let access_manager = Arc::new(NamespaceAccessManager::new(
-            NamespaceSecurityConfig::default(),
-        ));
+        // Track C: AuthManager with a sibling token store path so that any
+        // create_token call during these HTTP tests can persist without
+        // erroring on an empty path. The legacy default (security disabled)
+        // is preserved by not pre-seeding any tokens.
+        let tokens_path = std::path::Path::new(db_path)
+            .parent()
+            .map(|p| p.join("tokens.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{}-tokens.json", db_path)))
+            .to_string_lossy()
+            .to_string();
+        let auth_manager = Arc::new(AuthManager::new(tokens_path, None));
 
         HttpState {
             rag: rag.clone(),
@@ -3345,7 +3358,7 @@ mod tests {
                 embedding_client,
                 1024 * 1024,
                 vec![],
-                access_manager,
+                auth_manager,
             )),
             mcp_sessions: Arc::new(McpSessionManager::new()),
             mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),

@@ -17,8 +17,9 @@ use crate::tui::host_detection::{
 };
 use crate::tui::indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
-    IndexEventSink, IndexTelemetrySnapshot, SharedIndexTelemetry, TracingSink, TuiTelemetrySink,
-    collect_indexable_files, import_lancedb, new_index_telemetry, start_indexing, validate_path,
+    IndexEventSink, IndexTelemetrySnapshot, IndexingJob, SharedIndexTelemetry, TracingSink,
+    TuiTelemetrySink, collect_indexable_files, import_lancedb, new_index_telemetry, start_indexing,
+    validate_path,
 };
 use crate::tui::monitor::{MonitorSnapshot, spawn_monitor};
 use anyhow::{Result, anyhow};
@@ -1546,14 +1547,16 @@ impl App {
             mpsc::channel(crate::tui::indexer::INDEX_CONTROL_CHANNEL_CAPACITY);
 
         self.index_task = Some(start_indexing(
-            path,
-            files,
-            namespace.clone(),
-            self.embedding_config.clone(),
-            self.memex_cfg.resolved_db_path(),
+            IndexingJob {
+                source_dir: path,
+                files,
+                namespace: namespace.clone(),
+                embedding_config: self.embedding_config.clone(),
+                db_path: self.memex_cfg.resolved_db_path(),
+                initial_parallelism: self.index_parallelism,
+            },
             sink,
             control_rx,
-            self.index_parallelism,
         ));
 
         let (monitor_rx, monitor_task) = spawn_monitor(Duration::from_secs(1));

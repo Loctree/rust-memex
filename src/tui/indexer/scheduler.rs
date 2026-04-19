@@ -90,19 +90,36 @@ impl SchedulerState {
     }
 }
 
+/// Parameters describing *what* to index and *how* (data + tuning).
+///
+/// Runtime wiring (event sink + control channel) is kept as separate
+/// arguments to `start_indexing` because those are caller-owned ownership
+/// handles rather than job configuration.
+pub struct IndexingJob {
+    pub source_dir: PathBuf,
+    pub files: Vec<PathBuf>,
+    pub namespace: String,
+    pub embedding_config: EmbeddingConfig,
+    pub db_path: String,
+    pub initial_parallelism: usize,
+}
+
 /// Start the concurrent indexing scheduler.
-#[allow(clippy::too_many_arguments)]
 pub fn start_indexing(
-    source_dir: PathBuf,
-    files: Vec<PathBuf>,
-    namespace: String,
-    embedding_config: EmbeddingConfig,
-    db_path: String,
+    job: IndexingJob,
     sink: Arc<dyn IndexEventSink>,
     control_rx: mpsc::Receiver<IndexControl>,
-    initial_parallelism: usize,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
+        let IndexingJob {
+            source_dir,
+            files,
+            namespace,
+            embedding_config,
+            db_path,
+            initial_parallelism,
+        } = job;
+
         let expanded_db_path = shellexpand::tilde(&db_path).to_string();
         let storage = Arc::new(StorageManager::new_lance_only(&expanded_db_path).await?);
         storage.ensure_collection().await?;

@@ -16,70 +16,6 @@ use rust_memex::{
     rag::PipelineGovernorConfig, repair_cross_store_recovery,
 };
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Standard config discovery locations (in priority order)
-#[allow(dead_code)]
-const CONFIG_SEARCH_PATHS: &[&str] = &[
-    "~/.rmcp-servers/rust-memex/config.toml",
-    "~/.config/rust-memex/config.toml",
-    "~/.rmcp_servers/rust_memex/config.toml", // legacy underscore path
-];
-
-/// Discover config file from standard locations
-#[allow(dead_code)]
-fn discover_config() -> Option<String> {
-    // 1. Environment variable takes priority
-    if let Ok(path) = std::env::var("RUST_MEMEX_CONFIG") {
-        let expanded = shellexpand::tilde(&path).to_string();
-        if std::path::Path::new(&expanded).exists() {
-            return Some(path);
-        }
-    }
-
-    // 2. Check standard locations
-    for path in CONFIG_SEARCH_PATHS {
-        let expanded = shellexpand::tilde(path).to_string();
-        if std::path::Path::new(&expanded).exists() {
-            return Some(path.to_string());
-        }
-    }
-
-    None
-}
-
-#[allow(dead_code)]
-fn load_file_config(path: &str) -> Result<FileConfig> {
-    let (_canonical, contents) = path_utils::safe_read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Cannot load config '{}': {}", path, e))?;
-    toml::from_str(&contents).map_err(Into::into)
-}
-
-/// Load config from explicit path or discover from standard locations
-#[allow(dead_code)]
-fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, Option<String>)> {
-    // Explicit path takes priority
-    if let Some(path) = explicit_path {
-        return Ok((load_file_config(path)?, Some(path.to_string())));
-    }
-
-    // Try to discover config
-    if let Some(discovered) = discover_config() {
-        return Ok((load_file_config(&discovered)?, Some(discovered)));
-    }
-
-    // No config found - use defaults
-    Ok((FileConfig::default(), None))
-}
-
-use crate::cli::config::*;
 use crate::cli::definition::*;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -1228,9 +1164,11 @@ pub enum KeepStrategy {
     HighestScore,
 }
 
-impl KeepStrategy {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
+impl From<&str> for KeepStrategy {
+    /// Lenient infallible parse: unknown inputs fall back to `Oldest`.
+    /// Using `From<&str>` instead of a custom `from_str` avoids shadowing
+    /// `std::str::FromStr::from_str` (which returns `Result`).
+    fn from(s: &str) -> Self {
         match s {
             "newest" => Self::Newest,
             "highest-score" => Self::HighestScore,

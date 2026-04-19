@@ -86,8 +86,7 @@ pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
     StemLanguage,
 };
-#[allow(deprecated)]
-pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
+pub use security::NamespaceSecurityConfig;
 pub use storage::{
     ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
     CrossStoreRecoveryStatus, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,

@@ -9,7 +9,6 @@ use rust_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
 /// Standard config discovery locations (in priority order)
-#[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
     "~/.rmcp-servers/rust-memex/config.toml",
     "~/.config/rust-memex/config.toml",
@@ -17,7 +16,6 @@ const CONFIG_SEARCH_PATHS: &[&str] = &[
 ];
 
 /// Discover config file from standard locations
-#[allow(dead_code)]
 fn discover_config() -> Option<String> {
     // 1. Environment variable takes priority
     if let Ok(path) = std::env::var("RUST_MEMEX_CONFIG") {
@@ -38,7 +36,6 @@ fn discover_config() -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
 fn load_file_config(path: &str) -> Result<FileConfig> {
     let (_canonical, contents) = path_utils::safe_read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot load config '{}': {}", path, e))?;
@@ -46,7 +43,6 @@ fn load_file_config(path: &str) -> Result<FileConfig> {
 }
 
 /// Load config from explicit path or discover from standard locations
-#[allow(dead_code)]
 fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, Option<String>)> {
     // Explicit path takes priority
     if let Some(path) = explicit_path {

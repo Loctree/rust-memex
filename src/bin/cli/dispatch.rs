@@ -165,16 +165,21 @@ fn dashboard_browser_url(bind_address: IpAddr, port: u16) -> String {
 }
 
 fn open_browser(url: &str) -> Result<()> {
+    // Each supported-platform branch returns Ok(()) directly; the fallback
+    // branch is compiled in only when none of the above targets match. This
+    // keeps clippy happy on every target (no unreachable_code, no
+    // needless_return) while still producing a real runtime error on
+    // unsupported platforms.
     #[cfg(target_os = "macos")]
     {
         ProcessCommand::new("open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
         ProcessCommand::new("xdg-open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -182,13 +187,16 @@ fn open_browser(url: &str) -> Result<()> {
         ProcessCommand::new("cmd")
             .args(["/C", "start", "", url])
             .spawn()?;
-        return Ok(());
+        Ok(())
     }
 
-    #[allow(unreachable_code)]
-    Err(anyhow::anyhow!(
-        "Automatic browser open is not supported on this platform"
-    ))
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        Err(anyhow::anyhow!(
+            "Automatic browser open is not supported on this platform"
+        ))
+    }
 }
 
 /// Validate startup preconditions for the HTTP server:
@@ -686,7 +694,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             run_dedup(
                 namespace,
                 dry_run,
-                KeepStrategy::from_str(&keep),
+                KeepStrategy::from(keep.as_str()),
                 cross_namespace,
                 json,
                 cfg.db_path,

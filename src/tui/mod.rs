@@ -31,7 +31,8 @@ pub use health::{CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker}
 pub use host_detection::{HostDetection, detect_hosts, write_mux_service_config};
 pub use indexer::{
     DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
-    IndexEvent, IndexEventSink, IndexTelemetrySnapshot, SharedIndexTelemetry, TracingSink,
-    TuiTelemetrySink, collect_indexable_files, import_lancedb, start_indexing, validate_path,
+    IndexEvent, IndexEventSink, IndexTelemetrySnapshot, IndexingJob, SharedIndexTelemetry,
+    TracingSink, TuiTelemetrySink, collect_indexable_files, import_lancedb, start_indexing,
+    validate_path,
 };
 pub use monitor::{GpuStatus, MonitorSnapshot, spawn_monitor};

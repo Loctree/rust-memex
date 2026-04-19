@@ -5,13 +5,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[allow(deprecated)]
 use crate::{
+    auth::{AuthDenial, AuthManager, Scope},
     embeddings::EmbeddingClient,
     query::{QueryRouter, SearchModeRecommendation},
     rag::{RAGPipeline, SearchOptions, SliceLayer},
     search::{HybridSearcher, SearchMode},
-    security::NamespaceAccessManager,
 };
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -382,17 +381,15 @@ pub fn shared_tools_list_result() -> Value {
 }
 
 #[derive(Clone)]
-#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 pub struct McpCore {
     rag: Arc<RAGPipeline>,
     hybrid_searcher: Option<Arc<HybridSearcher>>,
     embedding_client: Arc<Mutex<EmbeddingClient>>,
     max_request_bytes: usize,
     allowed_paths: Vec<String>,
-    access_manager: Arc<NamespaceAccessManager>,
+    auth_manager: Arc<AuthManager>,
 }
 
-#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 impl McpCore {
     pub fn new(
         rag: Arc<RAGPipeline>,
@@ -400,7 +397,7 @@ impl McpCore {
         embedding_client: Arc<Mutex<EmbeddingClient>>,
         max_request_bytes: usize,
         allowed_paths: Vec<String>,
-        access_manager: Arc<NamespaceAccessManager>,
+        auth_manager: Arc<AuthManager>,
     ) -> Self {
         Self {
             rag,
@@ -408,7 +405,7 @@ impl McpCore {
             embedding_client,
             max_request_bytes,
             allowed_paths,
-            access_manager,
+            auth_manager,
         }
     }
 
@@ -416,14 +413,51 @@ impl McpCore {
         self.rag.clone()
     }
 
-    /// Access the namespace access manager (if security is enabled).
-    /// Returns None when the manager exists but security is disabled.
-    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; still needed during transition
-    pub fn access_manager(&self) -> Option<&NamespaceAccessManager> {
-        if self.access_manager.is_enabled() {
-            Some(&self.access_manager)
-        } else {
-            None
+    /// Access the unified auth manager (Track C replacement for the legacy
+    /// `NamespaceAccessManager`). Always available — if no tokens are
+    /// configured, every authorize() call for that namespace is permitted.
+    pub fn auth_manager(&self) -> &AuthManager {
+        &self.auth_manager
+    }
+
+    /// MCP-tool per-request namespace access check.
+    ///
+    /// Preserves the legacy semantic of `NamespaceAccessManager::verify_access`:
+    ///   * If no tokens are registered that cover `namespace`, access is allowed
+    ///     (namespace is "open").
+    ///   * If any token covers `namespace`, a matching plaintext token must be
+    ///     supplied via the MCP tool-call `token` argument and it must grant
+    ///     write scope for the namespace.
+    ///
+    /// Returns `Ok(())` on success, `Err(message)` on denial.
+    async fn verify_tool_access(&self, namespace: &str, token: Option<&str>) -> Result<()> {
+        let tokens = self.auth_manager.list_tokens().await;
+        let namespace_has_token = tokens
+            .iter()
+            .any(|entry| entry.has_namespace_access(namespace));
+
+        if !namespace_has_token {
+            // No tokens protect this namespace — legacy "open" behavior.
+            return Ok(());
+        }
+
+        match token {
+            Some(plaintext) => match self
+                .auth_manager
+                .authorize(plaintext, &Scope::Write, Some(namespace))
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(AuthDenial::InvalidToken) | Err(AuthDenial::MissingToken) => Err(anyhow!(
+                    "Access denied: invalid token for namespace '{}'",
+                    namespace
+                )),
+                Err(denial) => Err(anyhow!("{}", denial)),
+            },
+            None => Err(anyhow!(
+                "Access denied: namespace '{}' requires a token. Use namespace_create_token to generate one.",
+                namespace
+            )),
         }
     }
 
@@ -591,8 +625,7 @@ impl McpCore {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
-                self.access_manager
-                    .verify_access(namespace, token)
+                self.verify_tool_access(namespace, token)
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
@@ -613,8 +646,7 @@ impl McpCore {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
-                self.access_manager
-                    .verify_access(namespace, token)
+                self.verify_tool_access(namespace, token)
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
@@ -629,8 +661,7 @@ impl McpCore {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
-                self.access_manager
-                    .verify_access(namespace, token)
+                self.verify_tool_access(namespace, token)
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
@@ -666,8 +697,7 @@ impl McpCore {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
-                self.access_manager
-                    .verify_access(namespace, token)
+                self.verify_tool_access(namespace, token)
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
@@ -681,8 +711,7 @@ impl McpCore {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
 
-                self.access_manager
-                    .verify_access(namespace, token)
+                self.verify_tool_access(namespace, token)
                     .await
                     .map_err(|e| jsonrpc_error(Some(id), -32603, e.to_string()))?;
 
@@ -702,9 +731,27 @@ impl McpCore {
                     return Ok(tool_error_message("Namespace is required"));
                 }
 
+                // Track C: map legacy per-namespace create to AuthManager.
+                // id == namespace preserves revoke-by-namespace and
+                // list-protected semantics without a separate mapping table.
+                // Scopes grant full access to the namespace. Wildcard
+                // namespaces are not issued via this MCP path.
+                //
+                // Legacy `TokenStore::create_token` overwrote on collision
+                // (HashMap::insert). Preserve that idempotence by revoking
+                // an existing entry before creating — effectively a rotate.
+                let description = description
+                    .unwrap_or_else(|| format!("Auto-created for namespace '{}'", namespace));
+                let _ = self.auth_manager.revoke_token(namespace).await;
                 match self
-                    .access_manager
-                    .create_token(namespace, description)
+                    .auth_manager
+                    .create_token(
+                        namespace.to_string(),
+                        vec![Scope::Read, Scope::Write, Scope::Admin],
+                        vec![namespace.to_string()],
+                        None,
+                        description,
+                    )
                     .await
                 {
                     Ok(token) => Ok(text_result(format!(
@@ -721,7 +768,7 @@ impl McpCore {
                     return Ok(tool_error_message("Namespace is required"));
                 }
 
-                match self.access_manager.revoke_token(namespace).await {
+                match self.auth_manager.revoke_token(namespace).await {
                     Ok(true) => Ok(text_result(format!(
                         "Token revoked for namespace '{}'. The namespace is now publicly accessible.",
                         namespace
@@ -734,15 +781,40 @@ impl McpCore {
                 }
             }
             McpTool::NamespaceListProtected => {
-                let protected = self.access_manager.list_protected_namespaces().await;
+                let tokens = self.auth_manager.list_tokens().await;
+                // Legacy shape: one row per protected namespace. Under the v2
+                // auth model a single token can cover many namespaces, so we
+                // flatten: every non-wildcard namespace listed by any token
+                // becomes an entry. Dedup by namespace, keeping the most
+                // recently created description.
+                let mut protected: std::collections::BTreeMap<String, (i64, Option<String>)> =
+                    std::collections::BTreeMap::new();
+                for entry in &tokens {
+                    let created_at = entry.created_at.timestamp();
+                    let desc = Some(entry.description.clone());
+                    for ns in &entry.namespaces {
+                        if ns == "*" {
+                            continue;
+                        }
+                        protected
+                            .entry(ns.clone())
+                            .and_modify(|existing| {
+                                if created_at > existing.0 {
+                                    *existing = (created_at, desc.clone());
+                                }
+                            })
+                            .or_insert_with(|| (created_at, desc.clone()));
+                    }
+                }
+
                 if protected.is_empty() {
                     Ok(text_result(
                         "No namespaces are currently protected with tokens.",
                     ))
                 } else {
                     let list: Vec<Value> = protected
-                        .iter()
-                        .map(|(namespace, created_at, description)| {
+                        .into_iter()
+                        .map(|(namespace, (created_at, description))| {
                             json!({
                                 "namespace": namespace,
                                 "created_at": created_at,
@@ -754,13 +826,21 @@ impl McpCore {
                 }
             }
             McpTool::NamespaceSecurityStatus => {
-                let enabled = self.access_manager.is_enabled();
-                let protected_count = self.access_manager.list_protected_namespaces().await.len();
+                // Track C: "enabled" now means "at least one token is
+                // configured". An empty store is equivalent to the old
+                // `enabled=false` state: every namespace is accessible.
+                let has_any = self.auth_manager.has_any_tokens().await;
+                let tokens = self.auth_manager.list_tokens().await;
+                let protected_namespaces: std::collections::BTreeSet<String> = tokens
+                    .iter()
+                    .flat_map(|entry| entry.namespaces.iter().cloned())
+                    .filter(|ns| ns != "*")
+                    .collect();
 
                 Ok(text_result(format!(
                     "Namespace security: {}\nProtected namespaces: {}\n\nNote: When security is disabled, all namespaces are accessible without tokens.",
-                    if enabled { "ENABLED" } else { "DISABLED" },
-                    protected_count
+                    if has_any { "ENABLED" } else { "DISABLED" },
+                    protected_namespaces.len()
                 )))
             }
             McpTool::Dive => {
