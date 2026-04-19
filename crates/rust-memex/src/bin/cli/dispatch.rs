@@ -10,7 +10,7 @@ use tracing_subscriber::FmtSubscriber;
 use rust_memex::{
     EmbeddingClient, QueryRouter, RAGPipeline, SearchMode, SearchModeRecommendation, SliceLayer,
     SliceMode, StorageManager, WizardConfig, create_server, default_reindexed_namespace,
-    run_wizard,
+    diagnostics::KeepStrategy, run_wizard,
 };
 
 use crate::cli::config::*;
@@ -612,7 +612,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
         Some(Commands::Stats) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             let storage = StorageManager::new_lance_only(&cfg.db_path).await?;
-            let stats = storage.stats().await?;
+            let stats = rust_memex::diagnostics::database_stats(&storage).await?;
             eprintln!("Database Statistics:");
             eprintln!("  Table:       {}", stats.table_name);
             eprintln!("  Path:        {}", stats.db_path);

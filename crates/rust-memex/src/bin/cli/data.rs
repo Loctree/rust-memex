@@ -9,8 +9,8 @@ pub use rust_memex::contracts::audit::{
 };
 use rust_memex::{
     EmbeddingClient, EmbeddingConfig, RAGPipeline, ReindexJob, ReprocessJob, SliceMode,
-    StorageManager, export_namespace_jsonl_stream, import_jsonl_file, reindex_namespace,
-    reprocess_jsonl_file,
+    StorageManager, diagnostics, export_namespace_jsonl_stream, import_jsonl_file,
+    reindex_namespace, reprocess_jsonl_file,
 };
 
 pub struct ReprocessConfig {
@@ -271,13 +271,10 @@ pub async fn run_audit(
     json: bool,
     db_path: String,
 ) -> Result<()> {
-    use rust_memex::{IntegrityRecommendation, TextIntegrityMetrics};
-
     let storage = StorageManager::new_lance_only(&db_path).await?;
 
-    // Get namespaces to audit (list_namespaces returns Vec<(String, usize)>)
-    let namespaces: Vec<String> = if let Some(ns) = namespace {
-        vec![ns]
+    let namespaces: Vec<String> = if let Some(ns) = namespace.as_deref() {
+        vec![ns.to_string()]
     } else {
         storage
             .list_namespaces()
@@ -296,8 +293,7 @@ pub async fn run_audit(
         return Ok(());
     }
 
-    let threshold_f32 = threshold as f32 / 100.0;
-    let mut results: Vec<NamespaceAuditResult> = Vec::new();
+    let results = diagnostics::audit_namespaces(&storage, namespace.as_deref(), threshold).await?;
 
     if !json {
         eprintln!(
@@ -307,55 +303,18 @@ pub async fn run_audit(
         );
     }
 
-    for ns in &namespaces {
-        // Get all documents in namespace
-        let docs = storage.get_all_in_namespace(ns).await?;
-
-        if docs.is_empty() {
-            results.push(NamespaceAuditResult {
-                namespace: ns.clone(),
-                document_count: 0,
-                avg_chunk_length: 0,
-                sentence_integrity: 0.0,
-                word_integrity: 0.0,
-                chunk_quality: 0.0,
-                overall_score: 0.0,
-                recommendation: AuditRecommendation::Empty,
-                passes_threshold: false,
-            });
-            continue;
-        }
-
-        // Extract text from documents and compute metrics (ChromaDocument has `document` field)
-        let chunks: Vec<String> = docs.iter().map(|d| d.document.clone()).collect();
-        let combined_text = chunks.join(" ");
-
-        let metrics = TextIntegrityMetrics::compute(&combined_text, &chunks);
-        let passes = metrics.overall >= threshold_f32;
-
-        let recommendation = match metrics.recommendation() {
-            IntegrityRecommendation::Excellent => AuditRecommendation::Excellent,
-            IntegrityRecommendation::Good => AuditRecommendation::Good,
-            IntegrityRecommendation::Warn => AuditRecommendation::Warn,
-            IntegrityRecommendation::Purge => AuditRecommendation::Purge,
-        };
-
-        results.push(NamespaceAuditResult {
-            namespace: ns.clone(),
-            document_count: docs.len(),
-            avg_chunk_length: metrics.avg_chunk_length,
-            sentence_integrity: metrics.sentence_integrity,
-            word_integrity: metrics.word_integrity,
-            chunk_quality: metrics.chunk_quality,
-            overall_score: metrics.overall,
-            recommendation,
-            passes_threshold: passes,
-        });
-
-        if verbose && !json {
-            eprintln!("Namespace: {}", ns);
-            eprintln!("  Documents: {}", docs.len());
-            eprintln!("  {}", metrics);
+    if verbose && !json {
+        for result in &results {
+            eprintln!("Namespace: {}", result.namespace);
+            eprintln!("  Documents: {}", result.document_count);
+            eprintln!(
+                "  avg_chunk_length={} sentence_integrity={:.2} word_integrity={:.2} chunk_quality={:.2} overall={:.2}",
+                result.avg_chunk_length,
+                result.sentence_integrity,
+                result.word_integrity,
+                result.chunk_quality,
+                result.overall_score
+            );
             eprintln!();
         }
     }
@@ -448,10 +407,7 @@ pub async fn run_purge_quality(
     json: bool,
     db_path: String,
 ) -> Result<()> {
-    use rust_memex::TextIntegrityMetrics;
-
     let storage = StorageManager::new_lance_only(&db_path).await?;
-    // list_namespaces returns Vec<(String, usize)>
     let namespace_list = storage.list_namespaces().await?;
 
     if namespace_list.is_empty() {
@@ -463,9 +419,6 @@ pub async fn run_purge_quality(
         return Ok(());
     }
 
-    let threshold_f32 = threshold as f32 / 100.0;
-    let mut to_purge: Vec<(String, f32, usize)> = Vec::new();
-
     if !json {
         eprintln!(
             "Analyzing {} namespace(s) with {}% quality threshold...\n",
@@ -473,26 +426,9 @@ pub async fn run_purge_quality(
             threshold
         );
     }
+    let result = diagnostics::purge_quality_namespaces(&storage, None, threshold, !confirm).await?;
 
-    for (ns, _count) in &namespace_list {
-        let docs = storage.get_all_in_namespace(ns).await?;
-
-        if docs.is_empty() {
-            to_purge.push((ns.clone(), 0.0, 0));
-            continue;
-        }
-
-        // ChromaDocument has `document` field, not `text`
-        let chunks: Vec<String> = docs.iter().map(|d| d.document.clone()).collect();
-        let combined_text = chunks.join(" ");
-        let metrics = TextIntegrityMetrics::compute(&combined_text, &chunks);
-
-        if metrics.overall < threshold_f32 {
-            to_purge.push((ns.clone(), metrics.overall, docs.len()));
-        }
-    }
-
-    if to_purge.is_empty() {
+    if result.candidates.is_empty() {
         if json {
             println!(r#"{{"purged": [], "message": "All namespaces pass quality threshold"}}"#);
         } else {
@@ -508,27 +444,28 @@ pub async fn run_purge_quality(
         let output = serde_json::json!({
             "dry_run": !confirm,
             "threshold": threshold,
-            "to_purge": to_purge.iter().map(|(ns, score, count)| {
+            "to_purge": result.candidates.iter().map(|candidate| {
                 serde_json::json!({
-                    "namespace": ns,
-                    "quality_score": score,
-                    "document_count": count
+                    "namespace": candidate.namespace,
+                    "quality_score": candidate.quality_score,
+                    "document_count": candidate.document_count
                 })
             }).collect::<Vec<_>>()
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
-
-        if !confirm {
-            return Ok(());
-        }
     } else {
         println!(
             "Found {} namespace(s) below {}% quality threshold:",
-            to_purge.len(),
+            result.candidates.len(),
             threshold
         );
-        for (ns, score, count) in &to_purge {
-            println!("  - {} ({:.1}% quality, {} docs)", ns, score * 100.0, count);
+        for candidate in &result.candidates {
+            println!(
+                "  - {} ({:.1}% quality, {} docs)",
+                candidate.namespace,
+                candidate.quality_score * 100.0,
+                candidate.document_count
+            );
         }
         println!();
 
@@ -539,33 +476,11 @@ pub async fn run_purge_quality(
         }
     }
 
-    // Actually purge if confirmed (use purge_namespace, not delete_namespace)
-    let mut purged_count = 0;
-    for (ns, _score, count) in &to_purge {
-        if !json {
-            eprint!("Purging '{}' ({} docs)... ", ns, count);
-        }
-
-        match storage.delete_namespace_documents(ns).await {
-            Ok(_) => {
-                purged_count += 1;
-                if !json {
-                    eprintln!("done");
-                }
-            }
-            Err(e) => {
-                if !json {
-                    eprintln!("ERROR: {}", e);
-                }
-            }
-        }
-    }
-
     if !json {
         println!();
         println!(
             "Purged {} namespace(s) with quality below {}%",
-            purged_count, threshold
+            result.purged_namespaces, threshold
         );
     }
 

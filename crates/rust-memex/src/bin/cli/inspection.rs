@@ -7,7 +7,11 @@ pub use rust_memex::contracts::stats::{DatabaseStats, NamespaceStats, StorageMet
 pub use rust_memex::contracts::timeline::{TimeRange, TimelineEntry, TimelineFilter};
 use rust_memex::{
     BM25Config, BM25Index, EmbeddingClient, EmbeddingConfig, HealthChecker, RAGPipeline,
-    SliceLayer, StorageManager, inspect_cross_store_recovery,
+    SliceLayer, StorageManager,
+    diagnostics::{
+        self, TimelineBucket, TimelineQuery, namespace_stats as collect_namespace_stats,
+    },
+    inspect_cross_store_recovery,
 };
 
 /// Run overview command - quick stats and health check
@@ -44,81 +48,7 @@ pub async fn run_overview(
         return Ok(());
     }
 
-    // Group by namespace
-    let mut by_namespace: std::collections::HashMap<String, Vec<_>> =
-        std::collections::HashMap::new();
-    for doc in &all_docs {
-        by_namespace
-            .entry(doc.namespace.clone())
-            .or_default()
-            .push(doc);
-    }
-
-    let mut stats_list: Vec<NamespaceStats> = Vec::new();
-
-    for (ns_name, docs) in &by_namespace {
-        // Count layers
-        let mut layer_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for doc in docs {
-            let layer_name = match doc.layer {
-                1 => "outer",
-                2 => "middle",
-                3 => "inner",
-                4 => "core",
-                _ => "flat",
-            };
-            *layer_counts.entry(layer_name.to_string()).or_insert(0) += 1;
-        }
-
-        // Collect all keywords and count frequency
-        let mut keyword_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for doc in docs {
-            for kw in &doc.keywords {
-                *keyword_counts.entry(kw.clone()).or_insert(0) += 1;
-            }
-        }
-        let mut top_keywords: Vec<_> = keyword_counts.into_iter().collect();
-        top_keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
-        let top_keywords: Vec<(String, usize)> = top_keywords.into_iter().take(10).collect();
-
-        // Check for timestamps in metadata (look for common timestamp patterns)
-        let has_timestamps = docs.iter().any(|d| {
-            let meta_str = d.metadata.to_string();
-            meta_str.contains("timestamp")
-                || meta_str.contains("created_at")
-                || meta_str.contains("indexed_at")
-                || meta_str.contains("date")
-        });
-
-        // Try to extract date range from metadata
-        let mut dates: Vec<String> = Vec::new();
-        for doc in docs {
-            if let Some(obj) = doc.metadata.as_object() {
-                for (k, v) in obj {
-                    if (k.contains("date") || k.contains("timestamp") || k.contains("time"))
-                        && let Some(s) = v.as_str()
-                    {
-                        dates.push(s.to_string());
-                    }
-                }
-            }
-        }
-        dates.sort();
-
-        stats_list.push(NamespaceStats {
-            name: ns_name.clone(),
-            total_chunks: docs.len(),
-            layer_counts,
-            top_keywords,
-            has_timestamps,
-            earliest_indexed: dates.first().cloned(),
-            latest_indexed: dates.last().cloned(),
-        });
-    }
-
-    stats_list.sort_by(|a, b| a.name.cmp(&b.name));
+    let stats_list = collect_namespace_stats(storage.as_ref(), namespace.as_deref()).await?;
 
     if json_output {
         let json = serde_json::json!({
@@ -744,23 +674,6 @@ pub async fn run_recall(
     Ok(())
 }
 
-/// Timeline report for JSON output
-#[derive(Debug, Clone, Serialize)]
-pub struct TimelineReport {
-    pub namespaces: Vec<String>,
-    pub entries: Vec<TimelineEntry>,
-    pub coverage: TimelineCoverage,
-    pub gaps: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TimelineCoverage {
-    pub earliest: Option<String>,
-    pub latest: Option<String>,
-    pub total_days: usize,
-    pub days_with_data: usize,
-}
-
 /// Run timeline command - show when content was indexed
 pub async fn run_timeline(
     db_path: String,
@@ -769,23 +682,19 @@ pub async fn run_timeline(
     show_gaps_only: bool,
     json_output: bool,
 ) -> Result<()> {
-    use std::collections::{BTreeMap, BTreeSet};
-
     let storage = StorageManager::new_lance_only(&db_path).await?;
+    let report = diagnostics::timeline_report(
+        &storage,
+        &TimelineQuery {
+            namespace: namespace_filter.clone(),
+            since,
+            until: None,
+            bucket: TimelineBucket::Day,
+        },
+    )
+    .await?;
 
-    // Get namespaces to query
-    let namespaces: Vec<String> = if let Some(ref ns) = namespace_filter {
-        vec![ns.clone()]
-    } else {
-        storage
-            .list_namespaces()
-            .await?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect()
-    };
-
-    if namespaces.is_empty() {
+    if report.namespaces.is_empty() {
         if json_output {
             println!(
                 "{}",
@@ -801,199 +710,50 @@ pub async fn run_timeline(
         return Ok(());
     }
 
-    // Parse since filter
-    let since_date: Option<chrono::NaiveDate> = since.as_ref().and_then(|s| {
-        // Try parsing as duration like "30d"
-        if let Some(days_str) = s.strip_suffix('d')
-            && let Ok(days) = days_str.parse::<i64>()
-        {
-            return Some((chrono::Utc::now() - chrono::Duration::days(days)).date_naive());
-        }
-        // Try parsing as YYYY-MM
-        if s.len() == 7
-            && s.chars().nth(4) == Some('-')
-            && let Ok(date) = chrono::NaiveDate::parse_from_str(&format!("{}-01", s), "%Y-%m-%d")
-        {
-            return Some(date);
-        }
-        // Try parsing as full date
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-    });
-
-    // Collect timeline data: date -> namespace -> source -> count
-    let mut timeline: BTreeMap<String, BTreeMap<String, BTreeMap<String, usize>>> = BTreeMap::new();
-    let mut all_dates: BTreeSet<String> = BTreeSet::new();
-
-    for ns_name in &namespaces {
-        let docs = storage.get_all_in_namespace(ns_name).await?;
-
-        for doc in docs {
-            // Extract indexed_at from metadata
-            let indexed_at = doc
-                .metadata
-                .get("indexed_at")
-                .and_then(|v| v.as_str())
-                .or_else(|| doc.metadata.get("timestamp").and_then(|v| v.as_str()));
-
-            let date_str = if let Some(ts) = indexed_at {
-                // Parse ISO timestamp and extract date
-                ts.split('T').next().unwrap_or("unknown").to_string()
-            } else {
-                "unknown".to_string()
-            };
-
-            // Apply since filter
-            if let Some(since_d) = since_date
-                && let Ok(doc_date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-                && doc_date < since_d
-            {
-                continue;
-            }
-
-            all_dates.insert(date_str.clone());
-
-            // Extract source from metadata
-            let source = doc
-                .metadata
-                .get("source")
-                .and_then(|v| v.as_str())
-                .or_else(|| doc.metadata.get("file_path").and_then(|v| v.as_str()))
-                .map(|s| {
-                    // Extract filename from path
-                    std::path::Path::new(s)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(s)
-                        .to_string()
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-
-            *timeline
-                .entry(date_str)
-                .or_default()
-                .entry(ns_name.clone())
-                .or_default()
-                .entry(source)
-                .or_default() += 1;
-        }
-    }
-
-    // Build entries list for JSON
-    let mut entries: Vec<TimelineEntry> = Vec::new();
-    for (date, ns_map) in &timeline {
-        for (ns, source_map) in ns_map {
-            for (source, count) in source_map {
-                entries.push(TimelineEntry {
-                    date: date.clone(),
-                    namespace: ns.clone(),
-                    source: Some(source.clone()),
-                    chunk_count: *count,
-                });
-            }
-        }
-    }
-
-    // Calculate coverage
-    let dates_vec: Vec<&String> = all_dates.iter().collect();
-    let earliest = dates_vec.first().map(|s| (*s).clone());
-    let latest = dates_vec.last().map(|s| (*s).clone());
-
-    // Find gaps (consecutive dates with no data)
-    let mut gaps: Vec<String> = Vec::new();
-    if dates_vec.len() >= 2 {
-        let sorted_dates: Vec<chrono::NaiveDate> = dates_vec
-            .iter()
-            .filter_map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-            .collect();
-
-        for window in sorted_dates.windows(2) {
-            let diff = (window[1] - window[0]).num_days();
-            if diff > 1 {
-                gaps.push(format!(
-                    "{} to {} ({} days)",
-                    window[0].format("%Y-%m-%d"),
-                    window[1].format("%Y-%m-%d"),
-                    diff - 1
-                ));
-            }
-        }
-    }
-
-    let coverage = TimelineCoverage {
-        earliest,
-        latest,
-        total_days: if dates_vec.len() >= 2 {
-            dates_vec
-                .first()
-                .and_then(|e| chrono::NaiveDate::parse_from_str(e, "%Y-%m-%d").ok())
-                .zip(
-                    dates_vec
-                        .last()
-                        .and_then(|l| chrono::NaiveDate::parse_from_str(l, "%Y-%m-%d").ok()),
-                )
-                .map(|(e, l)| (l - e).num_days() as usize + 1)
-                .unwrap_or(0)
-        } else {
-            dates_vec.len()
-        },
-        days_with_data: all_dates.len(),
-    };
-
-    let report = TimelineReport {
-        namespaces: namespaces.clone(),
-        entries,
-        coverage,
-        gaps: gaps.clone(),
-    };
-
     // Output
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if show_gaps_only {
         // Only show gaps
-        if gaps.is_empty() {
+        if report.gaps.is_empty() {
             eprintln!("No gaps found in timeline");
         } else {
             eprintln!("Timeline Gaps:");
-            for gap in &gaps {
+            for gap in &report.gaps {
                 eprintln!("  - {}", gap);
             }
         }
     } else {
         // Full timeline grouped by month
-        eprintln!("Timeline: {} namespace(s)", namespaces.len());
+        eprintln!("Timeline: {} namespace(s)", report.namespaces.len());
         if let Some(ref ns) = namespace_filter {
             eprintln!("  Namespace: {}", ns);
         }
         eprintln!();
 
         // Group by year-month
-        let mut by_month: BTreeMap<String, Vec<(String, String, usize)>> = BTreeMap::new();
-        for (date, ns_map) in &timeline {
-            let month = if date.len() >= 7 {
-                date[..7].to_string()
+        let mut by_month: std::collections::BTreeMap<String, Vec<(String, String, usize)>> =
+            std::collections::BTreeMap::new();
+        for entry in &report.entries {
+            let month = if entry.date.len() >= 7 {
+                entry.date[..7].to_string()
             } else {
-                date.clone()
+                entry.date.clone()
             };
 
-            for (ns, source_map) in ns_map {
-                let total: usize = source_map.values().sum();
-                let sources: Vec<_> = source_map.keys().take(3).cloned().collect();
-                let source_str = if sources.len() < source_map.len() {
-                    format!(
-                        "{} (+{} more)",
-                        sources.join(", "),
-                        source_map.len() - sources.len()
-                    )
-                } else {
-                    sources.join(", ")
-                };
-                by_month.entry(month.clone()).or_default().push((
-                    date.clone(),
-                    format!("[{}] {} ({})", ns, source_str, total),
-                    total,
-                ));
-            }
+            by_month.entry(month).or_default().push((
+                entry.date.clone(),
+                format!(
+                    "[{}] {} ({})",
+                    entry.namespace,
+                    entry
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    entry.chunk_count
+                ),
+                entry.chunk_count,
+            ));
         }
 
         for (month, entries) in by_month {
@@ -1017,14 +777,14 @@ pub async fn run_timeline(
             report.coverage.days_with_data, report.coverage.total_days
         );
 
-        if !gaps.is_empty() {
+        if !report.gaps.is_empty() {
             eprintln!();
-            eprintln!("Gaps ({}):", gaps.len());
-            for gap in gaps.iter().take(5) {
+            eprintln!("Gaps ({}):", report.gaps.len());
+            for gap in report.gaps.iter().take(5) {
                 eprintln!("  - {}", gap);
             }
-            if gaps.len() > 5 {
-                eprintln!("  ... and {} more gaps", gaps.len() - 5);
+            if report.gaps.len() > 5 {
+                eprintln!("  ... and {} more gaps", report.gaps.len() - 5);
             }
         }
     }

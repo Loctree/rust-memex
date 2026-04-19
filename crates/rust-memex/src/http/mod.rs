@@ -18,11 +18,16 @@
 //! - POST /search            - Search documents
 //! - GET  /sse/search        - SSE streaming search
 //! - GET  /sse/namespaces    - SSE streaming namespace listing with summaries
+//! - POST /sse/compact       - SSE streaming database compaction
+//! - POST /sse/cleanup       - SSE streaming version cleanup (>7 days)
+//! - POST /sse/gc            - SSE streaming orphan garbage collection
 //! - POST /sse/optimize      - SSE streaming database optimize (compact + prune)
 //! - POST /sse/reprocess     - SSE streaming namespace rebuild from JSONL
 //! - POST /sse/reindex       - SSE streaming namespace rebuild from namespace source
 //! - POST /upsert            - Upsert document (memory_upsert)
 //! - POST /index             - Index text with full pipeline
+//! - POST /api/merge         - Merge multiple LanceDB stores into one target
+//! - POST /api/repair-writes - Inspect or repair cross-store recovery ledgers
 //! - POST /api/export        - Stream a namespace as JSONL
 //! - POST /api/import        - Import JSONL into a namespace
 //! - POST /api/migrate-namespace - Atomically rename a namespace
@@ -37,6 +42,7 @@
 //! Vibecrafted with AI Agents by Loctree (c)2026 Loctree
 
 mod lifecycle;
+mod recovery;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -55,8 +61,9 @@ use axum::{
     },
     routing::{delete, get, post},
 };
-pub use memex_contracts::progress::{CompactProgress, SseEvent};
-pub use memex_contracts::stats::{DatabaseStats, StorageMetrics};
+pub use memex_contracts::progress::{CompactProgress, MergeProgress, RepairResult, SseEvent};
+pub use memex_contracts::stats::{DatabaseStats, NamespaceStats, StorageMetrics};
+use memex_contracts::{audit::AuditResult, timeline::TimelineEntry};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
@@ -69,12 +76,17 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
+use crate::diagnostics::{
+    self, DedupResult as DiagnosticDedupResult, KeepStrategy, PurgeQualityResult, TimelineBucket,
+    TimelineQuery,
+};
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
 use crate::search::{HybridSearchResult, SearchMode};
 use crate::storage::ChromaDocument;
 
 const DASHBOARD_SESSION_COOKIE: &str = "rust_memex_dashboard_session";
+const DIAGNOSTIC_APPROVAL_TTL: Duration = Duration::from_secs(300);
 
 // ============================================================================
 // HTML Dashboard (embedded)
@@ -941,6 +953,8 @@ pub struct HttpState {
     pub cached_namespaces: Arc<RwLock<Option<Vec<NamespaceInfo>>>>,
     /// Per-namespace last activity timestamp (updated on upsert/index)
     pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
+    /// Recent destructive diagnostic dry-runs approved for follow-up execute calls.
+    pub diagnostic_dry_run_approvals: Arc<RwLock<HashMap<String, Instant>>>,
     /// Optional Bearer token for authenticating mutating requests
     pub auth_token: Option<String>,
     /// Auth enforcement mode
@@ -962,6 +976,7 @@ impl HttpState {
             mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
             cached_namespaces: Arc::new(RwLock::new(None)),
             namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
             auth_token: None,
             auth_mode: AuthMode::MutatingOnly,
             allow_query_token: false,
@@ -969,6 +984,73 @@ impl HttpState {
             dashboard_oidc: None,
         }
     }
+}
+
+fn validate_threshold(threshold: u8) -> Result<(), (StatusCode, String)> {
+    if threshold > 100 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "threshold must be between 0 and 100".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn diagnostic_approval_key(
+    operation: &str,
+    namespace: Option<&str>,
+    threshold: Option<u8>,
+) -> String {
+    let namespace = namespace.unwrap_or("*");
+    let threshold = threshold
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{operation}:{namespace}:{threshold}")
+}
+
+async fn record_diagnostic_dry_run(state: &HttpState, key: String) {
+    let now = Instant::now();
+    let mut approvals = state.diagnostic_dry_run_approvals.write().await;
+    approvals.retain(|_, recorded_at| now.duration_since(*recorded_at) <= DIAGNOSTIC_APPROVAL_TTL);
+    approvals.insert(key, now);
+}
+
+async fn consume_diagnostic_dry_run(state: &HttpState, key: &str) -> bool {
+    let now = Instant::now();
+    let mut approvals = state.diagnostic_dry_run_approvals.write().await;
+    approvals.retain(|_, recorded_at| now.duration_since(*recorded_at) <= DIAGNOSTIC_APPROVAL_TTL);
+    approvals.remove(key).is_some()
+}
+
+async fn ensure_destructive_diagnostic_allowed(
+    state: &HttpState,
+    key: String,
+    confirm: bool,
+    allow_single_step: bool,
+) -> Result<(), (StatusCode, String)> {
+    if !confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "destructive execution requires confirm=true".to_string(),
+        ));
+    }
+
+    if allow_single_step {
+        return Ok(());
+    }
+
+    if consume_diagnostic_dry_run(state, &key).await {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::CONFLICT,
+        "destructive execution requires a preceding matching dry_run=true call or allow_single_step=true".to_string(),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1318,6 +1400,74 @@ fn default_total_limit() -> usize {
 
 fn default_mode() -> String {
     "hybrid".to_string()
+}
+
+fn default_quality_threshold() -> u8 {
+    90
+}
+
+fn default_timeline_bucket() -> String {
+    "day".to_string()
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditParams {
+    pub ns: Option<String>,
+    #[serde(default = "default_quality_threshold")]
+    pub threshold: u8,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimelineParams {
+    pub ns: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default = "default_timeline_bucket")]
+    pub bucket: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DedupParams {
+    #[serde(default)]
+    pub ns: Option<String>,
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DedupRequest {
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub allow_single_step: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeQualityRequest {
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "default_quality_threshold")]
+    pub threshold: u8,
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub allow_single_step: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DedupResponse {
+    pub namespace: Option<String>,
+    pub execute: bool,
+    pub dry_run: bool,
+    pub result: DiagnosticDedupResult,
 }
 
 fn http_search_mode(mode: &str) -> SearchMode {
@@ -1948,7 +2098,8 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/sse/namespaces", get(sse_namespaces_handler))
         .route("/expand/{ns}/{id}", get(expand_handler))
         .route("/parent/{ns}/{id}", get(parent_handler))
-        .route("/get/{ns}/{id}", get(get_handler));
+        .route("/get/{ns}/{id}", get(get_handler))
+        .merge(diagnostic_routes());
 
     // Conditionally wrap read routes with auth middleware in all-routes mode
     let read_routes = if all_routes_auth {
@@ -1963,12 +2114,13 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
     // Mutating routes (auth required when token is configured)
     let authed_routes = Router::new()
         .route("/refresh", post(refresh_handler))
-        .route("/sse/optimize", post(sse_optimize_handler))
         .route("/upsert", post(upsert_handler))
         .route("/index", post(index_handler))
         .route("/delete/{ns}/{id}", post(delete_handler))
         .route("/ns/{namespace}", delete(purge_namespace_handler))
+        .merge(diagnostic_authed_routes())
         .merge(lifecycle_routes())
+        .merge(recovery_routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -2000,6 +2152,24 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
 
 fn lifecycle_routes() -> Router<HttpState> {
     lifecycle::routes()
+}
+
+fn recovery_routes() -> Router<HttpState> {
+    recovery::routes()
+}
+
+fn diagnostic_routes() -> Router<HttpState> {
+    Router::new()
+        .route("/api/audit", get(audit_handler))
+        .route("/api/stats", get(database_stats_handler))
+        .route("/api/stats/{ns}", get(namespace_stats_handler))
+        .route("/api/timeline", get(timeline_handler))
+}
+
+fn diagnostic_authed_routes() -> Router<HttpState> {
+    Router::new()
+        .route("/api/purge-quality", post(purge_quality_handler))
+        .route("/api/dedup", post(dedup_handler))
 }
 
 /// Health check endpoint
@@ -2229,6 +2399,191 @@ async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Valu
     Json(status_response_from_discovery(
         &build_discovery_response(&state).await,
     ))
+}
+
+/// Diagnostic audit for a single namespace (GET /api/audit)
+async fn audit_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<AuditParams>,
+) -> Result<Json<AuditResult>, (StatusCode, String)> {
+    validate_threshold(params.threshold)?;
+    let namespace = params
+        .ns
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "ns query parameter is required".to_string(),
+            )
+        })?;
+
+    let result = diagnostics::audit_namespaces(
+        state.rag.storage_manager().as_ref(),
+        Some(namespace),
+        params.threshold,
+    )
+    .await
+    .map_err(internal_error)?
+    .into_iter()
+    .next()
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("namespace '{namespace}' not found"),
+        )
+    })?;
+
+    Ok(Json(result))
+}
+
+/// Database statistics (GET /api/stats)
+async fn database_stats_handler(
+    State(state): State<HttpState>,
+) -> Result<Json<DatabaseStats>, (StatusCode, String)> {
+    let stats = diagnostics::database_stats(state.rag.storage_manager().as_ref())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(stats))
+}
+
+/// Namespace statistics (GET /api/stats/{ns})
+async fn namespace_stats_handler(
+    State(state): State<HttpState>,
+    Path(ns): Path<String>,
+) -> Result<Json<NamespaceStats>, (StatusCode, String)> {
+    let stats = diagnostics::namespace_stats(state.rag.storage_manager().as_ref(), Some(&ns))
+        .await
+        .map_err(internal_error)?;
+    let result = stats
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("namespace '{ns}' not found")))?;
+    Ok(Json(result))
+}
+
+/// Time-bucketed timeline (GET /api/timeline)
+async fn timeline_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<TimelineParams>,
+) -> Result<Json<Vec<TimelineEntry>>, (StatusCode, String)> {
+    let bucket = match params.bucket.as_str() {
+        "day" => TimelineBucket::Day,
+        "hour" => TimelineBucket::Hour,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "bucket must be 'day' or 'hour'".to_string(),
+            ));
+        }
+    };
+
+    let report = diagnostics::timeline_report(
+        state.rag.storage_manager().as_ref(),
+        &TimelineQuery {
+            namespace: params.ns,
+            since: params.since,
+            until: params.until,
+            bucket,
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(report.entries))
+}
+
+/// Purge low-quality namespaces, gated by prior dry-run unless explicitly single-step.
+async fn purge_quality_handler(
+    State(state): State<HttpState>,
+    Json(request): Json<PurgeQualityRequest>,
+) -> Result<Json<PurgeQualityResult>, (StatusCode, String)> {
+    validate_threshold(request.threshold)?;
+    let key = diagnostic_approval_key(
+        "purge-quality",
+        request.namespace.as_deref(),
+        Some(request.threshold),
+    );
+
+    if request.dry_run {
+        let result = diagnostics::purge_quality_namespaces(
+            state.rag.storage_manager().as_ref(),
+            request.namespace.as_deref(),
+            request.threshold,
+            true,
+        )
+        .await
+        .map_err(internal_error)?;
+        record_diagnostic_dry_run(&state, key).await;
+        return Ok(Json(result));
+    }
+
+    ensure_destructive_diagnostic_allowed(&state, key, request.confirm, request.allow_single_step)
+        .await?;
+
+    let result = diagnostics::purge_quality_namespaces(
+        state.rag.storage_manager().as_ref(),
+        request.namespace.as_deref(),
+        request.threshold,
+        false,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(result))
+}
+
+/// Deduplicate a namespace, dry-run by default and gated on execute.
+async fn dedup_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<DedupParams>,
+    body: String,
+) -> Result<Json<DedupResponse>, (StatusCode, String)> {
+    let request = if body.trim().is_empty() {
+        DedupRequest::default()
+    } else {
+        serde_json::from_str::<DedupRequest>(&body).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid dedup request body: {error}"),
+            )
+        })?
+    };
+
+    let dry_run = !params.execute;
+    let key = diagnostic_approval_key("dedup", params.ns.as_deref(), None);
+
+    if !dry_run {
+        ensure_destructive_diagnostic_allowed(
+            &state,
+            key.clone(),
+            request.confirm,
+            request.allow_single_step,
+        )
+        .await?;
+    }
+
+    let result = diagnostics::deduplicate_documents(
+        state.rag.storage_manager().as_ref(),
+        params.ns.as_deref(),
+        dry_run,
+        KeepStrategy::Oldest,
+        false,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    if dry_run {
+        record_diagnostic_dry_run(&state, key).await;
+    }
+
+    Ok(Json(DedupResponse {
+        namespace: params.ns,
+        execute: params.execute,
+        dry_run,
+        result,
+    }))
 }
 
 /// Browse documents in namespace (GET /api/browse/:ns)
@@ -2732,118 +3087,6 @@ async fn sse_namespaces_handler(
     )
 }
 
-/// SSE streaming optimize endpoint - runs compact + prune with progress events
-/// POST /sse/optimize - streams optimization progress and stats
-async fn sse_optimize_handler(
-    State(state): State<HttpState>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let stream = async_stream::stream! {
-        let start = std::time::Instant::now();
-
-        // Pre-optimize stats
-        let pre_stats = state.rag.storage_manager().stats().await.ok();
-
-        yield Ok(Event::default()
-            .event("start")
-            .data(serde_json::json!({
-                "status": "starting_optimization",
-                "db_path": state.rag.storage_manager().lance_path(),
-                "pre_row_count": pre_stats.as_ref().map(|s| s.row_count),
-                "pre_version_count": pre_stats.as_ref().map(|s| s.version_count),
-            }).to_string()));
-
-        // Phase 1: Compact
-        yield Ok(Event::default()
-            .event("phase")
-            .data(serde_json::json!({
-                "phase": "compact",
-                "status": "running",
-                "description": "Merging small files into larger ones"
-            }).to_string()));
-
-        let compact_result = state.rag.storage_manager().compact().await;
-
-        match &compact_result {
-            Ok(stats) => {
-                yield Ok(Event::default()
-                    .event("compact_done")
-                    .data(serde_json::json!({
-                        "phase": "compact",
-                        "status": "complete",
-                        "files_removed": stats.compaction.as_ref().map(|c| c.files_removed),
-                        "files_added": stats.compaction.as_ref().map(|c| c.files_added),
-                        "fragments_removed": stats.compaction.as_ref().map(|c| c.fragments_removed),
-                        "fragments_added": stats.compaction.as_ref().map(|c| c.fragments_added),
-                    }).to_string()));
-            }
-            Err(e) => {
-                yield Ok(Event::default()
-                    .event("compact_error")
-                    .data(serde_json::json!({
-                        "phase": "compact",
-                        "status": "error",
-                        "error": e.to_string()
-                    }).to_string()));
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Phase 2: Prune old versions
-        yield Ok(Event::default()
-            .event("phase")
-            .data(serde_json::json!({
-                "phase": "prune",
-                "status": "running",
-                "description": "Removing old versions (>7 days)"
-            }).to_string()));
-
-        let prune_result = state.rag.storage_manager().cleanup(Some(7)).await;
-
-        match &prune_result {
-            Ok(stats) => {
-                yield Ok(Event::default()
-                    .event("prune_done")
-                    .data(serde_json::json!({
-                        "phase": "prune",
-                        "status": "complete",
-                        "old_versions": stats.prune.as_ref().map(|p| p.old_versions),
-                        "bytes_removed": stats.prune.as_ref().map(|p| p.bytes_removed),
-                    }).to_string()));
-            }
-            Err(e) => {
-                yield Ok(Event::default()
-                    .event("prune_error")
-                    .data(serde_json::json!({
-                        "phase": "prune",
-                        "status": "error",
-                        "error": e.to_string()
-                    }).to_string()));
-            }
-        }
-
-        // Post-optimize stats
-        let post_stats = state.rag.storage_manager().stats().await.ok();
-
-        yield Ok(Event::default()
-            .event("done")
-            .data(serde_json::json!({
-                "status": "complete",
-                "post_row_count": post_stats.as_ref().map(|s| s.row_count),
-                "post_version_count": post_stats.as_ref().map(|s| s.version_count),
-                "compact_ok": compact_result.is_ok(),
-                "prune_ok": prune_result.is_ok(),
-                "elapsed_ms": start.elapsed().as_millis() as u64
-            }).to_string()));
-    };
-
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("ping"),
-    )
-}
-
 /// Upsert document endpoint (POST /upsert) - uses memory_upsert
 async fn upsert_handler(
     State(state): State<HttpState>,
@@ -3249,6 +3492,7 @@ pub async fn start_server(
         mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
         cached_namespaces: cached_namespaces.clone(),
         namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+        diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
         auth_token: server_config.auth_token.clone(),
         auth_mode: server_config.auth_mode.clone(),
         allow_query_token: server_config.allow_query_token,
@@ -3396,6 +3640,7 @@ mod tests {
             mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
             cached_namespaces: Arc::new(RwLock::new(None)),
             namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
             auth_token: None,
             auth_mode: AuthMode::MutatingOnly,
             allow_query_token: false,

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod common;
+pub mod diagnostics;
 pub mod embeddings;
 pub mod engine;
 pub mod handlers;
@@ -12,6 +13,7 @@ pub mod path_utils;
 pub mod preprocessing;
 pub mod query;
 pub mod rag;
+pub mod recovery;
 pub mod search;
 pub mod security;
 pub mod storage;
@@ -83,6 +85,10 @@ pub use rag::{
     repair_cross_store_recovery,
     // Async pipeline exports
     run_pipeline,
+};
+pub use recovery::{
+    MaintenanceExecution, MergeExecution, RepairExecution, cleanup_versions, collect_garbage,
+    compact_database, merge_databases, repair_writes,
 };
 pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,

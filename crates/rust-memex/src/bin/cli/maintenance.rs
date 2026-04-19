@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
+pub use rust_memex::diagnostics::{DedupGroup, DedupResult, KeepStrategy};
 use rust_memex::{
-    BM25Config, BM25Index, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig,
-    IndexProgressTracker, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
-    RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, migrate_namespace_atomic,
-    path_utils, rag::PipelineGovernorConfig, repair_cross_store_recovery,
+    CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig, IndexProgressTracker,
+    PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig, RAGPipeline, SliceMode,
+    StorageManager, diagnostics, merge_databases, migrate_namespace_atomic,
+    rag::PipelineGovernorConfig, repair_writes as execute_repair_writes,
 };
 
 use crate::cli::definition::*;
@@ -1135,14 +1136,8 @@ pub async fn run_repair_writes(
     execute: bool,
     json_output: bool,
 ) -> Result<()> {
-    let storage = StorageManager::new_lance_only(&db_path).await?;
-    let bm25 = BM25Index::new(&BM25Config::default().with_read_only(!execute))?;
-
-    let report = if execute {
-        repair_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
-    } else {
-        inspect_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
-    };
+    let repair = execute_repair_writes(&db_path, namespace.as_deref(), execute).await?;
+    let report = repair.report;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1151,55 +1146,6 @@ pub async fn run_repair_writes(
     }
 
     Ok(())
-}
-
-/// Strategy for keeping documents when deduplicating
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeepStrategy {
-    /// Keep the document with the earliest ID (lexicographic)
-    Oldest,
-    /// Keep the document with the latest ID (lexicographic)
-    Newest,
-    /// Keep the document that appears first in vector search (highest relevance)
-    HighestScore,
-}
-
-impl From<&str> for KeepStrategy {
-    /// Lenient infallible parse: unknown inputs fall back to `Oldest`.
-    /// Using `From<&str>` instead of a custom `from_str` avoids shadowing
-    /// `std::str::FromStr::from_str` (which returns `Result`).
-    fn from(s: &str) -> Self {
-        match s {
-            "newest" => Self::Newest,
-            "highest-score" => Self::HighestScore,
-            _ => Self::Oldest,
-        }
-    }
-}
-
-/// Result of deduplication operation
-#[derive(Debug, Clone, Serialize)]
-pub struct DedupResult {
-    /// Total documents scanned
-    pub total_docs: usize,
-    /// Documents with unique content (no duplicates)
-    pub unique_docs: usize,
-    /// Duplicate groups found (each group has 2+ docs with same hash)
-    pub duplicate_groups: usize,
-    /// Total duplicate documents that would be/were removed
-    pub duplicates_removed: usize,
-    /// Documents without content_hash (cannot be deduplicated)
-    pub docs_without_hash: usize,
-    /// Details of each duplicate group (for reporting)
-    pub groups: Vec<DedupGroup>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DedupGroup {
-    pub content_hash: String,
-    pub kept_id: String,
-    pub kept_namespace: String,
-    removed_ids: Vec<(String, String)>, // (id, namespace)
 }
 
 /// Run deduplication on the database
@@ -1212,13 +1158,16 @@ pub async fn run_dedup(
     db_path: String,
 ) -> Result<()> {
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+    let result = diagnostics::deduplicate_documents(
+        storage.as_ref(),
+        namespace.as_deref(),
+        dry_run,
+        keep_strategy,
+        cross_namespace,
+    )
+    .await?;
 
-    // Get all documents (optionally filtered by namespace)
-    let all_docs = storage
-        .all_documents(namespace.as_deref(), 1_000_000)
-        .await?;
-
-    if all_docs.is_empty() {
+    if result.total_docs == 0 {
         if json_output {
             println!(
                 "{}",
@@ -1235,90 +1184,10 @@ pub async fn run_dedup(
     }
 
     if !json_output {
-        eprintln!("Scanning {} documents for duplicates...", all_docs.len());
+        eprintln!("Scanning {} documents for duplicates...", result.total_docs);
         if dry_run {
             eprintln!("(dry-run mode: no changes will be made)");
         }
-    }
-
-    // Group documents by content_hash
-    // If cross_namespace is false, we group by (namespace, content_hash)
-    // If cross_namespace is true, we group by content_hash only
-    let mut hash_groups: std::collections::HashMap<String, Vec<_>> =
-        std::collections::HashMap::new();
-    let mut docs_without_hash = 0;
-
-    for doc in &all_docs {
-        match &doc.content_hash {
-            Some(hash) if !hash.is_empty() => {
-                let key = if cross_namespace {
-                    hash.clone()
-                } else {
-                    format!("{}:{}", doc.namespace, hash)
-                };
-                hash_groups.entry(key).or_default().push(doc);
-            }
-            _ => {
-                docs_without_hash += 1;
-            }
-        }
-    }
-
-    // Find groups with duplicates (more than 1 document per hash)
-    let mut result = DedupResult {
-        total_docs: all_docs.len(),
-        unique_docs: 0,
-        duplicate_groups: 0,
-        duplicates_removed: 0,
-        docs_without_hash,
-        groups: Vec::new(),
-    };
-
-    for (_key, mut docs) in hash_groups {
-        if docs.len() == 1 {
-            result.unique_docs += 1;
-            continue;
-        }
-
-        // Sort documents based on keep strategy
-        match keep_strategy {
-            KeepStrategy::Oldest => {
-                docs.sort_by(|a, b| a.id.cmp(&b.id));
-            }
-            KeepStrategy::Newest => {
-                docs.sort_by(|a, b| b.id.cmp(&a.id));
-            }
-            KeepStrategy::HighestScore => {
-                // Already in search order (highest score first), no sort needed
-            }
-        }
-
-        // First document is kept, rest are duplicates
-        let kept = &docs[0];
-        let to_remove: Vec<_> = docs[1..].to_vec();
-
-        let group = DedupGroup {
-            content_hash: kept.content_hash.clone().unwrap_or_default(),
-            kept_id: kept.id.clone(),
-            kept_namespace: kept.namespace.clone(),
-            removed_ids: to_remove
-                .iter()
-                .map(|d| (d.id.clone(), d.namespace.clone()))
-                .collect(),
-        };
-
-        result.duplicate_groups += 1;
-        result.duplicates_removed += to_remove.len();
-        result.unique_docs += 1; // The kept one is unique
-
-        // Actually delete if not dry-run
-        if !dry_run {
-            for doc in &to_remove {
-                storage.delete_document(&doc.namespace, &doc.id).await?;
-            }
-        }
-
-        result.groups.push(group);
     }
 
     // Output results
@@ -1368,12 +1237,12 @@ pub async fn run_dedup(
                     &group.content_hash[..group.content_hash.len().min(16)]
                 );
                 eprintln!("  Kept: {} (ns: {})", group.kept_id, group.kept_namespace);
-                for (id, ns) in &group.removed_ids {
+                for removed in &group.removed {
                     eprintln!(
                         "  {} {} (ns: {})",
                         if dry_run { "Would remove:" } else { "Removed:" },
-                        id,
-                        ns
+                        removed.id,
+                        removed.namespace
                     );
                 }
             }
@@ -1750,34 +1619,26 @@ pub async fn run_merge(
     json_output: bool,
 ) -> Result<()> {
     let mut stats = MergeStats::default();
-
-    // Validate and sanitize source paths (prevents path traversal)
-    let mut validated_sources: Vec<PathBuf> = Vec::new();
-    for source in &source_paths {
-        let source_str = source.to_str().unwrap_or("");
-        match path_utils::sanitize_existing_path(source_str) {
-            Ok(validated) => validated_sources.push(validated),
-            Err(e) => {
-                if !json_output {
-                    eprintln!("Warning: Source database invalid: {} - {}", source_str, e);
-                }
-                stats.errors += 1;
-            }
-        }
-    }
-
-    if validated_sources.is_empty() {
-        return Err(anyhow::anyhow!("No valid source databases found"));
-    }
-
-    // Validate and sanitize target path (prevents path traversal)
-    let target_str = target_path.to_str().unwrap_or("");
-    let validated_target = path_utils::sanitize_new_path(target_str)?;
+    let execution = merge_databases(
+        source_paths.clone(),
+        target_path,
+        dedup,
+        namespace_prefix.clone(),
+        dry_run,
+    )
+    .await?;
+    let validated_target = execution.target_path;
+    stats.total_docs = execution.progress.total_docs;
+    stats.docs_copied = execution.progress.docs_copied;
+    stats.docs_skipped = execution.progress.docs_skipped;
+    stats.namespaces = execution.progress.namespaces.into_iter().collect();
+    stats.sources_processed = execution.progress.sources_processed;
+    stats.errors = execution.progress.errors;
 
     if !json_output {
         eprintln!("\n=== RMCP-MEMEX MERGE ===\n");
-        eprintln!("Sources: {} database(s)", validated_sources.len());
-        for src in &validated_sources {
+        eprintln!("Sources: {} database(s)", source_paths.len());
+        for src in &source_paths {
             eprintln!("  - {}", src.display());
         }
         eprintln!("Target:  {}", validated_target.display());
@@ -1789,184 +1650,6 @@ pub async fn run_merge(
             eprintln!("\n[DRY RUN - no changes will be made]\n");
         }
         eprintln!();
-    }
-
-    // Open target storage (will create if not exists)
-    let target_storage = if !dry_run {
-        // Ensure parent directory exists for target
-        if let Some(parent) = validated_target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Some(StorageManager::new_lance_only(validated_target.to_str().unwrap_or("")).await?)
-    } else {
-        None
-    };
-
-    // Track content hashes for deduplication (across all sources)
-    let mut seen_hashes: HashSet<String> = HashSet::new();
-
-    // If dedup is enabled and target exists, pre-populate seen_hashes from target
-    if dedup
-        && !dry_run
-        && let Some(ref target) = target_storage
-    {
-        // Get all existing documents from target to extract their hashes
-        if let Ok(existing_docs) = target.all_documents(None, 100000).await {
-            for doc in existing_docs {
-                if let Some(hash) = doc.content_hash {
-                    seen_hashes.insert(hash);
-                }
-            }
-            if !json_output && !seen_hashes.is_empty() {
-                eprintln!(
-                    "Found {} existing documents in target for dedup\n",
-                    seen_hashes.len()
-                );
-            }
-        }
-    }
-
-    // Process each source database
-    for source_path in &validated_sources {
-        if !json_output {
-            eprintln!("Processing: {}", source_path.display());
-        }
-
-        // Open source database read-only
-        // SAFETY: source_path was validated by path_utils::sanitize_existing_path above
-        let source_path_str = source_path.to_str().unwrap_or("");
-        let source_storage = match StorageManager::new_lance_only(source_path_str).await {
-            Ok(s) => s,
-            Err(e) => {
-                if !json_output {
-                    eprintln!("  Error opening source: {}", e);
-                }
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        // Get all documents from source (using zero embedding for full scan)
-        let source_docs = match source_storage.all_documents(None, 100000).await {
-            Ok(docs) => docs,
-            Err(e) => {
-                if !json_output {
-                    eprintln!("  Error reading source: {}", e);
-                }
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        if source_docs.is_empty() {
-            if !json_output {
-                eprintln!("  (empty database)\n");
-            }
-            stats.sources_processed += 1;
-            continue;
-        }
-
-        let source_doc_count = source_docs.len();
-        stats.total_docs += source_doc_count;
-
-        // Group by namespace for reporting
-        let mut by_namespace: std::collections::HashMap<String, Vec<_>> =
-            std::collections::HashMap::new();
-        for doc in source_docs {
-            by_namespace
-                .entry(doc.namespace.clone())
-                .or_default()
-                .push(doc);
-        }
-
-        if !json_output {
-            eprintln!(
-                "  Found {} documents in {} namespace(s)",
-                source_doc_count,
-                by_namespace.len()
-            );
-        }
-
-        // Process each namespace
-        for (ns_name, docs) in by_namespace {
-            // Apply namespace prefix if specified
-            let target_namespace = if let Some(ref prefix) = namespace_prefix {
-                format!("{}{}", prefix, ns_name)
-            } else {
-                ns_name.clone()
-            };
-
-            stats.namespaces.insert(target_namespace.clone());
-
-            let mut ns_copied = 0;
-            let mut ns_skipped = 0;
-
-            // Prepare batch for insertion
-            let mut batch: Vec<rust_memex::ChromaDocument> = Vec::new();
-
-            for doc in docs {
-                // Check for deduplication
-                if dedup && let Some(ref hash) = doc.content_hash {
-                    if seen_hashes.contains(hash) {
-                        ns_skipped += 1;
-                        stats.docs_skipped += 1;
-                        continue;
-                    }
-                    seen_hashes.insert(hash.clone());
-                }
-
-                // Create document with new namespace
-                let new_doc = rust_memex::ChromaDocument {
-                    id: doc.id,
-                    namespace: target_namespace.clone(),
-                    embedding: doc.embedding,
-                    metadata: doc.metadata,
-                    document: doc.document,
-                    layer: doc.layer,
-                    parent_id: doc.parent_id,
-                    children_ids: doc.children_ids,
-                    keywords: doc.keywords,
-                    content_hash: doc.content_hash,
-                };
-
-                batch.push(new_doc);
-                ns_copied += 1;
-                stats.docs_copied += 1;
-            }
-
-            // Write batch to target (unless dry run)
-            if !dry_run
-                && !batch.is_empty()
-                && let Some(ref target) = target_storage
-                && let Err(e) = target.add_to_store(batch).await
-            {
-                if !json_output {
-                    eprintln!("    Error writing to target: {}", e);
-                }
-                stats.errors += 1;
-            }
-
-            if !json_output {
-                let prefix_info = if namespace_prefix.is_some() {
-                    format!(" -> {}", target_namespace)
-                } else {
-                    String::new()
-                };
-                if ns_skipped > 0 {
-                    eprintln!(
-                        "    [{}{}] {} copied, {} skipped (duplicate)",
-                        ns_name, prefix_info, ns_copied, ns_skipped
-                    );
-                } else {
-                    eprintln!("    [{}{}] {} copied", ns_name, prefix_info, ns_copied);
-                }
-            }
-        }
-
-        stats.sources_processed += 1;
-        if !json_output {
-            eprintln!();
-        }
     }
 
     // Output final summary
