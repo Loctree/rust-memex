@@ -3804,6 +3804,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memex-contracts"
+version = "0.6.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memmap2"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5024,7 +5032,7 @@ dependencies = [
 
 [[package]]
 name = "rust-memex"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5039,6 +5047,7 @@ dependencies = [
  "glob",
  "indicatif",
  "lancedb",
+ "memex-contracts",
  "openidconnect",
  "pdf-extract",
  "protoc-bin-vendored",

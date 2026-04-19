@@ -25,6 +25,7 @@ pub mod progress;
 pub mod tui;
 
 use anyhow::Result;
+pub use memex_contracts as contracts;
 use tracing::Level;
 
 // Re-export core types for library consumers

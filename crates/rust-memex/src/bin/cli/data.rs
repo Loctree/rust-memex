@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+pub use rust_memex::contracts::audit::{
+    AuditRecommendation, AuditResult as NamespaceAuditResult, ChunkQuality, QualityTier,
+};
 use rust_memex::{
     EmbeddingClient, EmbeddingConfig, PreprocessingConfig, Preprocessor, RAGPipeline, SliceMode,
     StorageManager, compute_content_hash, path_utils,
@@ -780,20 +783,6 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
 // AUDIT & PURGE QUALITY COMMANDS
 // =============================================================================
 
-/// Namespace audit result with quality metrics
-#[derive(Debug, Serialize)]
-pub struct NamespaceAuditResult {
-    pub namespace: String,
-    pub document_count: usize,
-    pub avg_chunk_length: usize,
-    pub sentence_integrity: f32,
-    pub word_integrity: f32,
-    pub chunk_quality: f32,
-    pub overall_score: f32,
-    pub recommendation: String,
-    pub passes_threshold: bool,
-}
-
 /// Run audit on namespaces to check quality metrics
 pub async fn run_audit(
     namespace: Option<String>,
@@ -851,7 +840,7 @@ pub async fn run_audit(
                 word_integrity: 0.0,
                 chunk_quality: 0.0,
                 overall_score: 0.0,
-                recommendation: "EMPTY".to_string(),
+                recommendation: AuditRecommendation::Empty,
                 passes_threshold: false,
             });
             continue;
@@ -865,10 +854,10 @@ pub async fn run_audit(
         let passes = metrics.overall >= threshold_f32;
 
         let recommendation = match metrics.recommendation() {
-            IntegrityRecommendation::Excellent => "EXCELLENT",
-            IntegrityRecommendation::Good => "GOOD",
-            IntegrityRecommendation::Warn => "WARN",
-            IntegrityRecommendation::Purge => "PURGE",
+            IntegrityRecommendation::Excellent => AuditRecommendation::Excellent,
+            IntegrityRecommendation::Good => AuditRecommendation::Good,
+            IntegrityRecommendation::Warn => AuditRecommendation::Warn,
+            IntegrityRecommendation::Purge => AuditRecommendation::Purge,
         };
 
         results.push(NamespaceAuditResult {
@@ -879,7 +868,7 @@ pub async fn run_audit(
             word_integrity: metrics.word_integrity,
             chunk_quality: metrics.chunk_quality,
             overall_score: metrics.overall,
-            recommendation: recommendation.to_string(),
+            recommendation,
             passes_threshold: passes,
         });
 

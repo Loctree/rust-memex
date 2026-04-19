@@ -48,6 +48,8 @@ use axum::{
     },
     routing::{delete, get, post},
 };
+pub use memex_contracts::progress::{CompactProgress, SseEvent};
+pub use memex_contracts::stats::{DatabaseStats, StorageMetrics};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,

@@ -3,22 +3,12 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+pub use rust_memex::contracts::stats::{DatabaseStats, NamespaceStats, StorageMetrics};
+pub use rust_memex::contracts::timeline::{TimeRange, TimelineEntry, TimelineFilter};
 use rust_memex::{
     BM25Config, BM25Index, EmbeddingClient, EmbeddingConfig, HealthChecker, RAGPipeline,
     SliceLayer, StorageManager, inspect_cross_store_recovery,
 };
-
-/// Namespace overview stats
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct NamespaceStats {
-    pub name: String,
-    pub total_chunks: usize,
-    pub layer_counts: std::collections::HashMap<String, usize>,
-    top_keywords: Vec<(String, usize)>,
-    pub has_timestamps: bool,
-    pub earliest_indexed: Option<String>,
-    pub latest_indexed: Option<String>,
-}
 
 /// Run overview command - quick stats and health check
 pub async fn run_overview(
@@ -752,15 +742,6 @@ pub async fn run_recall(
     }
 
     Ok(())
-}
-
-/// Timeline entry for JSON output
-#[derive(Debug, Clone, Serialize)]
-pub struct TimelineEntry {
-    pub date: String,
-    pub namespace: String,
-    pub source: Option<String>,
-    pub chunk_count: usize,
 }
 
 /// Timeline report for JSON output

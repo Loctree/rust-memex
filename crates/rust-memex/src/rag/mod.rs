@@ -1,4 +1,8 @@
 use anyhow::{Result, anyhow};
+pub use memex_contracts::audit::{AuditRecommendation, AuditResult, ChunkQuality, QualityTier};
+pub use memex_contracts::progress::{
+    AuditProgress, MergeProgress, ReindexProgress, RepairResult, ReprocessProgress,
+};
 use pdf_extract;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

@@ -1,0 +1,78 @@
+[package]
+name = "rust-memex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/rust-memex"
+readme = "../../README.md"
+
+[features]
+default = ["cli", "provider-cascade"]
+
+# CLI feature: enables the binary, TUI wizard, and progress bars
+cli = ["clap", "indicatif", "ratatui", "crossterm", "sysinfo"]
+
+# Provider cascade: current Ollama/OpenAI-compatible embedding approach
+provider-cascade = []
+
+# Embedded Candle embeddings (placeholder for future)
+# embedded-candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+
+[lib]
+name = "rust_memex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-memex"
+path = "src/bin/rust_memex.rs"
+required-features = ["cli"]
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+futures.workspace = true
+glob.workspace = true
+indicatif = { workspace = true, optional = true }
+lancedb.workspace = true
+memex-contracts = { path = "../memex-contracts" }
+openidconnect.workspace = true
+pdf-extract.workspace = true
+ratatui = { workspace = true, optional = true }
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shellexpand.workspace = true
+subtle.workspace = true
+sysinfo = { workspace = true, optional = true }
+tantivy.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
