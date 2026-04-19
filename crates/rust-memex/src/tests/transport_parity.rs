@@ -59,8 +59,6 @@ fn tool_names() -> Vec<String> {
 const EXPECTED_TOOLS: &[&str] = &[
     "health",
     "rag_index",
-    "rag_index_text",
-    "rag_search",
     "memory_upsert",
     "memory_get",
     "memory_search",

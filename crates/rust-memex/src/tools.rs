@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -403,8 +403,6 @@ mod tests {
 
         assert!(names.contains(&"health"));
         assert!(names.contains(&"rag_index"));
-        assert!(names.contains(&"rag_index_text"));
-        assert!(names.contains(&"rag_search"));
         assert!(names.contains(&"memory_upsert"));
         assert!(names.contains(&"memory_search"));
         assert!(names.contains(&"memory_get"));

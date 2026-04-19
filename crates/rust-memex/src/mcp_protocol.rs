@@ -3,8 +3,6 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use uuid::Uuid;
-
 use crate::{
     auth::{AuthDenial, AuthManager, Scope},
     embeddings::EmbeddingClient,
@@ -102,8 +100,6 @@ impl McpMethod {
 enum McpTool {
     Health,
     RagIndex,
-    RagIndexText,
-    RagSearch,
     MemoryUpsert,
     MemoryGet,
     MemorySearch,
@@ -117,11 +113,9 @@ enum McpTool {
 }
 
 impl McpTool {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 12] = [
         Self::Health,
         Self::RagIndex,
-        Self::RagIndexText,
-        Self::RagSearch,
         Self::MemoryUpsert,
         Self::MemoryGet,
         Self::MemorySearch,
@@ -138,8 +132,6 @@ impl McpTool {
         match name {
             "health" => Some(Self::Health),
             "rag_index" => Some(Self::RagIndex),
-            "rag_index_text" => Some(Self::RagIndexText),
-            "rag_search" => Some(Self::RagSearch),
             "memory_upsert" => Some(Self::MemoryUpsert),
             "memory_get" => Some(Self::MemoryGet),
             "memory_search" => Some(Self::MemorySearch),
@@ -158,8 +150,6 @@ impl McpTool {
         match self {
             Self::Health => "health",
             Self::RagIndex => "rag_index",
-            Self::RagIndexText => "rag_index_text",
-            Self::RagSearch => "rag_search",
             Self::MemoryUpsert => "memory_upsert",
             Self::MemoryGet => "memory_get",
             Self::MemorySearch => "memory_search",
@@ -194,37 +184,6 @@ impl McpTool {
                         "namespace": {"type": "string"}
                     },
                     "required": ["path"]
-                }
-            }),
-            Self::RagIndexText => json!({
-                "name": self.name(),
-                "description": "Index raw text for RAG/memory",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "id": {"type": "string"},
-                        "namespace": {"type": "string"},
-                        "metadata": {"type": "object"}
-                    },
-                    "required": ["text"]
-                }
-            }),
-            Self::RagSearch => json!({
-                "name": self.name(),
-                "description": "Search documents using RAG",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "k": {"type": "integer", "default": 10},
-                        "namespace": {"type": "string"},
-                        "project": {"type": "string", "description": "Filter to documents whose metadata project/project_id matches this value"},
-                        "deep": {"type": "boolean", "default": false, "description": "Include all onion layers instead of only outer summaries"},
-                        "mode": {"type": "string", "enum": ["vector", "bm25", "hybrid"], "default": "hybrid", "description": "Search mode: vector (semantic), bm25 (keyword), hybrid (both)"},
-                        "auto_route": {"type": "boolean", "default": false, "description": "Auto-detect query intent and select optimal search mode. Overrides mode when true."}
-                    },
-                    "required": ["query"]
                 }
             }),
             Self::MemoryUpsert => json!({
@@ -571,56 +530,6 @@ impl McpCore {
                     Err(e) => Ok(tool_error(e)),
                 }
             }
-            McpTool::RagIndexText => {
-                let text = args["text"].as_str().unwrap_or("").to_string();
-                let namespace = args["namespace"].as_str();
-                let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
-                let item_id = args
-                    .get("id")
-                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-                match self
-                    .rag
-                    .index_text(namespace, item_id.clone(), text, metadata)
-                    .await
-                {
-                    Ok(returned_id) => {
-                        Ok(text_result(format!("Indexed text with id {}", returned_id)))
-                    }
-                    Err(e) => Ok(tool_error(e)),
-                }
-            }
-            McpTool::RagSearch => {
-                let query = args["query"].as_str().unwrap_or("");
-                let limit = requested_limit(args, 10);
-                let namespace = args["namespace"].as_str();
-                let mode = requested_search_mode(query, args);
-                let options = requested_search_options(args);
-
-                if let Some(hybrid_result) = self
-                    .try_hybrid_search(
-                        query,
-                        namespace,
-                        limit,
-                        (mode, options.clone()),
-                        id,
-                        SearchShape::Rag,
-                    )
-                    .await?
-                {
-                    return Ok(hybrid_result);
-                }
-
-                match self
-                    .rag
-                    .search_with_options(namespace, query, limit, options)
-                    .await
-                {
-                    Ok(results) => Ok(text_result_from_json(&results)),
-                    Err(e) => Ok(tool_error(e)),
-                }
-            }
             McpTool::MemoryUpsert => {
                 let namespace = args["namespace"].as_str().unwrap_or("default");
                 let token = args["token"].as_str();
@@ -677,7 +586,6 @@ impl McpCore {
                         limit,
                         (mode, options.clone()),
                         id,
-                        SearchShape::Memory,
                     )
                     .await?
                 {
@@ -932,7 +840,6 @@ impl McpCore {
         limit: usize,
         search: (SearchMode, SearchOptions),
         id: &Value,
-        shape: SearchShape,
     ) -> std::result::Result<Option<Value>, Value> {
         let (mode, options) = search;
         if mode == SearchMode::Vector {
@@ -956,48 +863,25 @@ impl McpCore {
             .await
             .map_err(|e| jsonrpc_error(Some(id), -32603, format!("Hybrid search failed: {}", e)))?;
 
-        let payload: Vec<Value> = match shape {
-            SearchShape::Rag => results
-                .iter()
-                .map(|result| {
-                    json!({
-                        "id": result.id,
-                        "namespace": result.namespace,
-                        "document": result.document,
-                        "combined_score": result.combined_score,
-                        "vector_score": result.vector_score,
-                        "bm25_score": result.bm25_score,
-                        "metadata": result.metadata,
-                        "layer": result.layer.as_ref().map(|layer| format!("{:?}", layer)),
-                        "keywords": result.keywords
-                    })
+        let payload: Vec<Value> = results
+            .iter()
+            .map(|result| {
+                json!({
+                    "id": result.id,
+                    "namespace": result.namespace,
+                    "text": result.document,
+                    "score": result.combined_score,
+                    "vector_score": result.vector_score,
+                    "bm25_score": result.bm25_score,
+                    "metadata": result.metadata
                 })
-                .collect(),
-            SearchShape::Memory => results
-                .iter()
-                .map(|result| {
-                    json!({
-                        "id": result.id,
-                        "namespace": result.namespace,
-                        "text": result.document,
-                        "score": result.combined_score,
-                        "vector_score": result.vector_score,
-                        "bm25_score": result.bm25_score,
-                        "metadata": result.metadata
-                    })
-                })
-                .collect(),
-        };
+            })
+            .collect();
 
         Ok(Some(text_result_from_json(&payload)))
     }
 }
 
-#[derive(Clone, Copy)]
-enum SearchShape {
-    Rag,
-    Memory,
-}
 
 fn requested_search_mode(query: &str, args: &Value) -> SearchMode {
     if args["auto_route"].as_bool().unwrap_or(false) {

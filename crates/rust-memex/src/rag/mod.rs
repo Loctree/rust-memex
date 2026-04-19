@@ -467,15 +467,31 @@ impl Default for OnionSliceConfig {
 
 fn create_core_only_slice(content: &str) -> Vec<OnionSlice> {
     let core_id = OnionSlice::generate_id(content, SliceLayer::Core);
-    let keywords = extract_keywords(content, 5);
-    vec![OnionSlice {
-        id: core_id,
-        layer: SliceLayer::Core,
-        content: content.to_string(),
-        parent_id: None,
-        children_ids: vec![],
-        keywords,
-    }]
+    let core_keywords = extract_keywords(content, 5);
+
+    // Short content still needs an Outer slice so default search (layer=Outer)
+    // can find it. Without this, short onion entries are invisible unless deep=true.
+    let outer_id = OnionSlice::generate_id(content, SliceLayer::Outer);
+    let outer_keywords = extract_keywords(content, 3);
+
+    vec![
+        OnionSlice {
+            id: outer_id.clone(),
+            layer: SliceLayer::Outer,
+            content: content.to_string(),
+            parent_id: Some(core_id.clone()),
+            children_ids: vec![],
+            keywords: outer_keywords,
+        },
+        OnionSlice {
+            id: core_id,
+            layer: SliceLayer::Core,
+            content: content.to_string(),
+            parent_id: None,
+            children_ids: vec![outer_id],
+            keywords: core_keywords,
+        },
+    ]
 }
 
 /// Create onion slices from content
