@@ -9,7 +9,8 @@ use tracing_subscriber::FmtSubscriber;
 
 use rust_memex::{
     EmbeddingClient, QueryRouter, RAGPipeline, SearchMode, SearchModeRecommendation, SliceLayer,
-    SliceMode, StorageManager, WizardConfig, create_server, run_wizard,
+    SliceMode, StorageManager, WizardConfig, create_server, default_reindexed_namespace,
+    run_wizard,
 };
 
 use crate::cli::config::*;

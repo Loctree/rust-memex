@@ -4,6 +4,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod handlers;
 pub mod http;
+pub mod lifecycle;
 pub mod mcp_core;
 pub mod mcp_protocol;
 mod mcp_runtime;
@@ -95,6 +96,12 @@ pub use storage::{
 
 // High-level engine API
 pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
+pub use lifecycle::{
+    ExportRecord, ImportOutcome, NamespaceMigrationOutcome, ReindexJob, ReindexOutcome,
+    ReprocessJob, ReprocessOutcome, default_reindexed_namespace, export_namespace_jsonl_stream,
+    import_jsonl_bytes_stream, import_jsonl_file, import_jsonl_reader, migrate_namespace_atomic,
+    reindex_namespace, reprocess_jsonl_file,
+};
 
 // Canonical MCP metadata plus local Rust helper API.
 pub use tools::{

@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use rust_memex::{
     BM25Config, BM25Index, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig,
     IndexProgressTracker, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
-    RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, path_utils,
-    rag::PipelineGovernorConfig, repair_cross_store_recovery,
+    RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, migrate_namespace_atomic,
+    path_utils, rag::PipelineGovernorConfig, repair_cross_store_recovery,
 };
 
 use crate::cli::definition::*;
@@ -1542,6 +1542,37 @@ pub async fn run_migrate_namespace(
             );
             eprintln!("\nNo changes made (dry run).");
         }
+        return Ok(());
+    }
+
+    if !merge && delete_source {
+        let outcome = migrate_namespace_atomic(&storage, &from, &to).await?;
+        let result = MigrationResult {
+            from_namespace: outcome.from_namespace.clone(),
+            to_namespace: outcome.to_namespace.clone(),
+            docs_migrated: outcome.migrated_chunks,
+            docs_merged: 0,
+            source_deleted: true,
+            dry_run: false,
+        };
+
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "success",
+                    "result": result
+                }))?
+            );
+        } else {
+            eprintln!("\n-> Namespace Migration Complete\n");
+            eprintln!("  From:           '{}'", outcome.from_namespace);
+            eprintln!("  To:             '{}'", outcome.to_namespace);
+            eprintln!("  Docs migrated:  {}", outcome.migrated_chunks);
+            eprintln!("  Source '{}': atomically renamed", outcome.from_namespace);
+            eprintln!("\n  DB path: {}", db_path);
+        }
+
         return Ok(());
     }
 

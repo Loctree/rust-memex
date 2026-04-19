@@ -1692,6 +1692,11 @@ impl RAGPipeline {
         self.storage.clone()
     }
 
+    pub async fn embedding_healthcheck(&self) -> Result<()> {
+        self.mlx_bridge.lock().await.embed("healthcheck").await?;
+        Ok(())
+    }
+
     /// Refresh storage to see new data written by other processes
     pub async fn refresh(&self) -> Result<()> {
         self.storage.refresh().await
@@ -3756,13 +3761,22 @@ fn metadata_matches_project(metadata: &Value, project: &str) -> bool {
         return true;
     }
 
+    let needle = canonical_project_identity(needle);
+
     metadata.as_object().is_some_and(|object| {
         ["project", "project_id", "source_project"]
             .iter()
             .filter_map(|key| object.get(*key))
             .filter_map(|value| value.as_str())
-            .any(|value| value.eq_ignore_ascii_case(needle))
+            .any(|value| canonical_project_identity(value) == needle)
     })
+}
+
+fn canonical_project_identity(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "loctree" | "vetcoders" => "vetcoders".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

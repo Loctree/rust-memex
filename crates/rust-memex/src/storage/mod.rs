@@ -569,6 +569,43 @@ impl StorageManager {
         Ok(pre_count)
     }
 
+    pub async fn rename_namespace_atomic(&self, from: &str, to: &str) -> Result<usize> {
+        if from == to {
+            return Ok(0);
+        }
+
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        let source_filter = self.namespace_filter(from);
+        let source_count = table.count_rows(Some(source_filter.clone())).await?;
+        if source_count == 0 {
+            return Ok(0);
+        }
+
+        let target_filter = self.namespace_filter(to);
+        let target_count = table.count_rows(Some(target_filter)).await?;
+        if target_count > 0 {
+            return Err(anyhow!(
+                "Target namespace '{}' already exists with {} rows",
+                to,
+                target_count
+            ));
+        }
+
+        let sql_literal = format!("'{}'", to.replace('\'', "''"));
+        let update = table
+            .update()
+            .only_if(source_filter)
+            .column("namespace", sql_literal)
+            .execute()
+            .await?;
+
+        Ok(update.rows_updated as usize)
+    }
+
     pub fn get_collection_name(&self) -> &str {
         &self.collection_name
     }

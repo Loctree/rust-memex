@@ -614,13 +614,22 @@ fn matches_project_filter(metadata: &Value, project: &str) -> bool {
         return true;
     }
 
+    let needle = canonical_project_identity(needle);
+
     metadata.as_object().is_some_and(|object| {
         ["project", "project_id", "source_project"]
             .iter()
             .filter_map(|key| object.get(*key))
             .filter_map(|value| value.as_str())
-            .any(|value| value.eq_ignore_ascii_case(needle))
+            .any(|value| canonical_project_identity(value) == needle)
     })
+}
+
+fn canonical_project_identity(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "loctree" | "vetcoders" => "vetcoders".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn boosted_score(query: &str, base_score: f32, metadata: &Value, layer: Option<SliceLayer>) -> f32 {

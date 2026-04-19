@@ -21,7 +21,7 @@ argon2 = "0.5"
 arrow-array = "56.2"
 arrow-schema = "56.2"
 async-stream = "0.3"
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"

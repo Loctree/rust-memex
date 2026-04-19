@@ -19,8 +19,13 @@
 //! - GET  /sse/search        - SSE streaming search
 //! - GET  /sse/namespaces    - SSE streaming namespace listing with summaries
 //! - POST /sse/optimize      - SSE streaming database optimize (compact + prune)
+//! - POST /sse/reprocess     - SSE streaming namespace rebuild from JSONL
+//! - POST /sse/reindex       - SSE streaming namespace rebuild from namespace source
 //! - POST /upsert            - Upsert document (memory_upsert)
 //! - POST /index             - Index text with full pipeline
+//! - POST /api/export        - Stream a namespace as JSONL
+//! - POST /api/import        - Import JSONL into a namespace
+//! - POST /api/migrate-namespace - Atomically rename a namespace
 //! - GET  /expand/:ns/:id    - Expand onion slice (get children)
 //! - GET  /parent/:ns/:id    - Get parent slice (drill up)
 //! - DELETE /ns/:namespace   - Purge namespace
@@ -30,6 +35,8 @@
 //! - POST /mcp/messages/    - JSON-RPC POST endpoint with session_id
 //!
 //! Vibecrafted with AI Agents by Loctree (c)2026 Loctree
+
+mod lifecycle;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -944,6 +951,24 @@ pub struct HttpState {
     pub auth_manager: Option<Arc<crate::auth::AuthManager>>,
     /// Optional dashboard-only OIDC runtime for browser sessions.
     dashboard_oidc: Option<Arc<DashboardOidcRuntime>>,
+}
+
+impl HttpState {
+    pub fn new(rag: Arc<RAGPipeline>, mcp_core: Arc<McpCore>) -> Self {
+        Self {
+            rag,
+            mcp_core,
+            mcp_sessions: Arc::new(McpSessionManager::new()),
+            mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
+            cached_namespaces: Arc::new(RwLock::new(None)),
+            namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            auth_token: None,
+            auth_mode: AuthMode::MutatingOnly,
+            allow_query_token: false,
+            auth_manager: None,
+            dashboard_oidc: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1943,6 +1968,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/index", post(index_handler))
         .route("/delete/{ns}/{id}", post(delete_handler))
         .route("/ns/{namespace}", delete(purge_namespace_handler))
+        .merge(lifecycle_routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1970,6 +1996,10 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .merge(mcp_routes)
         .layer(cors)
         .with_state(state)
+}
+
+fn lifecycle_routes() -> Router<HttpState> {
+    lifecycle::routes()
 }
 
 /// Health check endpoint
