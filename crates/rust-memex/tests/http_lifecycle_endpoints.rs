@@ -408,11 +408,16 @@ async fn export_import_round_trip_and_migrate_namespace_work() {
         .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
         .collect::<Vec<_>>();
     assert_eq!(exported_rows.len(), 2);
-    assert!(
-        exported_rows
-            .iter()
-            .all(|row| row["content_hash"].is_string())
-    );
+    let exported_hashes = exported_rows
+        .iter()
+        .map(|row| {
+            row["content_hash"]
+                .as_str()
+                .expect("exported content hash")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exported_hashes, vec!["hash-alpha", "hash-beta"]);
 
     let boundary = "memex-boundary";
     let import_body = multipart_body("import-copy", false, &exported_jsonl, boundary);
@@ -435,6 +440,12 @@ async fn export_import_round_trip_and_migrate_namespace_work() {
     )
     .expect("import json");
     assert_eq!(import_json["imported_count"], 2);
+    assert_eq!(
+        import_json["imported_count"]
+            .as_u64()
+            .expect("imported count") as usize,
+        exported_rows.len()
+    );
     assert_eq!(
         test_app
             .storage

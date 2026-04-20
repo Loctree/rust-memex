@@ -15,16 +15,15 @@ use axum::{
     routing::post,
 };
 use futures::StreamExt;
+use memex_contracts::progress::SseEvent;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use crate::{
     ReindexJob, ReprocessJob, SliceMode, default_reindexed_namespace,
-    export_namespace_jsonl_stream, import_jsonl_file, migrate_namespace_atomic, reindex_namespace,
-    reprocess_jsonl_file,
+    export_namespace_jsonl_stream, import_jsonl_bytes_stream, migrate_namespace_atomic,
+    reindex_namespace, reprocess_jsonl_file,
 };
 
 use super::HttpState;
@@ -261,7 +260,7 @@ async fn import_handler(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut namespace = None;
     let mut skip_existing = false;
-    let mut upload_path = None;
+    let mut imported_count = None;
 
     while let Some(field) = multipart.next_field().await.map_err(internal_error)? {
         let field_name = field.name().unwrap_or_default().to_string();
@@ -274,40 +273,52 @@ async fn import_handler(
                 skip_existing = parse_bool_field(&value)?;
             }
             "file" => {
-                let path = temp_upload_path();
-                let mut file = tokio::fs::File::create(&path)
-                    .await
-                    .map_err(internal_error)?;
+                let namespace = namespace.clone().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "missing multipart field 'namespace' before file upload".to_string(),
+                    )
+                })?;
                 let mut field = field;
-                while let Some(chunk) = field.chunk().await.map_err(internal_error)? {
-                    file.write_all(&chunk).await.map_err(internal_error)?;
-                }
-                file.flush().await.map_err(internal_error)?;
-                upload_path = Some(path);
+                let stream = async_stream::stream! {
+                    loop {
+                        match field.chunk().await {
+                            Ok(Some(chunk)) => yield Ok::<Bytes, String>(chunk),
+                            Ok(None) => break,
+                            Err(err) => {
+                                yield Err(err.to_string());
+                                break;
+                            }
+                        }
+                    }
+                };
+                futures::pin_mut!(stream);
+                let outcome =
+                    import_jsonl_bytes_stream(state.rag.clone(), namespace, skip_existing, stream)
+                        .await
+                        .map_err(internal_error)?;
+                imported_count = Some(outcome.imported_count);
+                break;
             }
             _ => {}
         }
     }
 
-    let namespace = namespace.ok_or_else(|| {
-        (
+    if namespace.is_none() {
+        return Err((
             StatusCode::BAD_REQUEST,
             "missing multipart field 'namespace'".to_string(),
-        )
-    })?;
-    let upload_path = upload_path.ok_or_else(|| {
+        ));
+    }
+
+    let imported_count = imported_count.ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             "missing multipart file field 'file'".to_string(),
         )
     })?;
 
-    let outcome = import_jsonl_file(state.rag.clone(), namespace, &upload_path, skip_existing)
-        .await
-        .map_err(internal_error)?;
-    let _ = tokio::fs::remove_file(&upload_path).await;
-
-    Ok(Json(json!({ "imported_count": outcome.imported_count })))
+    Ok(Json(json!({ "imported_count": imported_count })))
 }
 
 async fn migrate_namespace_handler(
@@ -321,15 +332,15 @@ async fn migrate_namespace_handler(
     Ok(Json(json!({ "migrated_chunks": outcome.migrated_chunks })))
 }
 
-fn sse_event(event: &str, data: Value) -> crate::contracts::progress::SseEvent {
-    crate::contracts::progress::SseEvent {
+fn sse_event(event: &str, data: Value) -> SseEvent {
+    SseEvent {
         event: event.to_string(),
         id: None,
         data,
     }
 }
 
-fn to_axum_event(event: crate::contracts::progress::SseEvent) -> Event {
+fn to_axum_event(event: SseEvent) -> Event {
     let mut axum_event = Event::default()
         .event(event.event)
         .data(event.data.to_string());
@@ -347,10 +358,6 @@ fn sanitize_filename(namespace: &str) -> String {
             _ => '_',
         })
         .collect()
-}
-
-fn temp_upload_path() -> PathBuf {
-    std::env::temp_dir().join(format!("rust-memex-import-{}.jsonl", Uuid::new_v4()))
 }
 
 fn parse_bool_field(value: &str) -> Result<bool, (StatusCode, String)> {

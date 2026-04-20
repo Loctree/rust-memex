@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use async_stream::try_stream;
 use axum::body::Bytes;
 use futures::{Stream, StreamExt};
+use memex_contracts::progress::{ReindexProgress, ReprocessProgress};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -289,7 +290,7 @@ pub async fn reprocess_jsonl_file<F>(
     mut on_progress: F,
 ) -> Result<ReprocessOutcome>
 where
-    F: FnMut(crate::contracts::progress::ReprocessProgress),
+    F: FnMut(ReprocessProgress),
 {
     let ReprocessJob {
         input_path,
@@ -330,7 +331,7 @@ where
             parse_errors,
         },
         |progress| {
-            on_progress(crate::contracts::progress::ReprocessProgress {
+            on_progress(ReprocessProgress {
                 source_label: source_label.clone(),
                 processed_documents: progress.processed_documents,
                 indexed_documents: progress.indexed_documents,
@@ -363,7 +364,7 @@ pub async fn reindex_namespace<F>(
     mut on_progress: F,
 ) -> Result<ReindexOutcome>
 where
-    F: FnMut(crate::contracts::progress::ReindexProgress),
+    F: FnMut(ReindexProgress),
 {
     let ReindexJob {
         source_namespace,
@@ -441,7 +442,7 @@ where
             parse_errors: 0,
         },
         |progress| {
-            on_progress(crate::contracts::progress::ReindexProgress {
+            on_progress(ReindexProgress {
                 namespace: progress_namespace.clone(),
                 total_files: canonical_documents,
                 processed_files: progress.processed_documents,
