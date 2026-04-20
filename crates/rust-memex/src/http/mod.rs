@@ -61,9 +61,13 @@ use axum::{
     },
     routing::{delete, get, post},
 };
-pub use memex_contracts::progress::{CompactProgress, MergeProgress, RepairResult, SseEvent};
+pub use memex_contracts::audit::{AuditRecommendation, AuditResult, ChunkQuality, QualityTier};
+pub use memex_contracts::progress::{
+    AuditProgress, CompactProgress, MergeProgress, ReindexProgress, RepairResult,
+    ReprocessProgress, SseEvent,
+};
 pub use memex_contracts::stats::{DatabaseStats, NamespaceStats, StorageMetrics};
-use memex_contracts::{audit::AuditResult, timeline::TimelineEntry};
+pub use memex_contracts::timeline::{TimeRange, TimelineEntry, TimelineFilter};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,

@@ -1,8 +1,3 @@
-use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
-use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::{
     auth::{AuthDenial, AuthManager, Scope},
     embeddings::EmbeddingClient,
@@ -10,6 +5,11 @@ use crate::{
     rag::{RAGPipeline, SearchOptions, SliceLayer},
     search::{HybridSearcher, SearchMode},
 };
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const SERVER_NAME: &str = "rust-memex";
@@ -580,13 +580,7 @@ impl McpCore {
                 let options = requested_search_options(args);
 
                 if let Some(hybrid_result) = self
-                    .try_hybrid_search(
-                        query,
-                        Some(namespace),
-                        limit,
-                        (mode, options.clone()),
-                        id,
-                    )
+                    .try_hybrid_search(query, Some(namespace), limit, (mode, options.clone()), id)
                     .await?
                 {
                     return Ok(hybrid_result);
@@ -881,7 +875,6 @@ impl McpCore {
         Ok(Some(text_result_from_json(&payload)))
     }
 }
-
 
 fn requested_search_mode(query: &str, args: &Value) -> SearchMode {
     if args["auto_route"].as_bool().unwrap_or(false) {

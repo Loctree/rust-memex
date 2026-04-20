@@ -190,6 +190,7 @@ pub async fn run_stdio_server(config: ServerConfig) -> Result<()> {
 #[cfg(test)]
 mod lib_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn default_config_has_expected_values() {
@@ -197,5 +198,37 @@ mod lib_tests {
         assert_eq!(cfg.cache_mb, 4096);
         assert_eq!(cfg.db_path, "~/.rmcp-servers/rust-memex/lancedb");
         assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn contracts_are_reachable_through_main_crate() {
+        let audit = contracts::audit::AuditResult {
+            namespace: "animals".to_string(),
+            document_count: 4,
+            avg_chunk_length: 256,
+            sentence_integrity: 0.92,
+            word_integrity: 0.94,
+            chunk_quality: 0.9,
+            overall_score: 0.91,
+            recommendation: contracts::audit::AuditRecommendation::Good,
+            passes_threshold: true,
+        };
+        let storage = contracts::stats::StorageMetrics::default();
+        let timeline = contracts::timeline::TimelineFilter {
+            namespace: Some("animals".to_string()),
+            since: Some("2026-04-19".to_string()),
+            gaps_only: false,
+        };
+        let progress = contracts::progress::SseEvent {
+            event: "done".to_string(),
+            id: Some("evt-1".to_string()),
+            data: json!({ "status": "ok" }),
+        };
+
+        let _: rag::AuditResult = audit.clone();
+        let _: http::AuditResult = audit;
+        let _: http::StorageMetrics = storage;
+        let _: http::TimelineFilter = timeline;
+        let _: http::SseEvent = progress;
     }
 }
