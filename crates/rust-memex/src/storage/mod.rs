@@ -546,6 +546,40 @@ impl StorageManager {
         Ok(pre_count)
     }
 
+    /// Batch delete documents by IDs within a namespace.
+    ///
+    /// Issues a single `DELETE WHERE namespace = X AND id IN (...)` per chunk,
+    /// avoiding the per-document table scan that `delete_document` incurs when
+    /// called in a loop. Predicate is split into 500-id chunks to keep SQL
+    /// length bounded regardless of caller batch size.
+    pub async fn delete_documents(&self, namespace: &str, ids: &[&str]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+        const CHUNK: usize = 500;
+        let ns_filter = self.namespace_filter(namespace);
+        let mut total_deleted = 0usize;
+        for batch in ids.chunks(CHUNK) {
+            let id_list = batch
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let predicate = format!("{} AND id IN ({})", ns_filter, id_list);
+            let pre_count = table.count_rows(Some(predicate.clone())).await? as usize;
+            if pre_count == 0 {
+                continue;
+            }
+            table.delete(predicate.as_str()).await?;
+            total_deleted += pre_count;
+        }
+        Ok(total_deleted)
+    }
+
     pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
         let table = match self.open_table_if_exists().await? {
             Some(t) => t,
