@@ -246,7 +246,7 @@ impl HybridSearcher {
             })
             .collect();
         Self::apply_post_search_processing(query, &mut results, &options);
-        Self::dedup_by_content_hash(&mut results);
+        Self::dedup_by_chunk_hash(&mut results);
         Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         results.truncate(limit);
@@ -290,7 +290,7 @@ impl HybridSearcher {
         }
 
         Self::apply_post_search_processing(query, &mut results, &options);
-        Self::dedup_by_content_hash(&mut results);
+        Self::dedup_by_chunk_hash(&mut results);
         Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
         results.truncate(limit);
@@ -383,7 +383,7 @@ impl HybridSearcher {
         }
 
         Self::apply_post_search_processing(query, &mut final_results, &options);
-        Self::dedup_by_content_hash(&mut final_results);
+        Self::dedup_by_chunk_hash(&mut final_results);
         Self::dedup_by_source_path(&mut final_results);
         Self::enforce_source_diversity(&mut final_results, self.config.max_per_source);
         final_results.truncate(limit);
@@ -420,24 +420,36 @@ impl HybridSearcher {
         });
     }
 
-    /// Deduplicate results by content_hash (chunk-level) from metadata.
-    /// content_hash = per-chunk hash (unique per chunk content).
-    /// file_hash = per-file hash (provenance, NOT used for dedup).
-    fn dedup_by_content_hash(results: &mut Vec<HybridSearchResult>) {
+    /// Deduplicate results by per-chunk hash from metadata.
+    ///
+    /// Schema v4 (post spec P0) stores the per-chunk SHA256 under
+    /// `metadata.chunk_hash`. The legacy field `metadata.content_hash` (v3 and
+    /// earlier) actually held the *source* document hash for every onion
+    /// layer, so reading it here would either no-op silently (post-v4 chunks
+    /// have no `content_hash` field in metadata) or aggressively collapse
+    /// every onion layer of a single source into one result (legacy chunks).
+    /// Either outcome contradicts the function name.
+    ///
+    /// Chunk-level dedup therefore keys strictly on `metadata.chunk_hash`.
+    /// Results without that field (legacy v3 chunks, no-hash flat indexers)
+    /// are passed through untouched — `dedup_by_source_path` and
+    /// `enforce_source_diversity` still bound the result list.
+    ///
+    /// `metadata.source_hash` is preserved for provenance and is not used
+    /// here; `metadata.file_hash` is a deprecated alias of `source_hash` and
+    /// is also ignored.
+    fn dedup_by_chunk_hash(results: &mut Vec<HybridSearchResult>) {
         let mut seen: HashSet<String> = HashSet::new();
         let before = results.len();
         results.retain(|r| {
-            match r.metadata.get("content_hash").and_then(|v| v.as_str()) {
+            match r.metadata.get("chunk_hash").and_then(|v| v.as_str()) {
                 Some(hash) => seen.insert(hash.to_string()),
-                None => true, // keep results without content_hash
+                None => true, // keep legacy/no-hash chunks; source-path dedup still applies
             }
         });
         let removed = before - results.len();
         if removed > 0 {
-            tracing::debug!(
-                "Dedup: removed {} duplicate chunks by content_hash",
-                removed
-            );
+            tracing::debug!("Dedup: removed {} duplicate chunks by chunk_hash", removed);
         }
     }
 
@@ -911,6 +923,123 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "doc-outer");
         assert_eq!(results[1].id, "doc-other");
+    }
+
+    /// Schema v4 (post spec P0) writes per-chunk SHA256 under
+    /// `metadata.chunk_hash`. The pre-v4 dedup keyed off `metadata.content_hash`,
+    /// which is either absent (v4) or holds the source-document hash (v3
+    /// legacy) — neither matches the per-chunk semantic the function name
+    /// promises. This test locks the v4 contract: identical `chunk_hash`
+    /// collapses to one survivor, distinct hashes survive, missing field is
+    /// passed through.
+    #[test]
+    fn dedup_by_chunk_hash_collapses_v4_chunk_duplicates_only() {
+        fn fixture(id: &str, score: f32, chunk_hash: Option<&str>) -> HybridSearchResult {
+            let metadata = match chunk_hash {
+                Some(hash) => json!({
+                    "path": "/tmp/transcripts/a.md",
+                    "source_hash": "src-aaaa",
+                    "chunk_hash": hash,
+                    "layer": "outer",
+                }),
+                None => json!({
+                    "path": "/tmp/transcripts/legacy.md",
+                    "source_hash": "src-aaaa",
+                    "layer": "outer",
+                }),
+            };
+            HybridSearchResult {
+                id: id.to_string(),
+                namespace: "kb:transcripts".to_string(),
+                document: format!("{id} document text"),
+                combined_score: score,
+                vector_score: Some(score),
+                bm25_score: Some(score),
+                metadata,
+                layer: None,
+                parent_id: None,
+                children_ids: vec![],
+                keywords: vec![],
+            }
+        }
+
+        // Two identical-chunk hits arrive in score order (e.g. same chunk
+        // surfaced through both vector and BM25 lanes); only the first must
+        // survive. A distinct chunk and a legacy chunk (no `chunk_hash`) must
+        // pass through untouched.
+        let mut results = vec![
+            fixture("dup-high", 0.9, Some("chunk-aaaa")),
+            fixture("dup-low", 0.7, Some("chunk-aaaa")),
+            fixture("unique", 0.6, Some("chunk-bbbb")),
+            fixture("legacy", 0.5, None),
+        ];
+
+        HybridSearcher::dedup_by_chunk_hash(&mut results);
+
+        assert_eq!(
+            results.len(),
+            3,
+            "expected duplicate chunk_hash to collapse, got {:?}",
+            results.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert_eq!(results[0].id, "dup-high", "first duplicate must win");
+        assert!(
+            results.iter().any(|r| r.id == "unique"),
+            "distinct chunk_hash must survive"
+        );
+        assert!(
+            results.iter().any(|r| r.id == "legacy"),
+            "legacy chunk without chunk_hash must pass through"
+        );
+        assert!(
+            !results.iter().any(|r| r.id == "dup-low"),
+            "second duplicate must be removed"
+        );
+    }
+
+    /// Pre-v4 metadata stored the *source* document hash under
+    /// `content_hash`, so every onion layer of a single source shared the
+    /// same value. The post-P0 dedup must NOT key on that legacy field —
+    /// otherwise outer/middle/inner/core hits collapse to a single layer at
+    /// search time, masking the onion structure operators rebuilt the
+    /// namespace to expose. This test pins that boundary.
+    #[test]
+    fn dedup_by_chunk_hash_ignores_legacy_content_hash_field() {
+        fn legacy(id: &str, layer: &str) -> HybridSearchResult {
+            HybridSearchResult {
+                id: id.to_string(),
+                namespace: "kb:transcripts".to_string(),
+                document: format!("{id} {layer}"),
+                combined_score: 0.5,
+                vector_score: Some(0.5),
+                bm25_score: Some(0.4),
+                metadata: json!({
+                    "path": "/tmp/transcripts/legacy.md",
+                    // Pre-v4 quirk: every layer carried source_hash here.
+                    "content_hash": "shared-source-hash",
+                    "layer": layer,
+                }),
+                layer: None,
+                parent_id: None,
+                children_ids: vec![],
+                keywords: vec![],
+            }
+        }
+
+        let mut results = vec![
+            legacy("outer", "outer"),
+            legacy("middle", "middle"),
+            legacy("inner", "inner"),
+            legacy("core", "core"),
+        ];
+
+        HybridSearcher::dedup_by_chunk_hash(&mut results);
+
+        assert_eq!(
+            results.len(),
+            4,
+            "legacy `content_hash` (== source hash) must not collapse onion layers"
+        );
     }
 
     #[test]
