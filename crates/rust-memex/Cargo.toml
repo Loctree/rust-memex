@@ -22,12 +22,13 @@ cli = ["clap", "indicatif", "ratatui", "crossterm", "sysinfo"]
 # Provider cascade: current Ollama/OpenAI-compatible embedding approach
 provider-cascade = []
 
-# Onion-slicer outer layer synthesized via local Ollama instead of TF-IDF
-# keyword extraction. Opt-in until the wire-up is complete (spec P3).
-ollama-outer = []
-
 # Embedded Candle embeddings (placeholder for future)
 # embedded-candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+#
+# NOTE: The historical `ollama-outer` feature flag has been removed. Outer-layer
+# synthesis via Ollama is now always compiled in (reqwest is an unconditional
+# dep) and gated at runtime by `OnionSliceConfig::outer_synthesis`
+# (`OuterSynthesis::Keyword` vs `OuterSynthesis::Llm`). See spec P3.
 
 [lib]
 name = "rust_memex"

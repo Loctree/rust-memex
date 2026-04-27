@@ -28,7 +28,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::embeddings::EmbeddingClient;
 use crate::rag::{
-    OnionSlice, OnionSliceConfig, SliceMode, create_onion_slices, create_onion_slices_fast,
+    OnionSlice, OnionSliceConfig, OuterSynthesis, SliceMode, create_onion_slices_async,
+    create_onion_slices_fast_async,
 };
 use crate::storage::{ChromaDocument, StorageManager};
 
@@ -421,6 +422,12 @@ pub struct PipelineConfig {
     pub embedder_buffer: usize,
     /// Slicing mode for chunking.
     pub slice_mode: SliceMode,
+    /// Outer-layer synthesis strategy for onion modes (spec P3). Defaults to
+    /// the legacy `Keyword` (TF-based) path; set to `Llm { model, endpoint }`
+    /// to route the outer layer through a local Ollama model. Failures are
+    /// logged and silently fall back to keyword outer so the pipeline never
+    /// stalls on Ollama unavailability.
+    pub outer_synthesis: OuterSynthesis,
     /// Enable storage-backed deduplication.
     pub dedup_enabled: bool,
     /// Maximum number of embedding requests allowed in flight.
@@ -445,6 +452,7 @@ impl Default for PipelineConfig {
             chunker_buffer: CHANNEL_BUFFER_SIZE,
             embedder_buffer: CHANNEL_BUFFER_SIZE,
             slice_mode: SliceMode::default(),
+            outer_synthesis: OuterSynthesis::default(),
             dedup_enabled: true,
             embed_concurrency: 1,
             governor: None,
@@ -1002,14 +1010,18 @@ async fn stage_chunk_content(
     mut rx: mpsc::Receiver<FileContent>,
     tx: mpsc::Sender<ChunkBatch>,
     slice_mode: SliceMode,
+    outer_synthesis: OuterSynthesis,
     observer: PipelineObserver,
 ) {
-    let config = OnionSliceConfig::default();
+    let config = OnionSliceConfig {
+        outer_synthesis,
+        ..OnionSliceConfig::default()
+    };
 
     while let Some(file_content) = rx.recv().await {
         let path = file_content.path.clone();
         let content_hash = file_content.content_hash.clone();
-        let chunks = create_chunks_from_content(&file_content, slice_mode, &config);
+        let chunks = create_chunks_from_content(&file_content, slice_mode, &config).await;
         let count = chunks.len();
 
         if tx
@@ -1088,7 +1100,7 @@ fn looks_like_markdown_transcript(text: &str, path: &Path) -> bool {
 }
 
 /// Create chunks from file content based on slicing mode.
-fn create_chunks_from_content(
+async fn create_chunks_from_content(
     content: &FileContent,
     slice_mode: SliceMode,
     config: &OnionSliceConfig,
@@ -1121,11 +1133,15 @@ fn create_chunks_from_content(
 
     match slice_mode {
         SliceMode::Onion => {
-            let slices = create_onion_slices(&content.text, &metadata, config);
+            // `_async` resolves `OuterSynthesis::Llm` against Ollama before slicing
+            // (or skips the call when set to `Keyword`); failures fall back
+            // transparently to the keyword outer so the pipeline never stalls on
+            // a flaky LLM endpoint (spec P3).
+            let slices = create_onion_slices_async(&content.text, &metadata, config).await;
             slices_to_chunks(slices, content)
         }
         SliceMode::OnionFast => {
-            let slices = create_onion_slices_fast(&content.text, &metadata, config);
+            let slices = create_onion_slices_fast_async(&content.text, &metadata, config).await;
             slices_to_chunks(slices, content)
         }
         SliceMode::Flat => create_flat_chunks(&content.text, content, metadata),
@@ -1694,6 +1710,7 @@ pub async fn run_pipeline(
     let storage_for_storage = storage;
     let ns_for_reader = namespace.clone();
     let slice_mode = config.slice_mode;
+    let outer_synthesis = config.outer_synthesis.clone();
     let dedup_enabled = config.dedup_enabled;
 
     let reader_handle = tokio::spawn(stage_read_files(
@@ -1705,7 +1722,13 @@ pub async fn run_pipeline(
         observer.clone(),
     ));
 
-    let chunker_handle = tokio::spawn(stage_chunk_content(rx1, tx2, slice_mode, observer.clone()));
+    let chunker_handle = tokio::spawn(stage_chunk_content(
+        rx1,
+        tx2,
+        slice_mode,
+        outer_synthesis,
+        observer.clone(),
+    ));
     let embedder_handle = tokio::spawn(stage_embed_chunks(
         rx2,
         tx3,
@@ -1765,6 +1788,10 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.reader_buffer, CHANNEL_BUFFER_SIZE);
         assert_eq!(config.slice_mode, SliceMode::default());
+        assert!(matches!(
+            config.outer_synthesis,
+            crate::rag::OuterSynthesis::Keyword
+        ));
         assert!(config.dedup_enabled);
         assert_eq!(config.embed_concurrency, 1);
         assert!(config.governor.is_none());

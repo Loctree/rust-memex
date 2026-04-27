@@ -600,31 +600,217 @@ pub fn create_onion_slices(
     slices
 }
 
-/// P3 escape hatch — synthesize an outer summary by asking a local Ollama model.
+/// Maximum prompt-input length (chars) sent to Ollama. Spec calls for top-N
+/// chunks; the leading window catches intent + early decisions while keeping
+/// the context window comfortably under qwen2.5/phi mini limits.
+const OLLAMA_OUTER_INPUT_CHAR_BUDGET: usize = 8_000;
+
+/// Hard timeout for the Ollama HTTP call. Spec budgets ~5s/doc on a 4090; 60s
+/// covers cold model loads and weak hardware while still failing fast enough
+/// that the keyword fallback can take over without stalling the pipeline.
+const OLLAMA_OUTER_TIMEOUT_SECS: u64 = 60;
+
+/// Connect-phase timeout. Independent of the request total so a misconfigured
+/// or moved endpoint fails fast (5s) instead of burning the full 60s budget on
+/// every doc when Ollama is offline.
+const OLLAMA_OUTER_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// Synthesize an outer summary by asking a local Ollama model (spec P3).
 ///
-/// The LLM path is intentionally NOT wired into `create_onion_slices` directly:
-/// the slicer is synchronous CPU code and Ollama I/O is async + slow (5s/doc per
-/// spec). Callers that want LLM-driven outer summaries should:
-///   1. Run `create_onion_slices` to produce the four-layer skeleton.
-///   2. Pass the inner/core content here to get a clean summary.
-///   3. Replace the outer slice's `content` (and re-extract `keywords` if
-///      desired) before persisting.
+/// POSTs `{endpoint}/api/generate` with a non-streaming prompt that asks the
+/// model for a 1-3 sentence Polish summary, then returns the parsed
+/// `response` field. Returns `None` on any error (network, model load,
+/// malformed response, empty completion) so callers can transparently fall
+/// back to the keyword outer.
 ///
-/// Returns `None` on any error (network, model load, malformed response) so the
-/// caller can transparently fall back to the keyword outer.
+/// The slicer is synchronous CPU code, so async LLM calls happen at the
+/// pipeline boundary: pipeline reads `OuterSynthesis` from its config,
+/// invokes this function, and feeds the result into [`replace_outer_slice`]
+/// or directly into [`create_onion_slices_async`].
 ///
 /// Spec: 2026-04-27 kb-transcripts-onion-slicer-fix-spec, P3.
-#[cfg(feature = "ollama-outer")]
 pub async fn synthesize_outer_via_ollama(
-    inner_or_core_text: &str,
+    transcript_text: &str,
     model: &str,
     endpoint: &str,
 ) -> Option<String> {
-    // Implementation deferred — this scaffold documents the contract so callers
-    // and future implementers know the exact shape. Wire-up requires the
-    // `ollama-outer` cargo feature plus a `reqwest` (or equivalent) dep.
-    let _ = (inner_or_core_text, model, endpoint);
-    None
+    let trimmed = transcript_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut prompt_input: String = trimmed.chars().take(OLLAMA_OUTER_INPUT_CHAR_BUDGET).collect();
+    if prompt_input.chars().count() < trimmed.chars().count() {
+        prompt_input.push_str("\n\n[…transcript truncated for outer summary…]");
+    }
+
+    let prompt = format!(
+        "You are a precise transcript summarizer. Output 1-3 sentences in Polish.\n\
+         \n\
+         Summarize this conversation transcript. Focus on:\n\
+         1. What was the user's goal/question.\n\
+         2. What was decided/built/fixed.\n\
+         3. What was the outcome (success, blocker, follow-up).\n\
+         \n\
+         Skip UI/CLI noise (Brewing…, Frosting…, Grooving…, tokens·, shifttab, ⎿, ⎯).\n\
+         Be specific: name projects, technologies, files mentioned.\n\
+         \n\
+         Transcript:\n{prompt_input}"
+    );
+
+    let url = format!(
+        "{}/api/generate",
+        endpoint.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+    });
+
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            OLLAMA_OUTER_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(std::time::Duration::from_secs(OLLAMA_OUTER_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!("Ollama outer synthesis: client build failed: {err}");
+            return None;
+        }
+    };
+
+    let response = match client.post(&url).json(&body).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!("Ollama outer synthesis: POST {url} failed: {err}");
+            return None;
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(
+            "Ollama outer synthesis: POST {url} returned status {status}"
+        );
+        return None;
+    }
+
+    let parsed: serde_json::Value = match response.json().await {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Ollama outer synthesis: response decode failed: {err}");
+            return None;
+        }
+    };
+
+    let summary = parsed
+        .get("response")
+        .and_then(|value| value.as_str())
+        .map(|raw| raw.trim().to_string())
+        .filter(|text| !text.is_empty())?;
+
+    Some(summary)
+}
+
+/// Replace the outer slice in a four-layer (or outer+core) onion stack with a
+/// new content string, regenerating the outer ID and patching the parent's
+/// `children_ids` so the hierarchy stays internally consistent.
+///
+/// Used by the async slicers when `OuterSynthesis::Llm` produces a summary
+/// that should override the keyword outer. If `slices` contains no `Outer`
+/// layer, the input is returned unchanged.
+pub fn replace_outer_slice(slices: Vec<OnionSlice>, new_outer_content: String) -> Vec<OnionSlice> {
+    let new_outer_content = new_outer_content.trim().to_string();
+    if new_outer_content.is_empty() {
+        return slices;
+    }
+
+    let mut old_outer_id: Option<String> = None;
+    let new_outer_id = OnionSlice::generate_id(&new_outer_content, SliceLayer::Outer);
+
+    let mut rebuilt: Vec<OnionSlice> = slices
+        .into_iter()
+        .map(|slice| {
+            if slice.layer == SliceLayer::Outer {
+                old_outer_id = Some(slice.id.clone());
+                let new_keywords = extract_keywords(&new_outer_content, 3);
+                OnionSlice {
+                    id: new_outer_id.clone(),
+                    layer: SliceLayer::Outer,
+                    content: new_outer_content.clone(),
+                    parent_id: slice.parent_id,
+                    children_ids: slice.children_ids,
+                    keywords: new_keywords,
+                }
+            } else {
+                slice
+            }
+        })
+        .collect();
+
+    if let Some(old_id) = old_outer_id {
+        for slice in &mut rebuilt {
+            for child in &mut slice.children_ids {
+                if *child == old_id {
+                    *child = new_outer_id.clone();
+                }
+            }
+        }
+    }
+
+    rebuilt
+}
+
+/// Async variant of [`create_onion_slices`] that resolves the outer layer via
+/// the configured [`OuterSynthesis`] strategy.
+///
+/// When `config.outer_synthesis` is [`OuterSynthesis::Llm`] this reaches out to
+/// Ollama and (on success) replaces the keyword-derived outer with the model's
+/// summary. Any failure (network, malformed response, empty completion) is
+/// logged and the function silently falls back to the keyword outer so the
+/// pipeline never stalls on transient Ollama unavailability.
+pub async fn create_onion_slices_async(
+    content: &str,
+    metadata: &serde_json::Value,
+    config: &OnionSliceConfig,
+) -> Vec<OnionSlice> {
+    let llm_summary = resolve_llm_outer(content, &config.outer_synthesis).await;
+    let slices = create_onion_slices(content, metadata, config);
+    apply_optional_outer_override(slices, llm_summary)
+}
+
+/// Async variant of [`create_onion_slices_fast`] mirroring the LLM-or-keyword
+/// resolution from [`create_onion_slices_async`].
+pub async fn create_onion_slices_fast_async(
+    content: &str,
+    metadata: &serde_json::Value,
+    config: &OnionSliceConfig,
+) -> Vec<OnionSlice> {
+    let llm_summary = resolve_llm_outer(content, &config.outer_synthesis).await;
+    let slices = create_onion_slices_fast(content, metadata, config);
+    apply_optional_outer_override(slices, llm_summary)
+}
+
+async fn resolve_llm_outer(content: &str, strategy: &OuterSynthesis) -> Option<String> {
+    match strategy {
+        OuterSynthesis::Keyword => None,
+        OuterSynthesis::Llm { model, endpoint } => {
+            synthesize_outer_via_ollama(content, model, endpoint).await
+        }
+    }
+}
+
+fn apply_optional_outer_override(
+    slices: Vec<OnionSlice>,
+    summary: Option<String>,
+) -> Vec<OnionSlice> {
+    match summary {
+        Some(text) => replace_outer_slice(slices, text),
+        None => slices,
+    }
 }
 
 /// Create fast onion slices (outer + core only) - 2x faster than full onion
@@ -4437,5 +4623,436 @@ Results:
         );
         assert!(!outer.contains("Request:"));
         assert!(!outer.contains("Response:"));
+    }
+}
+
+#[cfg(test)]
+mod p3_llm_outer_tests {
+    //! Spec P3 acceptance tests: outer-layer synthesis via Ollama.
+    //!
+    //! Locks the contract that `OuterSynthesis::Llm` actually performs an HTTP
+    //! call (not the prior stub that returned `None`), that the prompt + body
+    //! shape match what an Ollama `/api/generate` instance expects, that the
+    //! parsed `response` field replaces the keyword outer in both full and
+    //! fast onion slicers, and that any failure mode (unreachable, non-2xx,
+    //! malformed JSON, empty completion) silently falls back to the keyword
+    //! outer so the indexing pipeline never stalls.
+    use super::*;
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    /// Captured request payload from the mock Ollama `/api/generate` endpoint.
+    type CapturedBody = Arc<StdMutex<Option<serde_json::Value>>>;
+
+    enum MockResponse {
+        /// Return 200 with a JSON body containing this `response` field.
+        Ok(&'static str),
+        /// Return 200 with the literal JSON value (lets us simulate malformed
+        /// payloads or empty `response`).
+        OkRaw(serde_json::Value),
+        /// Return a non-2xx status to simulate model-not-found / overload.
+        Status(StatusCode),
+    }
+
+    struct MockOllama {
+        endpoint: String,
+        captured: CapturedBody,
+        _handle: JoinHandle<()>,
+    }
+
+    async fn spawn_mock_ollama(behavior: MockResponse) -> MockOllama {
+        let captured: CapturedBody = Arc::new(StdMutex::new(None));
+        let captured_for_handler = captured.clone();
+        let behavior = Arc::new(behavior);
+
+        async fn handler(
+            State(state): State<(CapturedBody, Arc<MockResponse>)>,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            *state.0.lock().expect("captured mutex poisoned") = Some(body);
+            match state.1.as_ref() {
+                MockResponse::Ok(text) => (
+                    StatusCode::OK,
+                    Json(json!({ "response": text, "done": true })),
+                ),
+                MockResponse::OkRaw(value) => (StatusCode::OK, Json(value.clone())),
+                MockResponse::Status(code) => (*code, Json(json!({"error": "mocked"}))),
+            }
+        }
+
+        let app = Router::new()
+            .route("/api/generate", post(handler))
+            .with_state((captured_for_handler, behavior));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ollama");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        MockOllama {
+            endpoint: format!("http://{addr}"),
+            captured,
+            _handle: handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_posts_correct_payload_and_parses_response() {
+        let mock = spawn_mock_ollama(MockResponse::Ok(
+            "Naprawiono onion-slicer P3: outer generowany przez Ollama.",
+        ))
+        .await;
+
+        let summary = synthesize_outer_via_ollama(
+            "User: napraw P3.\nAssistant: Wpięte do pipeline.",
+            "qwen2.5:3b",
+            &mock.endpoint,
+        )
+        .await;
+
+        assert_eq!(
+            summary.as_deref(),
+            Some("Naprawiono onion-slicer P3: outer generowany przez Ollama.")
+        );
+
+        let captured = mock
+            .captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("ollama mock did not record the POST body");
+
+        assert_eq!(
+            captured.get("model").and_then(|v| v.as_str()),
+            Some("qwen2.5:3b"),
+            "model field must be forwarded verbatim"
+        );
+        assert_eq!(
+            captured.get("stream"),
+            Some(&json!(false)),
+            "stream must be false so the helper can read the full response in one shot"
+        );
+        let prompt = captured
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .expect("prompt field");
+        assert!(
+            prompt.contains("napraw P3"),
+            "prompt must include the transcript content"
+        );
+        assert!(
+            prompt.to_ascii_lowercase().contains("polish"),
+            "prompt must keep the language directive (Polish summary)"
+        );
+        assert!(
+            prompt.to_ascii_lowercase().contains("brewing"),
+            "prompt must instruct the model to skip Claude Code/Codex UI noise"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_truncates_oversized_input() {
+        let mock = spawn_mock_ollama(MockResponse::Ok("ok")).await;
+        let big = "A".repeat(OLLAMA_OUTER_INPUT_CHAR_BUDGET * 2);
+
+        let _ = synthesize_outer_via_ollama(&big, "any", &mock.endpoint).await;
+
+        let prompt = mock
+            .captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("body")
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .expect("prompt")
+            .to_string();
+        assert!(
+            prompt.contains("transcript truncated for outer summary"),
+            "oversized inputs must be truncated with the marker so the model sees the boundary"
+        );
+        // Prompt body length is bounded: budget + truncation marker + fixed
+        // header + transcript label. A few hundred chars of slack is fine.
+        assert!(
+            prompt.chars().count() < OLLAMA_OUTER_INPUT_CHAR_BUDGET + 1_000,
+            "prompt blew past the input char budget: {} chars",
+            prompt.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_returns_none_on_non_2xx() {
+        let mock = spawn_mock_ollama(MockResponse::Status(StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let summary = synthesize_outer_via_ollama("payload", "model", &mock.endpoint).await;
+        assert!(
+            summary.is_none(),
+            "5xx responses must surface as None (keyword fallback)"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_returns_none_on_malformed_payload() {
+        // Missing `response` field.
+        let mock = spawn_mock_ollama(MockResponse::OkRaw(json!({"done": true}))).await;
+        let summary = synthesize_outer_via_ollama("payload", "model", &mock.endpoint).await;
+        assert!(summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_returns_none_on_empty_response_field() {
+        let mock = spawn_mock_ollama(MockResponse::Ok("   \n  ")).await;
+        let summary = synthesize_outer_via_ollama("payload", "model", &mock.endpoint).await;
+        assert!(
+            summary.is_none(),
+            "whitespace-only completions must not pollute the outer layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_returns_none_on_unreachable_endpoint() {
+        // RFC 5737 TEST-NET-3 (203.0.113.0/24) is reserved for documentation
+        // and guaranteed not to route in real networks. Combined with the
+        // helper's 5s connect_timeout this makes the test deterministic and
+        // robust against parallel-test port-reuse races (a previous version
+        // bound+dropped a loopback port, which other tests in the suite could
+        // race-recapture and answer the request, causing flake).
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            synthesize_outer_via_ollama("payload", "model", "http://203.0.113.1:9"),
+        )
+        .await
+        .expect("synthesize must respect its own connect_timeout in the test budget");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthesize_outer_via_ollama_returns_none_on_empty_input() {
+        // Defense in depth: even if the caller forgets to skip empty docs, we
+        // must not waste an HTTP roundtrip on whitespace.
+        let result = synthesize_outer_via_ollama("   \n\t  ", "x", "http://127.0.0.1:1").await;
+        assert!(result.is_none());
+    }
+
+    fn long_transcript() -> String {
+        // Long enough to skip the short-content fast path in
+        // `create_onion_slices` (`min_content_for_slicing = 200`).
+        let body = "User asked how to fix the onion slicer outer layer. Assistant proposed wiring Ollama into the pipeline so the outer summary becomes a real Polish sentence instead of a TF-IDF keyword splat. The plan covers prompt construction, response parsing, and graceful fallback when Ollama is unreachable. ";
+        body.repeat(3)
+    }
+
+    #[tokio::test]
+    async fn create_onion_slices_async_replaces_outer_with_llm_summary() {
+        let mock = spawn_mock_ollama(MockResponse::Ok(
+            "LLM-resolved outer: streszczenie naprawy slicera onionowego.",
+        ))
+        .await;
+        let config = OnionSliceConfig {
+            outer_synthesis: OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: mock.endpoint.clone(),
+            },
+            ..OnionSliceConfig::default()
+        };
+        let metadata = json!({"type": "note"});
+        let content = long_transcript();
+
+        let slices = create_onion_slices_async(&content, &metadata, &config).await;
+        let outer = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("outer slice present");
+
+        assert_eq!(
+            outer.content,
+            "LLM-resolved outer: streszczenie naprawy slicera onionowego."
+        );
+
+        // The middle slice must point at the new outer ID, otherwise the
+        // hierarchy is silently broken and `expand` walks would fail.
+        let middle = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Middle)
+            .expect("middle slice present");
+        assert!(
+            middle.children_ids.contains(&outer.id),
+            "middle.children_ids must point at the new outer id (got {:?}, outer={})",
+            middle.children_ids,
+            outer.id
+        );
+
+        // Outer keywords must come from the LLM summary, not the original
+        // keyword extractor on middle content.
+        let keyword_lower: Vec<String> =
+            outer.keywords.iter().map(|k| k.to_ascii_lowercase()).collect();
+        assert!(
+            keyword_lower
+                .iter()
+                .any(|kw| kw.contains("streszczenie") || kw.contains("naprawy") || kw.contains("slicera")),
+            "outer keywords should reflect the LLM summary, got {:?}",
+            outer.keywords
+        );
+    }
+
+    #[tokio::test]
+    async fn create_onion_slices_async_falls_back_to_keyword_when_ollama_unreachable() {
+        // RFC 5737 TEST-NET-3 — see the unreachable-endpoint helper test for
+        // why we don't bind+drop a loopback port here.
+        let config = OnionSliceConfig {
+            outer_synthesis: OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: "http://203.0.113.1:9".to_string(),
+            },
+            ..OnionSliceConfig::default()
+        };
+        let metadata = json!({"type": "note"});
+        let content = long_transcript();
+
+        // The async path must complete and yield non-empty outer content even
+        // when Ollama is dead — pipeline must not stall.
+        let slices = tokio::time::timeout(
+            Duration::from_secs(15),
+            create_onion_slices_async(&content, &metadata, &config),
+        )
+        .await
+        .expect("async slicer must not block forever on a dead endpoint");
+        let outer = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("outer slice present");
+        assert!(
+            !outer.content.trim().is_empty(),
+            "keyword fallback must produce a usable outer when LLM is unreachable"
+        );
+
+        // Sanity: the fallback outer must be a keyword-style outer (the legacy
+        // bracketed [k1, k2, …] prefix produced by `create_outer_summary`). We
+        // intentionally do NOT compare byte-for-byte with the keyword baseline:
+        // `extract_keywords` ties are broken by HashMap iteration order, which
+        // is non-deterministic across runs, and that instability is orthogonal
+        // to the P3 fallback contract being tested here.
+        assert!(
+            outer.content.starts_with('['),
+            "fallback outer must be the keyword-style bracketed summary, got: {:?}",
+            outer.content
+        );
+    }
+
+    #[tokio::test]
+    async fn create_onion_slices_fast_async_replaces_outer_with_llm_summary() {
+        let mock = spawn_mock_ollama(MockResponse::Ok("Fast onion outer via LLM.")).await;
+        let config = OnionSliceConfig {
+            outer_synthesis: OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: mock.endpoint.clone(),
+            },
+            ..OnionSliceConfig::default()
+        };
+        let metadata = json!({"type": "note"});
+        let content = long_transcript();
+
+        let slices = create_onion_slices_fast_async(&content, &metadata, &config).await;
+        // Fast mode emits Outer + Core only.
+        assert_eq!(slices.len(), 2);
+        let outer = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("fast outer slice present");
+        let core = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Core)
+            .expect("fast core slice present");
+        assert_eq!(outer.content, "Fast onion outer via LLM.");
+        assert!(
+            core.children_ids.contains(&outer.id),
+            "fast-mode core must reference the new outer id"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_conversation_outer_is_replaced_by_llm_summary() {
+        // Markdown transcript metadata routes through structured slicer; this
+        // test guarantees the LLM override applies to the structured path
+        // (the actual spec target — kb:transcripts).
+        let mock =
+            spawn_mock_ollama(MockResponse::Ok("Structured outer rewritten by LLM.")).await;
+        let config = OnionSliceConfig {
+            outer_synthesis: OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: mock.endpoint.clone(),
+            },
+            ..OnionSliceConfig::default()
+        };
+        let metadata = json!({
+            "type": "conversation",
+            "format": "markdown_transcript"
+        });
+        let content = "## user\nNapraw onion slicer P3.\n\n## assistant\nWpiąłem Ollama do pipeline. Dodałem testy. Klucze sa nowe.\n";
+
+        let slices = create_onion_slices_async(content, &metadata, &config).await;
+        let outer = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("structured outer slice present");
+        assert_eq!(outer.content, "Structured outer rewritten by LLM.");
+    }
+
+    #[test]
+    fn replace_outer_slice_is_a_noop_when_summary_is_empty() {
+        let metadata = json!({"type": "note"});
+        let content = long_transcript();
+        let original = create_onion_slices(&content, &metadata, &OnionSliceConfig::default());
+        let cloned = original.clone();
+        let after = replace_outer_slice(cloned, "   ".to_string());
+        assert_eq!(after.len(), original.len());
+        for (left, right) in after.iter().zip(original.iter()) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.content, right.content);
+            assert_eq!(left.children_ids, right.children_ids);
+        }
+    }
+
+    #[test]
+    fn replace_outer_slice_rewrites_outer_id_and_parent_links() {
+        let metadata = json!({"type": "note"});
+        let content = long_transcript();
+        let slices = create_onion_slices(&content, &metadata, &OnionSliceConfig::default());
+        let original_outer_id = slices
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("outer present")
+            .id
+            .clone();
+
+        let after = replace_outer_slice(slices, "Brand new outer text.".to_string());
+        let outer = after
+            .iter()
+            .find(|slice| slice.layer == SliceLayer::Outer)
+            .expect("outer still present");
+        assert_eq!(outer.content, "Brand new outer text.");
+        assert_ne!(outer.id, original_outer_id, "outer id must be regenerated");
+
+        // No remaining child reference points at the stale id.
+        for slice in &after {
+            assert!(
+                !slice.children_ids.contains(&original_outer_id),
+                "children_ids must not reference the old outer id (slice layer={:?})",
+                slice.layer
+            );
+        }
+        // Some slice now points at the new outer id (the parent).
+        assert!(
+            after
+                .iter()
+                .any(|slice| slice.children_ids.contains(&outer.id)),
+            "no slice references the new outer id — hierarchy broken"
+        );
     }
 }
