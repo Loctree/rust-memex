@@ -121,9 +121,7 @@ fn parse_markdown_transcript_blocks(content: &str) -> Vec<RawBlock> {
             continue;
         }
 
-        if !in_fence
-            && let Some(role) = parse_markdown_heading(line)
-        {
+        if !in_fence && let Some(role) = parse_markdown_heading(line) {
             if let Some(existing_role) = current_role.take() {
                 push_raw_block(&mut blocks, existing_role, &current_lines.join("\n"));
             }
