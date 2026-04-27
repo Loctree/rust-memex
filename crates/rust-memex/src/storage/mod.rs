@@ -23,8 +23,14 @@ use crate::rag::SliceLayer;
 /// Schema version for LanceDB tables. Increment when changing table structure.
 /// Version 2: Added onion slice fields (layer, parent_id, children_ids, keywords)
 /// Version 3: Added content_hash for exact-match deduplication
+/// Version 4: Split `content_hash` into per-chunk SHA256 (this column) and a
+///            new `source_hash` column for the SHA256 of the source document
+///            text. This enables both layer-aware chunk dedup and pre-index
+///            source-level dedup. Pre-v4 rows store source-text hash in
+///            `content_hash`; backfill via `/admin/backfill-hashes` corrects
+///            this without breaking old data.
 /// See docs/MIGRATION.md for migration procedures.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // =============================================================================
 // STORAGE BACKEND INTERFACE
@@ -61,8 +67,15 @@ pub struct ChromaDocument {
     pub children_ids: Vec<String>,
     /// Extracted keywords for this slice
     pub keywords: Vec<String>,
-    /// SHA256 hash of original content for exact-match deduplication
+    /// SHA256 hash of THIS chunk's text. Used for chunk-level deduplication.
+    /// Pre-v4 rows may transitionally store the source-text hash here; the
+    /// `/admin/backfill-hashes` endpoint corrects them.
     pub content_hash: Option<String>,
+    /// SHA256 hash of the SOURCE document text (same value across all four
+    /// onion layers from one source). Used for pre-index dedup so we never
+    /// re-embed an already-ingested file. Optional for backward compatibility
+    /// with v3 schemas — `None` means "unknown source provenance".
+    pub source_hash: Option<String>,
 }
 
 impl ChromaDocument {
@@ -85,10 +98,13 @@ impl ChromaDocument {
             children_ids: vec![],
             keywords: vec![],
             content_hash: None,
+            source_hash: None,
         }
     }
 
-    /// Create a new document with content hash for deduplication
+    /// Create a new document with content hash for deduplication.
+    /// Source hash is left empty — prefer `new_flat_with_hashes` so callers
+    /// supply the source-document hash explicitly when they have it.
     pub fn new_flat_with_hash(
         id: String,
         namespace: String,
@@ -96,6 +112,27 @@ impl ChromaDocument {
         metadata: serde_json::Value,
         document: String,
         content_hash: String,
+    ) -> Self {
+        Self::new_flat_with_hashes(
+            id,
+            namespace,
+            embedding,
+            metadata,
+            document,
+            content_hash,
+            None,
+        )
+    }
+
+    /// Create a flat (legacy) document with both per-chunk and source hashes.
+    pub fn new_flat_with_hashes(
+        id: String,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+        document: String,
+        content_hash: String,
+        source_hash: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -108,6 +145,7 @@ impl ChromaDocument {
             children_ids: vec![],
             keywords: vec![],
             content_hash: Some(content_hash),
+            source_hash,
         }
     }
 
@@ -129,16 +167,31 @@ impl ChromaDocument {
             children_ids: slice.children_ids.clone(),
             keywords: slice.keywords.clone(),
             content_hash: None,
+            source_hash: None,
         }
     }
 
-    /// Create a document from an onion slice with content hash for deduplication
+    /// Create a document from an onion slice with content hash for deduplication.
+    /// Source hash is left empty — prefer `from_onion_slice_with_hashes` to
+    /// preserve source provenance for pre-index dedup.
     pub fn from_onion_slice_with_hash(
         slice: &crate::rag::OnionSlice,
         namespace: String,
         embedding: Vec<f32>,
         metadata: serde_json::Value,
         content_hash: String,
+    ) -> Self {
+        Self::from_onion_slice_with_hashes(slice, namespace, embedding, metadata, content_hash, None)
+    }
+
+    /// Create an onion-slice document with both per-chunk and source hashes.
+    pub fn from_onion_slice_with_hashes(
+        slice: &crate::rag::OnionSlice,
+        namespace: String,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+        content_hash: String,
+        source_hash: Option<String>,
     ) -> Self {
         Self {
             id: slice.id.clone(),
@@ -151,6 +204,7 @@ impl ChromaDocument {
             children_ids: slice.children_ids.clone(),
             keywords: slice.keywords.clone(),
             content_hash: Some(content_hash),
+            source_hash,
         }
     }
 
@@ -570,7 +624,7 @@ impl StorageManager {
                 .collect::<Vec<_>>()
                 .join(", ");
             let predicate = format!("{} AND id IN ({})", ns_filter, id_list);
-            let pre_count = table.count_rows(Some(predicate.clone())).await? as usize;
+            let pre_count = table.count_rows(Some(predicate.clone())).await?;
             if pre_count == 0 {
                 continue;
             }
@@ -752,8 +806,12 @@ impl StorageManager {
             Field::new("parent_id", DataType::Utf8, true), // Parent slice ID
             Field::new("children_ids", DataType::Utf8, true), // JSON array of children IDs
             Field::new("keywords", DataType::Utf8, true), // JSON array of keywords
-            // Deduplication field (v3 schema)
-            Field::new("content_hash", DataType::Utf8, true), // SHA256 hash for exact-match dedup
+            // Per-chunk dedup hash (v3 schema; v4 narrows semantic to chunk text)
+            Field::new("content_hash", DataType::Utf8, true), // SHA256 of THIS chunk's text
+            // Source-document hash (v4 schema) — same value across all 4 layers
+            // from one source. Drives pre-index dedup so we never re-embed an
+            // already-ingested file.
+            Field::new("source_hash", DataType::Utf8, true), // SHA256 of source document text
         ])
     }
 
@@ -792,11 +850,14 @@ impl StorageManager {
             .iter()
             .map(|d| serde_json::to_string(&d.keywords).unwrap_or_else(|_| "[]".to_string()))
             .collect();
-        // Content hash for deduplication
+        // Per-chunk content hash for chunk-level dedup
         let content_hashes: Vec<Option<&str>> = documents
             .iter()
             .map(|d| d.content_hash.as_deref())
             .collect();
+        // Source-document hash for pre-index source-level dedup (v4 schema)
+        let source_hashes: Vec<Option<&str>> =
+            documents.iter().map(|d| d.source_hash.as_deref()).collect();
 
         let schema = Arc::new(Self::create_schema(dim));
 
@@ -824,8 +885,10 @@ impl StorageManager {
                 Arc::new(StringArray::from(
                     keywords_json.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 )),
-                // Content hash for deduplication
+                // Per-chunk content hash for chunk-level dedup
                 Arc::new(StringArray::from(content_hashes)),
+                // Source-document hash for source-level dedup (v4 schema)
+                Arc::new(StringArray::from(source_hashes)),
             ],
         )?;
 
@@ -873,6 +936,10 @@ impl StorageManager {
         // Content hash field (optional for backward compatibility with v2 schema)
         let content_hash_col = batch
             .column_by_name("content_hash")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        // Source hash column (v4 schema) — optional for pre-v4 tables.
+        let source_hash_col = batch
+            .column_by_name("source_hash")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
         let dim = vector_col.value_length() as usize;
@@ -943,6 +1010,14 @@ impl StorageManager {
                 }
             });
 
+            let source_hash = source_hash_col.and_then(|col| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i).to_string())
+                }
+            });
+
             docs.push(ChromaDocument {
                 id,
                 namespace,
@@ -954,6 +1029,7 @@ impl StorageManager {
                 children_ids,
                 keywords,
                 content_hash,
+                source_hash,
             });
         }
         Ok(docs)
@@ -1087,12 +1163,25 @@ impl StorageManager {
         format!("content_hash = '{}'", hash.replace('\'', "''"))
     }
 
+    fn source_hash_filter(&self, hash: &str) -> String {
+        format!("source_hash = '{}'", hash.replace('\'', "''"))
+    }
+
     /// Check if the table schema has content_hash column (schema v3+)
     async fn table_has_content_hash(table: &Table) -> bool {
         table
             .schema()
             .await
             .map(|schema| schema.field_with_name("content_hash").is_ok())
+            .unwrap_or(false)
+    }
+
+    /// Check if the table schema has source_hash column (schema v4+)
+    async fn table_has_source_hash(table: &Table) -> bool {
+        table
+            .schema()
+            .await
+            .map(|schema| schema.field_with_name("source_hash").is_ok())
             .unwrap_or(false)
     }
 
@@ -1121,6 +1210,48 @@ impl StorageManager {
             "{} AND {}",
             self.namespace_filter(namespace),
             self.content_hash_filter(hash)
+        );
+
+        let mut stream = table
+            .query()
+            .only_if(filter.as_str())
+            .limit(1)
+            .execute()
+            .await?;
+
+        if let Some(batch) = stream.try_next().await? {
+            return Ok(batch.num_rows() > 0);
+        }
+
+        Ok(false)
+    }
+
+    /// Check if any chunk in `namespace` already references the given source-document
+    /// hash. Used by the indexing pipeline to skip re-embedding files that were
+    /// already ingested (P4 — pre-index source-level dedup).
+    ///
+    /// Returns Ok(false) if the table doesn't exist yet, or if the table is on a
+    /// pre-v4 schema without the `source_hash` column (graceful degradation —
+    /// older namespaces should be backfilled via `/admin/backfill-hashes`).
+    pub async fn has_source_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        if !Self::table_has_source_hash(&table).await {
+            tracing::debug!(
+                "Table '{}' has pre-v4 schema without source_hash column. \
+                 Source-level dedup disabled until backfill.",
+                self.collection_name
+            );
+            return Ok(false);
+        }
+
+        let filter = format!(
+            "{} AND {}",
+            self.namespace_filter(namespace),
+            self.source_hash_filter(hash)
         );
 
         let mut stream = table

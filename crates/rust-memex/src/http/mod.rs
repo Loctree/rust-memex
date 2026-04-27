@@ -81,8 +81,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::diagnostics::{
-    self, DedupResult as DiagnosticDedupResult, KeepStrategy, PurgeQualityResult, TimelineBucket,
-    TimelineQuery,
+    self, BackfillHashesResult, DedupResult as DiagnosticDedupResult, KeepStrategy,
+    PurgeQualityResult, TimelineBucket, TimelineQuery,
 };
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
@@ -1474,6 +1474,32 @@ pub struct DedupResponse {
     pub result: DiagnosticDedupResult,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BackfillHashesParams {
+    /// Optional namespace filter. Omitted = backfill all namespaces.
+    #[serde(default)]
+    pub ns: Option<String>,
+    /// Default `false` (dry run). Caller must opt in to writes.
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BackfillHashesRequest {
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub allow_single_step: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackfillHashesResponse {
+    pub namespace: Option<String>,
+    pub execute: bool,
+    pub dry_run: bool,
+    pub result: BackfillHashesResult,
+}
+
 fn http_search_mode(mode: &str) -> SearchMode {
     match mode {
         "vector" => SearchMode::Vector,
@@ -2174,6 +2200,7 @@ fn diagnostic_authed_routes() -> Router<HttpState> {
     Router::new()
         .route("/api/purge-quality", post(purge_quality_handler))
         .route("/api/dedup", post(dedup_handler))
+        .route("/api/backfill-hashes", post(backfill_hashes_handler))
 }
 
 /// Health check endpoint
@@ -2583,6 +2610,59 @@ async fn dedup_handler(
     }
 
     Ok(Json(DedupResponse {
+        namespace: params.ns,
+        execute: params.execute,
+        dry_run,
+        result,
+    }))
+}
+
+/// Backfill `content_hash` (per-chunk) and `source_hash` (per-source) for
+/// chunks written before the v4 schema. Behaves like `dedup`: dry-run by
+/// default, requires explicit confirmation for the destructive path. Spec:
+/// 2026-04-27 onion-slicer fix, P0 backfill.
+async fn backfill_hashes_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<BackfillHashesParams>,
+    body: String,
+) -> Result<Json<BackfillHashesResponse>, (StatusCode, String)> {
+    let request = if body.trim().is_empty() {
+        BackfillHashesRequest::default()
+    } else {
+        serde_json::from_str::<BackfillHashesRequest>(&body).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid backfill-hashes request body: {error}"),
+            )
+        })?
+    };
+
+    let dry_run = !params.execute;
+    let key = diagnostic_approval_key("backfill-hashes", params.ns.as_deref(), None);
+
+    if !dry_run {
+        ensure_destructive_diagnostic_allowed(
+            &state,
+            key.clone(),
+            request.confirm,
+            request.allow_single_step,
+        )
+        .await?;
+    }
+
+    let result = diagnostics::backfill_chunk_and_source_hashes(
+        state.rag.storage_manager().as_ref(),
+        params.ns.as_deref(),
+        dry_run,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    if dry_run {
+        record_diagnostic_dry_run(&state, key).await;
+    }
+
+    Ok(Json(BackfillHashesResponse {
         namespace: params.ns,
         execute: params.execute,
         dry_run,
@@ -3813,6 +3893,7 @@ mod tests {
             children_ids: vec!["child-1".to_string()],
             keywords: vec!["hello".to_string()],
             content_hash: None,
+            source_hash: None,
         };
 
         let json_doc: SearchResultJson = doc.into();

@@ -131,6 +131,7 @@ pub async fn merge_databases(
                     children_ids: doc.children_ids,
                     keywords: doc.keywords,
                     content_hash: doc.content_hash,
+                    source_hash: doc.source_hash,
                 });
                 progress.docs_copied += 1;
             }

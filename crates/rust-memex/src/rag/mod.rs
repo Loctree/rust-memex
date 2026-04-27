@@ -441,6 +441,23 @@ pub fn compute_content_hash(content: &str) -> String {
     result.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Strategy for producing the outer (~100 char) layer.
+///
+/// `Keyword` is the fast, dependency-free TF-based path used by all current
+/// callers. `Llm` is the spec P3 escape hatch: an external Ollama instance
+/// summarizes the document into 1–3 readable sentences. We expose it so the
+/// pipeline can be re-routed without forking the slicer once an Ollama
+/// endpoint is wired up.
+#[derive(Debug, Clone, Default)]
+pub enum OuterSynthesis {
+    /// TF-based keyword extraction (existing behavior). Cheap, no I/O.
+    #[default]
+    Keyword,
+    /// Send the top-N inner chunks to an Ollama model and use the response
+    /// as the outer summary. `endpoint` defaults to `http://localhost:11434`.
+    Llm { model: String, endpoint: String },
+}
+
 /// Configuration for onion slicing
 #[derive(Debug, Clone)]
 pub struct OnionSliceConfig {
@@ -452,6 +469,9 @@ pub struct OnionSliceConfig {
     pub inner_target: usize,
     /// Minimum content length to apply onion slicing (below this, use single Core slice)
     pub min_content_for_slicing: usize,
+    /// How to build the outer summary. `Keyword` (default) keeps the legacy
+    /// TF-IDF path; `Llm` routes through Ollama (spec P3, opt-in).
+    pub outer_synthesis: OuterSynthesis,
 }
 
 impl Default for OnionSliceConfig {
@@ -461,6 +481,7 @@ impl Default for OnionSliceConfig {
             middle_target: 300,
             inner_target: 600,
             min_content_for_slicing: 200,
+            outer_synthesis: OuterSynthesis::default(),
         }
     }
 }
@@ -579,6 +600,33 @@ pub fn create_onion_slices(
     slices
 }
 
+/// P3 escape hatch — synthesize an outer summary by asking a local Ollama model.
+///
+/// The LLM path is intentionally NOT wired into `create_onion_slices` directly:
+/// the slicer is synchronous CPU code and Ollama I/O is async + slow (5s/doc per
+/// spec). Callers that want LLM-driven outer summaries should:
+///   1. Run `create_onion_slices` to produce the four-layer skeleton.
+///   2. Pass the inner/core content here to get a clean summary.
+///   3. Replace the outer slice's `content` (and re-extract `keywords` if
+///      desired) before persisting.
+///
+/// Returns `None` on any error (network, model load, malformed response) so the
+/// caller can transparently fall back to the keyword outer.
+///
+/// Spec: 2026-04-27 kb-transcripts-onion-slicer-fix-spec, P3.
+#[cfg(feature = "ollama-outer")]
+pub async fn synthesize_outer_via_ollama(
+    inner_or_core_text: &str,
+    model: &str,
+    endpoint: &str,
+) -> Option<String> {
+    // Implementation deferred — this scaffold documents the contract so callers
+    // and future implementers know the exact shape. Wire-up requires the
+    // `ollama-outer` cargo feature plus a `reqwest` (or equivalent) dep.
+    let _ = (inner_or_core_text, model, endpoint);
+    None
+}
+
 /// Create fast onion slices (outer + core only) - 2x faster than full onion
 ///
 /// For bulk indexing where search quality can be slightly reduced.
@@ -633,26 +681,153 @@ pub fn create_onion_slices_fast(
     slices
 }
 
-/// Extract keywords from text using simple TF-based extraction
+/// English stopwords (top-100 typical filter).
+const STOP_WORDS_EN: &[&str] = &[
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does",
+    "did", "will", "would", "could", "should", "may", "might", "must", "shall", "can", "this",
+    "that", "these", "those", "i", "you", "he", "she", "it", "we", "they", "what", "which", "who",
+    "whom", "when", "where", "why", "how", "all", "each", "every", "both", "few", "more", "most",
+    "other", "some", "such", "no", "not", "only", "own", "same", "so", "than", "too", "very",
+    "just", "also", "now", "here", "there", "then", "once", "if", "into", "through", "during",
+    "before", "after", "above", "below", "between", "under", "again", "further", "about", "out",
+    "over", "up", "down", "off", "any", "because", "until", "while", "i'm", "i've", "i'll",
+    "you're", "he's", "she's", "we're", "they're", "let's", "that's", "isn't", "wasn't", "aren't",
+    "weren't", "doesn't", "didn't", "won't", "wouldn't", "shouldn't", "couldn't", "haven't",
+    "hasn't", "hadn't",
+];
+
+/// Polish stopwords (top-frequency filter). Driven by spec evidence:
+/// kb:transcripts top-5 tokens were `assistant/user/nie/transcript/jest`
+/// — the Polish ones (`nie`, `jest`, `już`) need to be filtered.
+const STOP_WORDS_PL: &[&str] = &[
+    "i", "w", "z", "na", "do", "od", "po", "za", "o", "u", "to", "ten", "ta", "te", "ci", "tej",
+    "tym", "się", "być", "był", "była", "było", "byli", "być", "mam", "masz", "ma", "mamy",
+    "macie", "mają", "jest", "są", "jestem", "jesteś", "był", "byli", "nie", "tak", "tu", "tam",
+    "już", "jeszcze", "też", "także", "ale", "lub", "albo", "czy", "że", "iż", "który", "która",
+    "które", "którzy", "co", "kto", "kogo", "kim", "czym", "gdzie", "kiedy", "skąd", "dokąd",
+    "jak", "jaki", "jaka", "jakie", "moje", "moja", "mój", "moi", "twój", "twoja", "twoje",
+    "nasz", "nasza", "nasze", "wasz", "wasza", "wasze", "ich", "jego", "jej", "im", "mu", "mi",
+    "ci", "go", "ją", "je", "nas", "was", "wam", "nam", "tylko", "bardzo", "bardziej", "może",
+    "można", "trzeba", "musi", "powinien", "raz", "razy", "potem", "wtedy", "więc", "wówczas",
+    "natomiast", "jednak", "jeśli", "jeżeli", "kiedy", "podczas", "przed", "przez", "podczas",
+    "ponieważ", "dlatego", "więc", "zatem", "tylko", "także", "również", "ponadto", "oraz",
+    "lecz", "kiedyś", "nigdy", "zawsze", "często", "rzadko", "czasem", "może", "powinno", "może",
+];
+
+/// Claude Code / Codex CLI animation gerundy — spec sample plus common variants.
+/// These pollute outer keywords for transcript namespaces because they appear
+/// 10-20× per file and TF-IDF treats them as discriminative for CLI vs prose.
+/// Lower-cased exact matches; tokenizer normalizes input the same way.
+const CLI_ANIMATION_GERUNDY: &[&str] = &[
+    "brewing",
+    "cogitating",
+    "frosting",
+    "grooving",
+    "beaming",
+    "booping",
+    "schlepping",
+    "computing",
+    "mulling",
+    "pondering",
+    "meditating",
+    "reflecting",
+    "crunching",
+    "synthesizing",
+    "distilling",
+    "forging",
+    "crafting",
+    "conjuring",
+    "whipping",
+    "channeling",
+    "decoding",
+    "encoding",
+    "reasoning",
+    "iterating",
+    "marinating",
+    "percolating",
+    "simmering",
+    "crystallizing",
+    "massaging",
+    "tinkering",
+    "polishing",
+    "thinking",
+    "proofing",
+    "bootstrapping",
+    "shifttab",
+    "tokens",
+    "permissions",
+    "bypass",
+    "running",
+    "thought",
+];
+
+/// CLI control / decoration tokens that recur in transcript exports.
+const CLI_CONTROL_TOKENS: &[&str] = &[
+    "shifttab",
+    "bypass",
+    "thought",
+    "thoughts",
+    "tokens",
+    "permissions",
+    "running",
+    "ran",
+    "stdout",
+    "stderr",
+    "tool",
+    "input",
+    "output",
+    "args",
+    "result",
+];
+
+/// Markdown structural words that show up in transcript headers/frontmatter.
+/// Per spec these are top-5 across kb:transcripts and contribute zero signal.
+const MARKDOWN_STRUCTURAL: &[&str] = &[
+    "transcript",
+    "user",
+    "assistant",
+    "system",
+    "human",
+    "model",
+    "date",
+    "started",
+    "source",
+    "cwd",
+    "session",
+    "session_id",
+    "agent",
+    "slice_mode",
+    "layer",
+    "metadata",
+    "frontmatter",
+    "claude",
+    "codex",
+    "gemini",
+];
+
+/// Whitespace-tolerant set construction for stop-token lookup.
+fn build_default_stop_set() -> std::collections::HashSet<&'static str> {
+    let mut set = std::collections::HashSet::new();
+    set.extend(STOP_WORDS_EN.iter().copied());
+    set.extend(STOP_WORDS_PL.iter().copied());
+    set.extend(CLI_ANIMATION_GERUNDY.iter().copied());
+    set.extend(CLI_CONTROL_TOKENS.iter().copied());
+    set.extend(MARKDOWN_STRUCTURAL.iter().copied());
+    set
+}
+
+/// Extract keywords from text using simple TF-based extraction.
+///
+/// Filters cover: PL+EN top-100 stopwords, Claude Code/Codex CLI gerundy,
+/// CLI control tokens, markdown structural words, session-token-shaped
+/// strings, and path-like fragments. Driven by the 2026-04-27 onion-slicer
+/// fix spec for `kb:transcripts`.
 fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
     use std::collections::HashMap;
 
-    // Common stop words to filter out
-    const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
-        "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does",
-        "did", "will", "would", "could", "should", "may", "might", "must", "shall", "can", "this",
-        "that", "these", "those", "i", "you", "he", "she", "it", "we", "they", "what", "which",
-        "who", "whom", "when", "where", "why", "how", "all", "each", "every", "both", "few",
-        "more", "most", "other", "some", "such", "no", "not", "only", "own", "same", "so", "than",
-        "too", "very", "just", "also", "now", "here", "there", "then", "once", "if", "into",
-        "through", "during", "before", "after", "above", "below", "between", "under", "again",
-        "further", "about", "out", "over", "up", "down", "off", "any", "because", "until", "while",
-    ];
+    let stop_set = build_default_stop_set();
 
-    let stop_set: std::collections::HashSet<&str> = STOP_WORDS.iter().copied().collect();
-
-    // Tokenize and count word frequencies
     let mut word_counts: HashMap<String, usize> = HashMap::new();
     for raw in text.split_whitespace() {
         for token in tokenize_keyword_candidates(raw) {
@@ -660,13 +835,13 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
                 && token.len() <= 30
                 && !stop_set.contains(token.as_str())
                 && !looks_like_session_token(&token)
+                && !looks_like_path_fragment(&token)
             {
                 *word_counts.entry(token).or_insert(0) += 1;
             }
         }
     }
 
-    // Sort by frequency and take top N
     let mut words: Vec<_> = word_counts.into_iter().collect();
     words.sort_by_key(|b| std::cmp::Reverse(b.1));
 
@@ -726,6 +901,82 @@ fn looks_like_session_token(token: &str) -> bool {
     token.len() > 12 && hex_chars == token.len()
         || digit_chars >= 6
         || (token.len() > 20 && alpha_chars < token.len() / 3)
+}
+
+/// Detect path-like fragments produced by stripping separators from concatenated
+/// directory paths. Driven by spec example:
+///   `userssilvergitvistakosmasessionid483fab1b40694c1595aa183cb34a9664...`
+///   `portalsrccomponentsdesktopwindowsvistaappwindowtsx145`
+/// These tokens are long, alphanumeric, and contain at least one runlength
+/// sequence of likely path segments. Filtering them out cleans up outer
+/// keyword splat for transcript namespaces.
+fn looks_like_path_fragment(token: &str) -> bool {
+    if token.len() < 30 {
+        return false;
+    }
+
+    // Heuristic 1: ≥3 directory-like segment markers in original raw token
+    // (this only fires if the tokenizer's compacted form preserves them).
+    let separator_count = token
+        .chars()
+        .filter(|ch| matches!(ch, '/' | '_' | '-' | '.'))
+        .count();
+    if separator_count >= 3 {
+        return true;
+    }
+
+    // Heuristic 2: looks like compacted path (long alphanum lowercase with
+    // characteristic shell/directory tokens embedded).
+    let common_path_segments = [
+        "src",
+        "components",
+        "users",
+        "library",
+        "claude",
+        "polyversai",
+        "vibecrafted",
+        "rust",
+        "memex",
+        "session",
+        "sessionid",
+        "branch",
+        "tsx",
+        "json",
+        "rs",
+        "py",
+        "node_modules",
+        "git",
+    ];
+    let lower = token.to_ascii_lowercase();
+    let segment_hits = common_path_segments
+        .iter()
+        .filter(|seg| lower.contains(*seg))
+        .count();
+    if segment_hits >= 2 {
+        return true;
+    }
+
+    // Heuristic 3: alphanum mix with no vowel runs >2 (indicates concatenation
+    // of unrelated identifiers, not a real word).
+    let vowels: std::collections::HashSet<char> =
+        ['a', 'e', 'i', 'o', 'u', 'y'].into_iter().collect();
+    let mut max_vowel_run = 0;
+    let mut current_run = 0;
+    for ch in token.chars() {
+        if vowels.contains(&ch.to_ascii_lowercase()) {
+            current_run += 1;
+            if current_run > max_vowel_run {
+                max_vowel_run = current_run;
+            }
+        } else {
+            current_run = 0;
+        }
+    }
+    if token.len() > 40 && max_vowel_run <= 2 {
+        return true;
+    }
+
+    false
 }
 
 /// Create short hash for document deduplication
@@ -2442,17 +2693,20 @@ impl RAGPipeline {
                     map.insert("keywords".to_string(), json!(slice.keywords));
                 }
 
-                // Dual hash: file_hash for provenance, content_hash for per-slice dedup
+                // Dual hash: source_hash for provenance, content_hash for per-slice dedup
                 let slice_hash = compute_content_hash(&slice.content);
                 if let serde_json::Value::Object(ref mut map) = metadata {
                     map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("source_hash".to_string(), json!(content_hash));
+                    map.insert("chunk_hash".to_string(), json!(&slice_hash));
                 }
-                let doc = ChromaDocument::from_onion_slice_with_hash(
+                let doc = ChromaDocument::from_onion_slice_with_hashes(
                     slice,
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
                     slice_hash,
+                    Some(content_hash.to_string()),
                 );
                 batch_docs.push(doc);
             }
@@ -2512,17 +2766,20 @@ impl RAGPipeline {
                     map.insert("keywords".to_string(), json!(slice.keywords));
                 }
 
-                // Dual hash: file_hash for provenance, content_hash for per-slice dedup
+                // Dual hash: source_hash for provenance, content_hash for per-slice dedup
                 let slice_hash = compute_content_hash(&slice.content);
                 if let serde_json::Value::Object(ref mut map) = metadata {
                     map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("source_hash".to_string(), json!(content_hash));
+                    map.insert("chunk_hash".to_string(), json!(&slice_hash));
                 }
-                let doc = ChromaDocument::from_onion_slice_with_hash(
+                let doc = ChromaDocument::from_onion_slice_with_hashes(
                     slice,
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
                     slice_hash,
+                    Some(content_hash.to_string()),
                 );
                 batch_docs.push(doc);
             }
@@ -2633,18 +2890,21 @@ impl RAGPipeline {
                     map.insert("total_chunks".to_string(), json!(total_chunks));
                 }
 
-                // Dual hash: file_hash for provenance, content_hash for per-chunk dedup
+                // Dual hash: source_hash for provenance, content_hash for per-chunk dedup
                 let chunk_hash = compute_content_hash(chunk);
                 if let serde_json::Value::Object(ref mut map) = metadata {
                     map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("source_hash".to_string(), json!(content_hash));
+                    map.insert("chunk_hash".to_string(), json!(&chunk_hash));
                 }
-                let doc = ChromaDocument::new_flat_with_hash(
+                let doc = ChromaDocument::new_flat_with_hashes(
                     format!("{}_{}", path.to_str().unwrap_or("unknown"), global_idx),
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
                     chunk.clone(),
                     chunk_hash,
+                    Some(content_hash.to_string()),
                 );
                 batch_docs.push(doc);
                 global_idx += 1;
@@ -2684,10 +2944,13 @@ impl RAGPipeline {
             let mut batch_docs = Vec::with_capacity(batch.len());
             for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
                 let mut metadata = base_metadata.clone();
+                let chunk_hash = compute_content_hash(chunk);
                 if let serde_json::Value::Object(ref mut map) = metadata {
                     map.insert("chunk_index".to_string(), json!(global_idx));
                     map.insert("total_chunks".to_string(), json!(total_chunks));
                     map.insert("file_hash".to_string(), json!(content_hash));
+                    map.insert("source_hash".to_string(), json!(content_hash));
+                    map.insert("chunk_hash".to_string(), json!(&chunk_hash));
                     map.insert("original_id".to_string(), json!(original_id));
                 }
 
@@ -2697,14 +2960,14 @@ impl RAGPipeline {
                     format!("{original_id}::chunk::{global_idx}")
                 };
 
-                let chunk_hash = compute_content_hash(chunk);
-                let doc = ChromaDocument::new_flat_with_hash(
+                let doc = ChromaDocument::new_flat_with_hashes(
                     doc_id,
                     namespace.to_string(),
                     embedding.clone(),
                     metadata,
                     chunk.clone(),
                     chunk_hash,
+                    Some(content_hash.to_string()),
                 );
                 batch_docs.push(doc);
                 global_idx += 1;

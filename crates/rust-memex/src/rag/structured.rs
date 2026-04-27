@@ -147,15 +147,49 @@ fn push_raw_block(blocks: &mut Vec<RawBlock>, role: String, content: &str) {
 
 fn parse_markdown_heading(line: &str) -> Option<&'static str> {
     let trimmed = line.trim();
+    // Original AI Chronicles-style headings.
     if trimmed.eq_ignore_ascii_case("User request:") {
-        Some("user")
-    } else if trimmed.eq_ignore_ascii_case("Assistant response:") {
-        Some("assistant")
-    } else if trimmed.eq_ignore_ascii_case("Reasoning focus:") {
-        Some("reasoning")
-    } else {
-        None
+        return Some("user");
     }
+    if trimmed.eq_ignore_ascii_case("Assistant response:") {
+        return Some("assistant");
+    }
+    if trimmed.eq_ignore_ascii_case("Reasoning focus:") {
+        return Some("reasoning");
+    }
+
+    // Claude Code / Codex transcript format: lines like
+    //   `## user`, `## assistant`, `## tool`, `## system`,
+    //   `### User`, `### Assistant`, `[user]`, `[assistant]`.
+    let stripped = trimmed
+        .trim_start_matches('#')
+        .trim_start_matches(['[', '*'])
+        .trim_end_matches([':', ']'])
+        .trim();
+
+    if stripped.eq_ignore_ascii_case("user") || stripped.eq_ignore_ascii_case("human") {
+        return Some("user");
+    }
+    if stripped.eq_ignore_ascii_case("assistant")
+        || stripped.eq_ignore_ascii_case("model")
+        || stripped.eq_ignore_ascii_case("ai")
+    {
+        return Some("assistant");
+    }
+    if stripped.eq_ignore_ascii_case("system") || stripped.eq_ignore_ascii_case("system context") {
+        return Some("system");
+    }
+    if stripped.eq_ignore_ascii_case("tool")
+        || stripped.eq_ignore_ascii_case("tool output")
+        || stripped.eq_ignore_ascii_case("tool result")
+    {
+        return Some("tool");
+    }
+    if stripped.eq_ignore_ascii_case("reasoning") || stripped.eq_ignore_ascii_case("thought") {
+        return Some("reasoning");
+    }
+
+    None
 }
 
 fn normalize_role_key(role: &str) -> String {

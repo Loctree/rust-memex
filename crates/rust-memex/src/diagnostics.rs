@@ -9,6 +9,7 @@ use memex_contracts::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::storage::ChromaDocument;
 use crate::{IntegrityRecommendation, SliceLayer, StorageManager, TextIntegrityMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +276,157 @@ pub async fn deduplicate_documents(
                 })
                 .collect(),
         });
+    }
+
+    Ok(result)
+}
+
+/// Result of a backfill-hashes pass.
+///
+/// `content_hash` is per-chunk SHA256 (semantics introduced in schema v4).
+/// `source_hash` is the SHA256 of the source document text — same value across
+/// all four onion layers from one source. Pre-v4 namespaces stored the source
+/// hash in `content_hash`; this backfill (a) re-derives a true per-chunk
+/// `content_hash`, and (b) preserves the legacy hash as `source_hash` so
+/// pre-index dedup works without re-reading source files.
+///
+/// Spec: `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`, P0 backfill.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackfillHashesResult {
+    /// Total documents inspected in the namespace (or across all namespaces).
+    pub total_docs: usize,
+    /// Documents that needed a `content_hash` write because the column was
+    /// either empty or stored the source hash (pre-v4 schema).
+    pub content_hash_backfilled: usize,
+    /// Documents that needed a `source_hash` write because the column was
+    /// empty (pre-v4 schema, or v4 chunk written before the field was wired
+    /// up end-to-end).
+    pub source_hash_backfilled: usize,
+    /// Documents skipped because they already have correct per-chunk
+    /// `content_hash` AND a populated `source_hash`.
+    pub already_consistent: usize,
+    /// Documents that could not be backfilled because the embedding column
+    /// was missing or zero-length (extremely unlikely; logged in storage warn).
+    pub skipped_no_embedding: usize,
+    /// `true` when the caller asked for a dry run (no writes performed).
+    pub dry_run: bool,
+}
+
+/// Recompute per-chunk `content_hash` and recover `source_hash` for legacy
+/// chunks. Safe to run repeatedly; chunks that already match the v4 contract
+/// are counted under `already_consistent` and left alone.
+///
+/// Strategy:
+/// 1. For each chunk, recompute `chunk_hash = SHA256(document_text)`.
+/// 2. If the stored `content_hash` differs from `chunk_hash`, the row is
+///    pre-v4 — its `content_hash` was actually the source hash. Move it into
+///    `source_hash` (when empty) before overwriting `content_hash`.
+/// 3. If `source_hash` is still empty after step 2, fall back to copying the
+///    new `content_hash` so dedup has *something* to key on (better than
+///    nothing — operators can re-index from source for true provenance).
+/// 4. Re-write the row by deleting + inserting (LanceDB has no per-row update
+///    that accepts a fixed-size vector update for our schema).
+///
+/// Spec: `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`, P0 backfill.
+pub async fn backfill_chunk_and_source_hashes(
+    storage: &StorageManager,
+    namespace: Option<&str>,
+    dry_run: bool,
+) -> Result<BackfillHashesResult> {
+    let mut result = BackfillHashesResult {
+        dry_run,
+        ..Default::default()
+    };
+
+    const PAGE: usize = 5_000;
+    let mut offset = 0;
+
+    loop {
+        let page = storage.all_documents_page(namespace, offset, PAGE).await?;
+        let page_len = page.len();
+        if page_len == 0 {
+            break;
+        }
+        result.total_docs += page_len;
+
+        for doc in &page {
+            if doc.embedding.is_empty() {
+                result.skipped_no_embedding += 1;
+                continue;
+            }
+
+            let true_chunk_hash = crate::rag::compute_content_hash(&doc.document);
+            let mut needs_content = false;
+            let mut needs_source = false;
+
+            let new_content_hash = match doc.content_hash.as_deref() {
+                Some(stored) if stored == true_chunk_hash => stored.to_string(),
+                Some(_) => {
+                    needs_content = true;
+                    true_chunk_hash.clone()
+                }
+                None => {
+                    needs_content = true;
+                    true_chunk_hash.clone()
+                }
+            };
+
+            // Recover source_hash. Pre-v4 chunks stored the source hash under
+            // `content_hash`; if that was the case, prefer it over the freshly
+            // computed chunk hash. Otherwise fall back to chunk_hash so dedup
+            // has a key (better than `None`).
+            let recovered_source_hash = match (&doc.source_hash, &doc.content_hash) {
+                (Some(s), _) if !s.is_empty() => s.clone(),
+                (_, Some(legacy)) if legacy.as_str() != true_chunk_hash.as_str() => {
+                    // Legacy content_hash was actually the source hash.
+                    needs_source = true;
+                    legacy.clone()
+                }
+                _ => {
+                    needs_source = doc.source_hash.is_none();
+                    new_content_hash.clone()
+                }
+            };
+
+            if !needs_content && !needs_source {
+                result.already_consistent += 1;
+                continue;
+            }
+
+            if needs_content {
+                result.content_hash_backfilled += 1;
+            }
+            if needs_source {
+                result.source_hash_backfilled += 1;
+            }
+
+            if dry_run {
+                continue;
+            }
+
+            // Atomic-per-row swap: delete then re-insert with corrected
+            // hashes. LanceDB lacks an update-with-vector path for our schema.
+            let new_doc = ChromaDocument {
+                id: doc.id.clone(),
+                namespace: doc.namespace.clone(),
+                embedding: doc.embedding.clone(),
+                metadata: doc.metadata.clone(),
+                document: doc.document.clone(),
+                layer: doc.layer,
+                parent_id: doc.parent_id.clone(),
+                children_ids: doc.children_ids.clone(),
+                keywords: doc.keywords.clone(),
+                content_hash: Some(new_content_hash.clone()),
+                source_hash: Some(recovered_source_hash.clone()),
+            };
+            storage.delete_document(&doc.namespace, &doc.id).await?;
+            storage.add_to_store(vec![new_doc]).await?;
+        }
+
+        if page_len < PAGE {
+            break;
+        }
+        offset += page_len;
     }
 
     Ok(result)
@@ -603,5 +755,113 @@ fn format_gap_date(date: DateTime<Utc>, bucket: TimelineBucket) -> String {
     match bucket {
         TimelineBucket::Day => date.format("%Y-%m-%d").to_string(),
         TimelineBucket::Hour => date.format("%Y-%m-%dT%H:00:00Z").to_string(),
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use crate::rag::compute_content_hash;
+    use crate::storage::ChromaDocument;
+    use tempfile::TempDir;
+
+    /// Pre-v4 row stored `content_hash = SHA256(source_doc)` for every layer
+    /// of the same source. After backfill, `content_hash` must become
+    /// SHA256(chunk_text) and `source_hash` must hold the legacy value so
+    /// pre-index dedup keeps working.
+    #[tokio::test]
+    async fn backfill_promotes_legacy_content_hash_to_source_hash() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("lancedb");
+        let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
+            .await
+            .expect("storage");
+        storage.ensure_collection().await.expect("collection");
+
+        let namespace = "kb:transcripts-test".to_string();
+        let source_text = "full source document text";
+        let source_hash = compute_content_hash(source_text);
+
+        // Two chunks from one source, written under the v3 contract:
+        // both rows carry the source-text hash in `content_hash` and
+        // leave `source_hash` empty.
+        let chunk_a_text = "outer summary text";
+        let chunk_b_text = "inner detailed text";
+        let doc_a = ChromaDocument {
+            id: "chunk-a".to_string(),
+            namespace: namespace.clone(),
+            embedding: vec![0.1_f32; 8],
+            metadata: serde_json::json!({"path": "doc.md"}),
+            document: chunk_a_text.to_string(),
+            layer: 1,
+            parent_id: None,
+            children_ids: vec![],
+            keywords: vec![],
+            content_hash: Some(source_hash.clone()),
+            source_hash: None,
+        };
+        let doc_b = ChromaDocument {
+            id: "chunk-b".to_string(),
+            namespace: namespace.clone(),
+            embedding: vec![0.2_f32; 8],
+            metadata: serde_json::json!({"path": "doc.md"}),
+            document: chunk_b_text.to_string(),
+            layer: 3,
+            parent_id: None,
+            children_ids: vec![],
+            keywords: vec![],
+            content_hash: Some(source_hash.clone()),
+            source_hash: None,
+        };
+        storage
+            .add_to_store(vec![doc_a, doc_b])
+            .await
+            .expect("seed pre-v4 rows");
+
+        let dry = backfill_chunk_and_source_hashes(&storage, Some(&namespace), true)
+            .await
+            .expect("dry run");
+        assert!(dry.dry_run);
+        assert_eq!(dry.total_docs, 2);
+        assert_eq!(dry.content_hash_backfilled, 2);
+        assert_eq!(dry.source_hash_backfilled, 2);
+        assert_eq!(dry.already_consistent, 0);
+
+        let live = backfill_chunk_and_source_hashes(&storage, Some(&namespace), false)
+            .await
+            .expect("live run");
+        assert!(!live.dry_run);
+        assert_eq!(live.content_hash_backfilled, 2);
+        assert_eq!(live.source_hash_backfilled, 2);
+
+        let after_a = storage
+            .get_document(&namespace, "chunk-a")
+            .await
+            .expect("lookup a")
+            .expect("doc-a present");
+        assert_eq!(
+            after_a.content_hash.as_deref(),
+            Some(compute_content_hash(chunk_a_text)).as_deref()
+        );
+        assert_eq!(after_a.source_hash.as_deref(), Some(source_hash.as_str()));
+
+        let after_b = storage
+            .get_document(&namespace, "chunk-b")
+            .await
+            .expect("lookup b")
+            .expect("doc-b present");
+        assert_eq!(
+            after_b.content_hash.as_deref(),
+            Some(compute_content_hash(chunk_b_text)).as_deref()
+        );
+        assert_eq!(after_b.source_hash.as_deref(), Some(source_hash.as_str()));
+
+        // Idempotency: running again leaves the rows alone.
+        let again = backfill_chunk_and_source_hashes(&storage, Some(&namespace), false)
+            .await
+            .expect("idempotent");
+        assert_eq!(again.content_hash_backfilled, 0);
+        assert_eq!(again.source_hash_backfilled, 0);
+        assert_eq!(again.already_consistent, 2);
     }
 }

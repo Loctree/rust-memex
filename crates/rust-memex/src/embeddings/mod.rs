@@ -1177,9 +1177,17 @@ fn truncate_at_boundary(text: &str, max_chars: usize) -> String {
 // TOKEN-AWARE VALIDATION
 // =============================================================================
 //
-// Embedding models have token limits (e.g., 8192 for qwen3-embedding).
+// Embedding models have token limits. qwen3-embedding:8b ships with a
+// 40 960-token context window (verified via `ollama show qwen3-embedding:8b`).
+// Earlier defaults (8192) were a conservative carry-over from older models and
+// caused premature truncation of long transcripts. We keep a 6 000-token margin
+// under the real limit (~35 000) for prompt overhead and language drift.
 // These utilities estimate token counts and validate chunks before embedding.
 // =============================================================================
+
+/// Default safe ceiling for qwen3-embedding context window.
+/// Real model limit is 40 960 tokens; we leave ~6k margin for safety.
+pub const DEFAULT_MAX_TOKENS: usize = 35_000;
 
 /// Token estimation configuration
 #[derive(Debug, Clone)]
@@ -1194,8 +1202,8 @@ pub struct TokenConfig {
 impl Default for TokenConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 8192,     // qwen3-embedding default
-            chars_per_token: 3.0, // Conservative for multilingual
+            max_tokens: DEFAULT_MAX_TOKENS,
+            chars_per_token: 3.0,
         }
     }
 }
@@ -1204,7 +1212,7 @@ impl TokenConfig {
     /// Create config for English-only content
     pub fn english() -> Self {
         Self {
-            max_tokens: 8192,
+            max_tokens: DEFAULT_MAX_TOKENS,
             chars_per_token: 4.0,
         }
     }
@@ -1212,7 +1220,7 @@ impl TokenConfig {
     /// Create config for multilingual/Polish content
     pub fn for_multilingual_text() -> Self {
         Self {
-            max_tokens: 8192,
+            max_tokens: DEFAULT_MAX_TOKENS,
             chars_per_token: 2.5,
         }
     }
@@ -1458,11 +1466,11 @@ mod tests {
 
     #[test]
     fn test_safe_chunk_size() {
-        let config = TokenConfig::default(); // 8192 tokens, 3 chars/token
+        let config = TokenConfig::default(); // 35_000 tokens, 3 chars/token
 
         let safe = safe_chunk_size(&config);
-        // 8192 * 0.8 * 3 = 19660 chars
-        assert!(safe > 15000 && safe < 25000);
+        // 35_000 * 0.8 * 3 = 84_000 chars
+        assert!(safe > 80_000 && safe < 90_000);
     }
 
     #[test]

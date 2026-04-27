@@ -63,7 +63,12 @@ pub struct Chunk {
     pub source_path: PathBuf,
     /// Target namespace.
     pub namespace: String,
-    /// Content hash of source file (for dedup tracking).
+    /// SHA256 of THIS chunk's text. Drives chunk-level deduplication.
+    /// Differs across the four onion layers from one source.
+    pub chunk_hash: String,
+    /// SHA256 of the source document (same value across all four onion
+    /// layers from one source). Drives pre-index source-level dedup so we
+    /// never re-embed an already-ingested file.
     pub source_hash: String,
     /// Onion slice layer (if using onion mode).
     pub layer: u8,
@@ -907,26 +912,40 @@ async fn stage_read_files(
         let content_hash = crate::rag::compute_content_hash(&text);
 
         if dedup_enabled {
-            match storage.has_content_hash(&namespace, &content_hash).await {
-                Ok(true) => {
-                    debug!(
-                        "Skipping duplicate: {:?} (hash: {})",
-                        path,
-                        &content_hash[..16]
-                    );
-                    observer
-                        .emit(PipelineEvent::FileSkipped {
-                            path: path.clone(),
-                            content_hash,
-                            reason: "exact duplicate".to_string(),
-                        })
-                        .await;
-                    continue;
-                }
-                Ok(false) => {}
+            // Source-level dedup: skip if any chunk in this namespace already
+            // came from a document with this exact text (P4). Falls back to
+            // per-chunk content_hash check for pre-v4 namespaces where the
+            // source_hash column may not yet exist.
+            let already_indexed = match storage.has_source_hash(&namespace, &content_hash).await {
+                Ok(true) => true,
+                Ok(false) => match storage.has_content_hash(&namespace, &content_hash).await {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(err) => {
+                        warn!("content_hash dedup fallback failed for {:?}: {}", path, err);
+                        false
+                    }
+                },
                 Err(err) => {
-                    warn!("Dedup check failed for {:?}: {}", path, err);
+                    warn!("source_hash dedup check failed for {:?}: {}", path, err);
+                    false
                 }
+            };
+
+            if already_indexed {
+                debug!(
+                    "Skipping duplicate source: {:?} (source_hash: {})",
+                    path,
+                    &content_hash[..16]
+                );
+                observer
+                    .emit(PipelineEvent::FileSkipped {
+                        path: path.clone(),
+                        content_hash,
+                        reason: "exact duplicate".to_string(),
+                    })
+                    .await;
+                continue;
             }
         }
 
@@ -1018,21 +1037,87 @@ async fn stage_chunk_content(
     info!("Chunker stage complete");
 }
 
+/// Heuristic: does this file look like a Claude Code / Codex / chat transcript?
+///
+/// Triggers the structured slicing path which builds semantic cards from
+/// turn boundaries instead of relying on TF-IDF over raw markdown soup.
+/// Conservative — fires only when at least two distinct role headings appear,
+/// so plain markdown notes still flow through the unstructured path.
+fn looks_like_markdown_transcript(text: &str, path: &Path) -> bool {
+    // Filename hints (Claude Code / Codex / mass exports use these patterns).
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("claude")
+            || lower.starts_with("codex")
+            || lower.contains("transcript")
+            || lower.contains("__clean")
+            || lower.contains("__dupe__")
+        {
+            return true;
+        }
+    }
+
+    // Content-shape hint: at least one user heading AND one assistant heading
+    // within the first ~200 lines. Cheap; bail early on long files.
+    let mut user_seen = false;
+    let mut assistant_seen = false;
+    for (idx, line) in text.lines().enumerate() {
+        if idx > 200 {
+            break;
+        }
+        let trimmed = line.trim();
+        let lowered = trimmed.to_ascii_lowercase();
+        if lowered == "## user"
+            || lowered == "### user"
+            || lowered == "[user]"
+            || lowered == "user request:"
+        {
+            user_seen = true;
+        } else if lowered == "## assistant"
+            || lowered == "### assistant"
+            || lowered == "[assistant]"
+            || lowered == "assistant response:"
+        {
+            assistant_seen = true;
+        }
+        if user_seen && assistant_seen {
+            return true;
+        }
+    }
+    false
+}
+
 /// Create chunks from file content based on slicing mode.
 fn create_chunks_from_content(
     content: &FileContent,
     slice_mode: SliceMode,
     config: &OnionSliceConfig,
 ) -> Vec<Chunk> {
-    let metadata = serde_json::json!({
+    let is_transcript = looks_like_markdown_transcript(&content.text, &content.path);
+
+    // Tagging the metadata with `format: "markdown_transcript"` flips
+    // structured.rs::is_structured_conversation() to true, which routes the
+    // slicer to semantic-card outer/middle/inner — bypassing the TF-IDF
+    // keyword splat that pollutes transcript namespaces (P2).
+    let mut metadata = serde_json::json!({
         "path": content.path.to_str(),
         "content_hash": &content.content_hash,
+        "source_hash": &content.content_hash,
         "slice_mode": match slice_mode {
             SliceMode::Onion => "onion",
             SliceMode::OnionFast => "onion-fast",
             SliceMode::Flat => "flat",
         },
     });
+    if is_transcript
+        && let serde_json::Value::Object(ref mut map) = metadata
+    {
+        map.insert(
+            "format".to_string(),
+            serde_json::json!("markdown_transcript"),
+        );
+        map.insert("type".to_string(), serde_json::json!("conversation"));
+    }
 
     match slice_mode {
         SliceMode::Onion => {
@@ -1052,9 +1137,11 @@ fn slices_to_chunks(slices: Vec<OnionSlice>, content: &FileContent) -> Vec<Chunk
     slices
         .into_iter()
         .map(|slice| {
+            let chunk_hash = crate::rag::compute_content_hash(&slice.content);
             let metadata = serde_json::json!({
                 "path": content.path.to_str(),
-                "content_hash": &content.content_hash,
+                "source_hash": &content.content_hash,
+                "chunk_hash": &chunk_hash,
                 "layer": slice.layer.name(),
             });
 
@@ -1063,6 +1150,7 @@ fn slices_to_chunks(slices: Vec<OnionSlice>, content: &FileContent) -> Vec<Chunk
                 content: slice.content,
                 source_path: content.path.clone(),
                 namespace: content.namespace.clone(),
+                chunk_hash,
                 source_hash: content.content_hash.clone(),
                 layer: slice.layer.as_u8(),
                 parent_id: slice.parent_id,
@@ -1087,10 +1175,16 @@ fn create_flat_chunks(
         .into_iter()
         .enumerate()
         .map(|(idx, chunk_text)| {
+            let chunk_hash = crate::rag::compute_content_hash(&chunk_text);
             let mut metadata = base_metadata.clone();
             if let serde_json::Value::Object(ref mut map) = metadata {
                 map.insert("chunk_index".to_string(), serde_json::json!(idx));
                 map.insert("total_chunks".to_string(), serde_json::json!(total_chunks));
+                map.insert(
+                    "source_hash".to_string(),
+                    serde_json::json!(&content.content_hash),
+                );
+                map.insert("chunk_hash".to_string(), serde_json::json!(&chunk_hash));
             }
 
             let id = format!(
@@ -1105,6 +1199,7 @@ fn create_flat_chunks(
                 content: chunk_text,
                 source_path: content.path.clone(),
                 namespace: content.namespace.clone(),
+                chunk_hash,
                 source_hash: content.content_hash.clone(),
                 layer: 0,
                 parent_id: None,
@@ -1489,12 +1584,17 @@ async fn rollback_stored_file_chunks(
 }
 
 /// Store a batch of embedded chunks.
+///
+/// Writes BOTH per-chunk `content_hash` (for chunk-level dedup, distinguishes
+/// outer/middle/inner/core slices of one source) AND `source_hash` (same value
+/// across all four onion layers, for pre-index source dedup).
 async fn store_batch(storage: &StorageManager, batch: Vec<EmbeddedChunk>) -> Result<usize> {
     let count = batch.len();
 
     let documents: Vec<ChromaDocument> = batch
         .into_iter()
         .map(|embedded| {
+            let source_hash = Some(embedded.chunk.source_hash);
             if embedded.chunk.layer > 0 {
                 ChromaDocument {
                     id: embedded.chunk.id,
@@ -1506,16 +1606,18 @@ async fn store_batch(storage: &StorageManager, batch: Vec<EmbeddedChunk>) -> Res
                     parent_id: embedded.chunk.parent_id,
                     children_ids: embedded.chunk.children_ids,
                     keywords: embedded.chunk.keywords,
-                    content_hash: Some(embedded.chunk.source_hash),
+                    content_hash: Some(embedded.chunk.chunk_hash),
+                    source_hash,
                 }
             } else {
-                ChromaDocument::new_flat_with_hash(
+                ChromaDocument::new_flat_with_hashes(
                     embedded.chunk.id,
                     embedded.chunk.namespace,
                     embedded.embedding,
                     embedded.chunk.metadata,
                     embedded.chunk.content,
-                    embedded.chunk.source_hash,
+                    embedded.chunk.chunk_hash,
+                    source_hash,
                 )
             }
         })
