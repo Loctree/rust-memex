@@ -1266,7 +1266,14 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
     }
 
     let mut words: Vec<_> = word_counts.into_iter().collect();
-    words.sort_by_key(|b| std::cmp::Reverse(b.1));
+    // Tie-break alphabetically on the token to make `top-N` deterministic when
+    // counts collide. `HashMap` iteration order is randomized per-process, so
+    // a count-only sort would surface a different `top-N` per run whenever the
+    // relevant tokens share a count (very common for LLM-synthesized outers
+    // where every meaningful word appears exactly once). The flake this
+    // protects against was observed in
+    // `rag::p3_llm_outer_tests::create_onion_slices_async_replaces_outer_with_llm_summary`.
+    words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     words
         .into_iter()
@@ -4837,6 +4844,43 @@ Results:
         );
     }
 
+    /// Locks deterministic tie-break ordering inside `extract_keywords`. Every
+    /// candidate token in this fixture appears exactly once, so without an
+    /// explicit alphabetical tie-break the `top-N` slice would pick a different
+    /// subset on every run (HashMap iteration order is randomized per process).
+    /// The flake this guards against was observed in
+    /// `rag::p3_llm_outer_tests::create_onion_slices_async_replaces_outer_with_llm_summary`,
+    /// where the failure mode was `["resolved", "llm", "outer"]` getting picked
+    /// instead of the meaning-bearing Polish tokens. 50 invocations against the
+    /// same fixture must produce byte-identical output; if a future refactor
+    /// drops the tie-break this loop catches it deterministically on CI.
+    #[test]
+    fn extract_keywords_is_deterministic_on_count_ties() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        let baseline = extract_keywords(text, 5);
+        assert_eq!(baseline.len(), 5);
+        // Alphabetical tie-break on count=1 must surface the alphabetical
+        // prefix of the candidate set — never `juliet` first, never `golf`
+        // first, etc.
+        assert_eq!(
+            baseline,
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string(),
+                "delta".to_string(),
+                "echo".to_string(),
+            ]
+        );
+        for _ in 0..50 {
+            assert_eq!(
+                extract_keywords(text, 5),
+                baseline,
+                "extract_keywords must be deterministic across runs on count ties"
+            );
+        }
+    }
+
     #[test]
     fn plain_text_still_uses_generic_fallback_path() {
         let metadata = json!({
@@ -5173,11 +5217,13 @@ mod p3_llm_outer_tests {
         );
 
         // Sanity: the fallback outer must be a keyword-style outer (the legacy
-        // bracketed [k1, k2, …] prefix produced by `create_outer_summary`). We
-        // intentionally do NOT compare byte-for-byte with the keyword baseline:
-        // `extract_keywords` ties are broken by HashMap iteration order, which
-        // is non-deterministic across runs, and that instability is orthogonal
-        // to the P3 fallback contract being tested here.
+        // bracketed [k1, k2, …] prefix produced by `create_outer_summary`).
+        // Tie-break ordering inside `extract_keywords` is now deterministic
+        // (alphabetical on token), so a byte-equality check against the
+        // keyword baseline would also pass; the bracketed-prefix shape is the
+        // narrower contract this test is here to lock — the exact keyword
+        // ordering on a real-world transcript is the keyword extractor's
+        // problem, not the P3 fallback contract's.
         assert!(
             outer.content.starts_with('['),
             "fallback outer must be the keyword-style bracketed summary, got: {:?}",
