@@ -173,6 +173,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "Structured summary about patient follow-up and medication changes.",
             "hash-klaud-outer",
+            None,
             json!({
                 "indexed_at": "2026-04-18T09:15:00Z",
                 "source": "klaudiusz-summary.md"
@@ -185,6 +186,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Core,
             "Detailed clinical note with multiple sentences. The record includes observations, medication timing, and recovery guidance.",
             "hash-klaud-core",
+            None,
             json!({
                 "indexed_at": "2026-04-18T09:25:00Z",
                 "source": "klaudiusz-core.md"
@@ -197,6 +199,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "Timeline entry for audit day one.",
             "hash-aicx-1",
+            None,
             json!({
                 "indexed_at": "2026-04-17T10:15:00Z",
                 "source": "day-one.md"
@@ -209,18 +212,26 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "Timeline entry for audit day two.",
             "hash-aicx-2",
+            None,
             json!({
                 "indexed_at": "2026-04-18T11:45:00Z",
                 "source": "day-two.md"
             }),
             &["timeline"],
         ),
+        // The two `dup-*` rows share both `content_hash` AND `source_hash` (+ layer)
+        // so the post-v4 default (`source-hash-layer`) and the legacy
+        // (`content-hash`) modes both classify them as one duplicate cluster.
+        // Spec P4: "dedup CLI: nowy default `--group-by source-hash-layer` zachowuje
+        // onion (1 chunk per layer per source), stary `--group-by content-hash`
+        // jako opt-in dla edge cases".
         doc_with_layer_and_hash(
             "dup-keep",
             "dup-ns",
             SliceLayer::Outer,
             "This duplicate content should collapse.",
             "dup-hash",
+            Some("dup-source"),
             json!({
                 "indexed_at": "2026-04-19T08:00:00Z",
                 "source": "dup-a.md"
@@ -233,6 +244,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "This duplicate content should collapse.",
             "dup-hash",
+            Some("dup-source"),
             json!({
                 "indexed_at": "2026-04-19T08:05:00Z",
                 "source": "dup-b.md"
@@ -245,11 +257,28 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "This entry is unique.",
             "dup-unique-hash",
+            Some("dup-unique-source"),
             json!({
                 "indexed_at": "2026-04-19T08:10:00Z",
                 "source": "dup-c.md"
             }),
             &["unique"],
+        ),
+        // Pre-v4 row: `content_hash` populated but `source_hash` is null. Under the
+        // post-v4 default the row contributes to `docs_without_hash`; under the
+        // legacy `content-hash` opt-in the same row is a regular candidate.
+        doc_with_layer_and_hash(
+            "dup-pre-v4",
+            "dup-ns",
+            SliceLayer::Outer,
+            "Legacy chunk written before source_hash was wired up.",
+            "pre-v4-hash",
+            None,
+            json!({
+                "indexed_at": "2026-04-19T08:15:00Z",
+                "source": "dup-pre-v4.md"
+            }),
+            &["legacy"],
         ),
         doc_with_layer_and_hash(
             "purge-1",
@@ -257,6 +286,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "fragment",
             "purge-hash-1",
+            None,
             json!({
                 "indexed_at": "2026-04-19T07:00:00Z",
                 "source": "broken-a.txt"
@@ -269,6 +299,7 @@ async fn seed_documents(storage: &StorageManager) {
             SliceLayer::Outer,
             "noise",
             "purge-hash-2",
+            None,
             json!({
                 "indexed_at": "2026-04-19T07:05:00Z",
                 "source": "broken-b.txt"
@@ -280,22 +311,25 @@ async fn seed_documents(storage: &StorageManager) {
     storage.add_to_store(docs).await.expect("seed docs");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn doc_with_layer_and_hash(
     id: &str,
     namespace: &str,
     layer: SliceLayer,
     text: &str,
     content_hash: &str,
+    source_hash: Option<&str>,
     metadata: Value,
     keywords: &[&str],
 ) -> ChromaDocument {
-    let mut doc = ChromaDocument::new_flat_with_hash(
+    let mut doc = ChromaDocument::new_flat_with_hashes(
         id.to_string(),
         namespace.to_string(),
         vec![0.25; EMBEDDING_DIMENSION],
         metadata,
         text.to_string(),
         content_hash.to_string(),
+        source_hash.map(ToString::to_string),
     );
     doc.layer = layer.as_u8();
     doc.keywords = keywords
@@ -499,6 +533,13 @@ async fn purge_quality_endpoint_requires_dry_run_then_executes() {
     );
 }
 
+/// Default endpoint behaviour after spec P4 ("dedup grouping") locked
+/// `source-hash-layer` as the post-v4 default. The two `dup-*` rows share
+/// content_hash AND source_hash AND layer, so the cluster collapses to one
+/// group keyed by `<source_hash>|layer<N>`. The pre-v4 row (no source_hash)
+/// is reported via `docs_without_hash`, never silently swept under default
+/// grouping. Execute deletes exactly one chunk and the surviving namespace
+/// keeps every distinct row (kept duplicate + unique + pre-v4).
 #[tokio::test]
 async fn dedup_endpoint_lists_duplicates_then_executes() {
     let test_app = build_test_app().await;
@@ -513,11 +554,26 @@ async fn dedup_endpoint_lists_duplicates_then_executes() {
     assert_eq!(dry_run_response.status(), StatusCode::OK);
     let dry_run_json: Value = response_json(dry_run_response).await;
     assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(
+        dry_run_json["result"]["group_by"], "source-hash-layer",
+        "post-v4 default must surface back to the operator on the wire"
+    );
     assert_eq!(dry_run_json["result"]["duplicate_groups"], 1);
     assert_eq!(
-        dry_run_json["result"]["groups"][0]["content_hash"],
-        "dup-hash"
+        dry_run_json["result"]["docs_without_hash"], 1,
+        "pre-v4 row with empty source_hash must be visible, not silently grouped"
     );
+
+    let group = &dry_run_json["result"]["groups"][0];
+    let expected_key = format!("dup-source|layer{}", SliceLayer::Outer.as_u8());
+    assert_eq!(group["group_key"], expected_key);
+    assert_eq!(
+        group["content_hash"], expected_key,
+        "legacy `content_hash` field must mirror `group_key` for wire-compat"
+    );
+    assert_eq!(group["kept_id"], "dup-keep");
+    assert_eq!(group["kept_namespace"], "dup-ns");
+    assert_eq!(group["removed"][0]["id"], "dup-remove");
 
     let execute_response = test_app
         .app
@@ -533,13 +589,58 @@ async fn dedup_endpoint_lists_duplicates_then_executes() {
     assert_eq!(execute_response.status(), StatusCode::OK);
     let execute_json: Value = response_json(execute_response).await;
     assert_eq!(execute_json["execute"], true);
+    assert_eq!(execute_json["result"]["group_by"], "source-hash-layer");
     assert_eq!(execute_json["result"]["duplicates_removed"], 1);
+    // 4 seeded - 1 removed = 3 (dup-keep + dup-unique + dup-pre-v4).
     assert_eq!(
         test_app
             .storage
             .count_namespace("dup-ns")
             .await
             .expect("post dedup count"),
-        2
+        3
     );
+}
+
+/// Spec P4 escape hatch: operators can opt into the legacy `content-hash`
+/// grouping for edge cases (e.g. backfilled corpora where source_hash was
+/// never populated). Locks the wire shape: `?group-by=content-hash` flips
+/// the default, `result.group_by` echoes the choice back, and a pre-v4 row
+/// that shares no `content_hash` with anyone else is reported as a unique
+/// doc rather than as `docs_without_hash`.
+#[tokio::test]
+async fn dedup_endpoint_supports_legacy_content_hash_grouping() {
+    let test_app = build_test_app().await;
+
+    let dry_run_response = test_app
+        .app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/dedup?ns=dup-ns&group-by=content-hash",
+            None,
+        ))
+        .await
+        .expect("dedup dry run");
+
+    assert_eq!(dry_run_response.status(), StatusCode::OK);
+    let dry_run_json: Value = response_json(dry_run_response).await;
+    assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(
+        dry_run_json["result"]["group_by"], "content-hash",
+        "legacy opt-in must echo back so operators can audit which mode ran"
+    );
+    assert_eq!(
+        dry_run_json["result"]["docs_without_hash"], 0,
+        "legacy mode treats every row with a content_hash as eligible"
+    );
+    assert_eq!(dry_run_json["result"]["duplicate_groups"], 1);
+    let group = &dry_run_json["result"]["groups"][0];
+    assert_eq!(group["group_key"], "dup-hash");
+    assert_eq!(
+        group["content_hash"], "dup-hash",
+        "legacy mode keys clusters by per-chunk content_hash directly"
+    );
+    assert_eq!(group["kept_id"], "dup-keep");
+    assert_eq!(group["removed"][0]["id"], "dup-remove");
 }
