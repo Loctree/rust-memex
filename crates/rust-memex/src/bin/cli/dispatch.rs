@@ -689,6 +689,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             dry_run,
             keep,
             cross_namespace,
+            group_by,
             json,
         }) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
@@ -697,6 +698,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 dry_run,
                 KeepStrategy::from(keep.as_str()),
                 cross_namespace,
+                rust_memex::diagnostics::DedupGroupBy::parse(&group_by),
                 json,
                 cfg.db_path,
             )

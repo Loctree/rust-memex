@@ -4330,6 +4330,90 @@ Results:
         assert!(inner.contains("Assistant response:"));
     }
 
+    /// Spec P1 acceptance criterion: top keywords for kb:transcripts must NOT
+    /// contain any of the boilerplate tokens (`assistant`, `user`, `transcript`,
+    /// `nie`, `jest`, `Brewing`, `Frosting`, `bypass`, …) regardless of how
+    /// frequently they appear in the source. This locks the static stoplist —
+    /// regressions here mean post-rebuild outer chunks immediately go back to
+    /// the keyword splat the spec was written to fix.
+    #[test]
+    fn extract_keywords_drops_spec_boilerplate_even_when_dominant() {
+        // Synthetic transcript-shaped soup: every banned token appears 3-4×,
+        // every meaning-bearing token (the "real" signal) appears once. A
+        // naive TF extractor would surface boilerplate exclusively.
+        let text = r"
+            ## user
+            ## assistant
+            transcript transcript transcript
+            user user user user
+            assistant assistant assistant assistant
+            Brewing… Brewing… Brewing… Cogitating…
+            Frosting… Grooving… Grooving…
+            shifttab shifttab bypass bypass permissions tokens
+            jest jest jest nie nie nie już też też
+            VistaPortal LiveTree onionSlicer LanceDB qwen3
+        ";
+
+        let keywords = extract_keywords(text, 30);
+        let lower: Vec<String> = keywords.iter().map(|k| k.to_ascii_lowercase()).collect();
+
+        let banned = [
+            "assistant",
+            "user",
+            "transcript",
+            "system",
+            "human",
+            "model",
+            "session",
+            "agent",
+            "claude",
+            "codex",
+            "nie",
+            "jest",
+            "już",
+            "też",
+            "tylko",
+            "bardzo",
+            "brewing",
+            "cogitating",
+            "frosting",
+            "grooving",
+            "beaming",
+            "thinking",
+            "shifttab",
+            "bypass",
+            "permissions",
+            "tokens",
+            "thought",
+            "running",
+        ];
+        for token in banned {
+            assert!(
+                !lower.iter().any(|k| k == token),
+                "extract_keywords leaked banned boilerplate `{}` into keywords {:?}",
+                token,
+                keywords
+            );
+        }
+
+        // And meaningful tokens must survive — at least one real signal word
+        // shows up. This guards against an over-aggressive filter that would
+        // make outer chunks empty.
+        let signal_hits = ["vistaportal", "livetree", "onionslicer", "lancedb", "qwen3"]
+            .iter()
+            .filter(|signal| {
+                lower
+                    .iter()
+                    .any(|k| k.contains(*signal) || k == &(*signal).to_string())
+            })
+            .count();
+        assert!(
+            signal_hits >= 1,
+            "stoplist over-filtered: zero meaningful tokens survived in {:?}",
+            keywords
+        );
+    }
+
     #[test]
     fn plain_text_still_uses_generic_fallback_path() {
         let metadata = json!({

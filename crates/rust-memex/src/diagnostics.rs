@@ -32,15 +32,77 @@ impl From<&str> for KeepStrategy {
     }
 }
 
+/// How to group chunks when looking for duplicates.
+///
+/// After the v4 schema (`source_hash` + per-chunk `content_hash`) the legacy
+/// `content_hash`-only grouping is broken for onion namespaces: every onion
+/// layer of the same source has a unique chunk hash, so naive grouping reports
+/// zero duplicates. Spec `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`,
+/// P4 fixes this by making `(source_hash, layer)` the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DedupGroupBy {
+    /// `(source_hash, layer)` — preserves onion structure: keeps one chunk
+    /// per layer per source, removing only true repeats (e.g. `__dupe__` +
+    /// `__clean__` variants of the same file). This is the post-v4 default.
+    #[default]
+    SourceHashLayer,
+    /// `source_hash` alone — collapses all layers of one source into a single
+    /// group. Useful when callers already plan to re-slice and only want to
+    /// deduplicate at the source-document level.
+    SourceHash,
+    /// `content_hash` (per-chunk text SHA256) — legacy v3 grouping. After P0
+    /// every chunk is unique, so this finds duplicates only when two chunk
+    /// texts are byte-identical. Kept as opt-in for force-reindex edge cases.
+    ContentHash,
+}
+
+impl DedupGroupBy {
+    /// Parse the CLI / HTTP string form. Unknown values fall through to the
+    /// default (`source-hash-layer`) so older clients keep working safely.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "content-hash" | "content_hash" => Self::ContentHash,
+            "source-hash" | "source_hash" => Self::SourceHash,
+            _ => Self::SourceHashLayer,
+        }
+    }
+
+    /// Stable string label for logging / CLI display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SourceHashLayer => "source-hash-layer",
+            Self::SourceHash => "source-hash",
+            Self::ContentHash => "content-hash",
+        }
+    }
+}
+
+impl From<&str> for DedupGroupBy {
+    fn from(value: &str) -> Self {
+        Self::parse(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupDuplicate {
     pub id: String,
     pub namespace: String,
 }
 
+/// One duplicate cluster.
+///
+/// `content_hash` keeps its legacy field name for wire-compat with older
+/// callers. Its semantic is now "the value of the grouping key" — for the
+/// post-v4 default this is `<source_hash>:layer<N>`, for `SourceHash` it is
+/// the source hash alone, and for the legacy `ContentHash` mode it is the
+/// per-chunk text hash. The new `group_key` field carries the same value with
+/// a clearer name; new clients should prefer it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupGroup {
     pub content_hash: String,
+    #[serde(default)]
+    pub group_key: String,
     pub kept_id: String,
     pub kept_namespace: String,
     pub removed: Vec<DedupDuplicate>,
@@ -53,6 +115,11 @@ pub struct DedupResult {
     pub duplicate_groups: usize,
     pub duplicates_removed: usize,
     pub docs_without_hash: usize,
+    /// Strategy used to bucket chunks into duplicate groups.
+    /// Defaults to `SourceHashLayer` so legacy serialized payloads keep
+    /// deserializing into the spec-default shape.
+    #[serde(default)]
+    pub group_by: DedupGroupBy,
     pub groups: Vec<DedupGroup>,
 }
 
@@ -211,6 +278,7 @@ pub async fn deduplicate_documents(
     dry_run: bool,
     keep_strategy: KeepStrategy,
     cross_namespace: bool,
+    group_by: DedupGroupBy,
 ) -> Result<DedupResult> {
     let all_docs = storage.all_documents(namespace, 1_000_000).await?;
 
@@ -218,17 +286,38 @@ pub async fn deduplicate_documents(
     let mut docs_without_hash = 0usize;
 
     for doc in &all_docs {
-        match &doc.content_hash {
-            Some(hash) if !hash.is_empty() => {
-                let key = if cross_namespace {
-                    hash.clone()
-                } else {
-                    format!("{}:{}", doc.namespace, hash)
-                };
-                hash_groups.entry(key).or_default().push(doc);
-            }
-            _ => docs_without_hash += 1,
-        }
+        // Build the bucket key per requested strategy. A doc is "without hash"
+        // if the strategy's required field is empty for this row — the caller
+        // can then decide whether to backfill or fall back.
+        let raw_key: Option<String> = match group_by {
+            DedupGroupBy::ContentHash => doc
+                .content_hash
+                .as_deref()
+                .filter(|hash| !hash.is_empty())
+                .map(ToOwned::to_owned),
+            DedupGroupBy::SourceHash => doc
+                .source_hash
+                .as_deref()
+                .filter(|hash| !hash.is_empty())
+                .map(ToOwned::to_owned),
+            DedupGroupBy::SourceHashLayer => doc
+                .source_hash
+                .as_deref()
+                .filter(|hash| !hash.is_empty())
+                .map(|hash| format!("{}|layer{}", hash, doc.layer)),
+        };
+
+        let Some(key) = raw_key else {
+            docs_without_hash += 1;
+            continue;
+        };
+
+        let scoped_key = if cross_namespace {
+            key
+        } else {
+            format!("{}:{}", doc.namespace, key)
+        };
+        hash_groups.entry(scoped_key).or_default().push(doc);
     }
 
     let mut result = DedupResult {
@@ -237,10 +326,11 @@ pub async fn deduplicate_documents(
         duplicate_groups: 0,
         duplicates_removed: 0,
         docs_without_hash,
+        group_by,
         groups: Vec::new(),
     };
 
-    for (_key, mut docs) in hash_groups {
+    for (key, mut docs) in hash_groups {
         if docs.len() == 1 {
             result.unique_docs += 1;
             continue;
@@ -261,11 +351,22 @@ pub async fn deduplicate_documents(
             }
         }
 
+        // Strip the namespace prefix when reporting the group key so consumers
+        // see the strategy-native value (e.g. `<source_hash>|layer3`).
+        let display_key = if cross_namespace {
+            key.clone()
+        } else {
+            key.split_once(':')
+                .map(|(_ns, rest)| rest.to_string())
+                .unwrap_or_else(|| key.clone())
+        };
+
         result.unique_docs += 1;
         result.duplicate_groups += 1;
         result.duplicates_removed += removed_docs.len();
         result.groups.push(DedupGroup {
-            content_hash: kept.content_hash.clone().unwrap_or_default(),
+            content_hash: display_key.clone(),
+            group_key: display_key,
             kept_id: kept.id.clone(),
             kept_namespace: kept.namespace.clone(),
             removed: removed_docs
@@ -863,5 +964,204 @@ mod backfill_tests {
         assert_eq!(again.content_hash_backfilled, 0);
         assert_eq!(again.source_hash_backfilled, 0);
         assert_eq!(again.already_consistent, 2);
+    }
+}
+
+#[cfg(test)]
+mod dedup_grouping_tests {
+    use super::*;
+    use crate::rag::compute_content_hash;
+    use crate::storage::ChromaDocument;
+    use tempfile::TempDir;
+
+    fn doc(
+        id: &str,
+        ns: &str,
+        layer: u8,
+        text: &str,
+        source: &str,
+        chunk_hash: &str,
+    ) -> ChromaDocument {
+        ChromaDocument {
+            id: id.to_string(),
+            namespace: ns.to_string(),
+            embedding: vec![0.1_f32; 8],
+            metadata: serde_json::json!({}),
+            document: text.to_string(),
+            layer,
+            parent_id: None,
+            children_ids: vec![],
+            keywords: vec![],
+            content_hash: Some(chunk_hash.to_string()),
+            source_hash: Some(source.to_string()),
+        }
+    }
+
+    /// Spec P4: post-v4 default (`source-hash-layer`) must keep the onion
+    /// intact: with two `__dupe__` + `__clean__` variants of the same source,
+    /// each layer collapses to a single survivor (4 dups removed for a 4-layer
+    /// onion), while distinct sources remain untouched.
+    #[tokio::test]
+    async fn source_hash_layer_grouping_preserves_onion_structure() {
+        let tmp = TempDir::new().expect("temp dir");
+        let storage = StorageManager::new_lance_only(tmp.path().join("db").to_str().unwrap())
+            .await
+            .expect("storage");
+        storage.ensure_collection().await.expect("collection");
+
+        let ns = "kb:transcripts-test";
+        let source_a = compute_content_hash("source document A — full transcript");
+        let source_b = compute_content_hash("source document B — different transcript");
+
+        // Source A indexed twice (`__dupe__` + `__clean__`): 4 layers × 2 = 8 chunks.
+        // After source-hash-layer grouping: 4 groups of 2 → 4 duplicates removed.
+        let mut docs = Vec::new();
+        for (suffix, _variant) in [("clean", "clean"), ("dupe", "dupe")].iter() {
+            for layer in 0u8..4 {
+                let text = format!("source-A layer-{layer} variant-{suffix}");
+                let chunk_hash = compute_content_hash(&text);
+                docs.push(doc(
+                    &format!("a-{suffix}-l{layer}"),
+                    ns,
+                    layer,
+                    &text,
+                    &source_a,
+                    &chunk_hash,
+                ));
+            }
+        }
+        // Source B indexed once: 4 unique chunks, must survive.
+        for layer in 0u8..4 {
+            let text = format!("source-B layer-{layer}");
+            let chunk_hash = compute_content_hash(&text);
+            docs.push(doc(
+                &format!("b-l{layer}"),
+                ns,
+                layer,
+                &text,
+                &source_b,
+                &chunk_hash,
+            ));
+        }
+        storage
+            .add_to_store(docs)
+            .await
+            .expect("seed dedup fixture");
+
+        let result = deduplicate_documents(
+            &storage,
+            Some(ns),
+            true,
+            KeepStrategy::Oldest,
+            false,
+            DedupGroupBy::SourceHashLayer,
+        )
+        .await
+        .expect("dedup");
+
+        assert_eq!(result.total_docs, 12);
+        assert_eq!(result.duplicate_groups, 4, "one group per onion layer");
+        assert_eq!(
+            result.duplicates_removed, 4,
+            "remove one variant per layer, keep the other"
+        );
+        assert_eq!(
+            result.docs_without_hash, 0,
+            "every chunk has source_hash populated"
+        );
+        // Source B contributes 4 singleton groups counted as unique_docs.
+        assert_eq!(result.unique_docs, 4 + 4);
+        // Group keys must contain the layer suffix so consumers can verify
+        // per-layer onion preservation.
+        assert!(
+            result
+                .groups
+                .iter()
+                .all(|g| g.group_key.contains("|layer")),
+            "source-hash-layer keys must encode layer: {:?}",
+            result
+                .groups
+                .iter()
+                .map(|g| &g.group_key)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Spec P4 invariant: post-P0 every chunk has a unique `content_hash`, so
+    /// the legacy grouping must report zero duplicates on a freshly-indexed
+    /// onion namespace. This test exists to lock that semantic in place — it
+    /// is the symptom that motivated adding `--group-by`.
+    #[tokio::test]
+    async fn content_hash_grouping_finds_zero_duplicates_on_fresh_onion() {
+        let tmp = TempDir::new().expect("temp dir");
+        let storage = StorageManager::new_lance_only(tmp.path().join("db").to_str().unwrap())
+            .await
+            .expect("storage");
+        storage.ensure_collection().await.expect("collection");
+
+        let ns = "kb:transcripts-test";
+        let source_a = compute_content_hash("source document A");
+        let mut docs = Vec::new();
+        for layer in 0u8..4 {
+            // Distinct chunk text per layer → unique per-chunk content_hash.
+            let text = format!("source-A unique-layer-{layer}");
+            let chunk_hash = compute_content_hash(&text);
+            docs.push(doc(
+                &format!("a-l{layer}"),
+                ns,
+                layer,
+                &text,
+                &source_a,
+                &chunk_hash,
+            ));
+        }
+        storage
+            .add_to_store(docs)
+            .await
+            .expect("seed unique chunks");
+
+        let result = deduplicate_documents(
+            &storage,
+            Some(ns),
+            true,
+            KeepStrategy::Oldest,
+            false,
+            DedupGroupBy::ContentHash,
+        )
+        .await
+        .expect("dedup");
+
+        assert_eq!(result.total_docs, 4);
+        assert_eq!(
+            result.duplicate_groups, 0,
+            "post-P0 each chunk has unique content_hash, legacy grouping must find none"
+        );
+        assert_eq!(result.duplicates_removed, 0);
+    }
+
+    #[test]
+    fn dedup_group_by_parses_known_aliases_and_falls_back_to_default() {
+        assert_eq!(
+            DedupGroupBy::parse("source-hash-layer"),
+            DedupGroupBy::SourceHashLayer
+        );
+        assert_eq!(DedupGroupBy::parse("source-hash"), DedupGroupBy::SourceHash);
+        assert_eq!(
+            DedupGroupBy::parse("source_hash"),
+            DedupGroupBy::SourceHash,
+            "underscore form accepted as alias"
+        );
+        assert_eq!(
+            DedupGroupBy::parse("content-hash"),
+            DedupGroupBy::ContentHash
+        );
+        assert_eq!(
+            DedupGroupBy::parse("content_hash"),
+            DedupGroupBy::ContentHash
+        );
+        // Unknown / empty values resolve to the post-v4 default rather than
+        // erroring out — keeps older HTTP/CLI clients working.
+        assert_eq!(DedupGroupBy::parse(""), DedupGroupBy::SourceHashLayer);
+        assert_eq!(DedupGroupBy::parse("nope"), DedupGroupBy::SourceHashLayer);
     }
 }

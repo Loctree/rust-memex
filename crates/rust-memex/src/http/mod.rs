@@ -1442,6 +1442,11 @@ pub struct DedupParams {
     pub ns: Option<String>,
     #[serde(default)]
     pub execute: bool,
+    /// Strategy for grouping chunks into duplicate sets. Defaults to
+    /// `source-hash-layer` (post-v4 default). Accepts `source-hash-layer`,
+    /// `source-hash`, or `content-hash` (legacy). Spec P4.
+    #[serde(default, alias = "groupBy", alias = "group-by")]
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2595,12 +2600,19 @@ async fn dedup_handler(
         .await?;
     }
 
+    let group_by = params
+        .group_by
+        .as_deref()
+        .map(diagnostics::DedupGroupBy::parse)
+        .unwrap_or_default();
+
     let result = diagnostics::deduplicate_documents(
         state.rag.storage_manager().as_ref(),
         params.ns.as_deref(),
         dry_run,
         KeepStrategy::Oldest,
         false,
+        group_by,
     )
     .await
     .map_err(internal_error)?;

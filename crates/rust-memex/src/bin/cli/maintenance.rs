@@ -1154,6 +1154,7 @@ pub async fn run_dedup(
     dry_run: bool,
     keep_strategy: KeepStrategy,
     cross_namespace: bool,
+    group_by: rust_memex::diagnostics::DedupGroupBy,
     json_output: bool,
     db_path: String,
 ) -> Result<()> {
@@ -1164,6 +1165,7 @@ pub async fn run_dedup(
         dry_run,
         keep_strategy,
         cross_namespace,
+        group_by,
     )
     .await?;
 
@@ -1185,6 +1187,7 @@ pub async fn run_dedup(
 
     if !json_output {
         eprintln!("Scanning {} documents for duplicates...", result.total_docs);
+        eprintln!("  Group by:            {}", group_by.label());
         if dry_run {
             eprintln!("(dry-run mode: no changes will be made)");
         }
@@ -1196,6 +1199,7 @@ pub async fn run_dedup(
             "dry_run": dry_run,
             "namespace": namespace,
             "cross_namespace": cross_namespace,
+            "group_by": group_by.label(),
             "keep_strategy": format!("{:?}", keep_strategy).to_lowercase(),
             "result": result,
         });
@@ -1216,7 +1220,7 @@ pub async fn run_dedup(
         );
         if result.docs_without_hash > 0 {
             eprintln!(
-                "  Without hash:        {} (cannot deduplicate)",
+                "  Without group key:   {} (cannot deduplicate; backfill --group-by source-hash needs source_hash)",
                 result.docs_without_hash
             );
         }
@@ -1232,10 +1236,13 @@ pub async fn run_dedup(
             );
             for group in result.groups.iter().take(show_count) {
                 eprintln!();
-                eprintln!(
-                    "  Hash: {}...",
-                    &group.content_hash[..group.content_hash.len().min(16)]
-                );
+                let key_display = if group.group_key.is_empty() {
+                    &group.content_hash
+                } else {
+                    &group.group_key
+                };
+                let max = key_display.len().min(48);
+                eprintln!("  Key: {}...", &key_display[..max]);
                 eprintln!("  Kept: {} (ns: {})", group.kept_id, group.kept_namespace);
                 for removed in &group.removed {
                     eprintln!(

@@ -709,17 +709,24 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Find and remove duplicate documents based on content hash
+    /// Find and remove duplicate documents based on the chosen grouping key
     ///
-    /// Groups documents by content_hash and removes duplicates, keeping one
-    /// document per unique content based on the --keep strategy.
+    /// Groups documents per --group-by and removes duplicates, keeping one
+    /// document per group based on the --keep strategy. The default
+    /// `source-hash-layer` grouping preserves the onion structure: for each
+    /// source document it keeps exactly one chunk per layer, removing only
+    /// real repeats (e.g. `__dupe__` + `__clean__` variants of the same
+    /// transcript). Use `content-hash` only when you actually want byte-
+    /// identical chunk text grouping (legacy v3 behavior).
     ///
     /// Examples:
-    ///   rust-memex dedup                          # All namespaces, dry-run
-    ///   rust-memex dedup -n memories              # Specific namespace
-    ///   rust-memex dedup --dry-run false          # Actually remove duplicates
-    ///   rust-memex dedup --keep newest            # Keep newest duplicates
-    ///   rust-memex dedup --cross-namespace        # Dedup across all namespaces
+    ///   rust-memex dedup                                # All namespaces, dry-run
+    ///   rust-memex dedup -n kb:transcripts              # Specific namespace
+    ///   rust-memex dedup --dry-run false                # Actually remove duplicates
+    ///   rust-memex dedup --keep newest                  # Keep newest duplicates
+    ///   rust-memex dedup --cross-namespace              # Dedup across all namespaces
+    ///   rust-memex dedup --group-by content-hash        # Legacy per-chunk hash
+    ///   rust-memex dedup --group-by source-hash         # Collapse all layers per source
     Dedup {
         /// Specific namespace to deduplicate (if not set, processes all namespaces separately)
         #[arg(long, short = 'n')]
@@ -740,6 +747,17 @@ pub enum Commands {
         /// By default, deduplication is done within each namespace separately.
         #[arg(long)]
         cross_namespace: bool,
+
+        /// How to bucket chunks into duplicate groups.
+        /// - "source-hash-layer" (default): keeps onion intact, removes only true source repeats
+        /// - "source-hash": collapses all layers of a source into one group
+        /// - "content-hash": legacy per-chunk text hash (post-v4 finds nothing on fresh indexes)
+        #[arg(
+            long = "group-by",
+            default_value = "source-hash-layer",
+            value_parser = ["source-hash-layer", "source-hash", "content-hash"]
+        )]
+        group_by: String,
 
         /// Output as JSON instead of human-readable format
         #[arg(long)]
