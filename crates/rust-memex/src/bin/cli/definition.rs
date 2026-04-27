@@ -316,6 +316,22 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
+        /// Force re-indexing even when the source already exists in the namespace
+        /// (spec P4 escape hatch).
+        ///
+        /// Equivalent to passing `--dedup false` but more explicit at the call
+        /// site: this is the operator-visible knob for "I know this source is
+        /// already indexed, re-embed it anyway." Use cases per spec P4: force
+        /// reindex after a slicer change, debug a specific document, or
+        /// rebuild a layer that was partially purged.
+        ///
+        /// Takes precedence over `--dedup` when set, so callers do not need
+        /// to pass both flags. The skip-log line for already-indexed sources
+        /// stays at `info!` level so an operator can tell from the run log
+        /// whether dedup was active and which sources were collapsed.
+        #[arg(long)]
+        allow_duplicates: bool,
+
         /// Show progress bar with ETA when running in an interactive terminal.
         /// Non-interactive runs fall back to line logs.
         #[arg(long)]
@@ -1012,6 +1028,41 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Backfill per-chunk `content_hash` and `source_hash` for legacy chunks
+    ///
+    /// Walks the namespace (or every namespace when `-n` is omitted) and
+    /// recomputes `content_hash = SHA256(chunk_text)` for every row, recovering
+    /// the legacy source-text hash into the new `source_hash` column. Idempotent:
+    /// rows that already match the v4 contract are counted as "consistent" and
+    /// left alone. Pre-v4 chunks (single hash equal to source text) get the
+    /// hash promoted into `source_hash` so post-v4 dedup grouping works without
+    /// re-reading source files.
+    ///
+    /// Defaults to `--dry-run true` so an operator can audit before writing.
+    ///
+    /// Spec: `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`, P0 backfill.
+    ///
+    /// Examples:
+    ///   rust-memex backfill-hashes                              # All namespaces, dry-run
+    ///   rust-memex backfill-hashes -n kb:transcripts            # One namespace, dry-run
+    ///   rust-memex backfill-hashes -n kb:transcripts --dry-run false  # Actually write
+    ///   rust-memex backfill-hashes --json                       # Machine-readable
+    BackfillHashes {
+        /// Specific namespace to backfill (default: every namespace)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Plan only, write nothing (default: true). Pass `--dry-run false`
+        /// to actually rewrite the rows. Mirrors the `dedup` CLI default so
+        /// an operator never accidentally rewrites a namespace.
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        dry_run: bool,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage auth tokens with per-token scopes and namespace ACL
     ///
     /// Create, list, revoke, and rotate bearer tokens for HTTP API access.
@@ -1383,5 +1434,96 @@ mod tests {
             result.is_err(),
             "clap must reject unknown --outer-synthesis values up-front"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Spec P4: --allow-duplicates escape hatch
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn index_command_allow_duplicates_defaults_to_false() {
+        let cli = Cli::parse_from(["rust-memex", "index", "/tmp"]);
+        match cli.command {
+            Some(Commands::Index {
+                allow_duplicates,
+                dedup,
+                ..
+            }) => {
+                assert!(
+                    !allow_duplicates,
+                    "default must be false so the safe path (dedup-on) is the default"
+                );
+                assert!(
+                    dedup,
+                    "dedup default must remain true; allow-duplicates is the explicit override"
+                );
+            }
+            other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_command_accepts_allow_duplicates_flag() {
+        let cli = Cli::parse_from(["rust-memex", "index", "/tmp", "--allow-duplicates"]);
+        match cli.command {
+            Some(Commands::Index {
+                allow_duplicates,
+                dedup,
+                ..
+            }) => {
+                assert!(allow_duplicates);
+                // The flag itself does not flip --dedup at parse time; the
+                // dispatcher applies the precedence at run time so the user
+                // sees a "Note: ..." breadcrumb when both flags are set.
+                assert!(dedup);
+            }
+            other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Spec P0 backfill: `backfill-hashes` CLI surface
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn backfill_hashes_command_defaults_to_dry_run_all_namespaces() {
+        let cli = Cli::parse_from(["rust-memex", "backfill-hashes"]);
+        match cli.command {
+            Some(Commands::BackfillHashes {
+                namespace,
+                dry_run,
+                json,
+            }) => {
+                assert!(namespace.is_none(), "no -n means all namespaces");
+                assert!(dry_run, "default must be dry-run for safety");
+                assert!(!json);
+            }
+            other => panic!("expected backfill-hashes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn backfill_hashes_command_accepts_namespace_and_live_run() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "backfill-hashes",
+            "-n",
+            "kb:transcripts",
+            "--dry-run",
+            "false",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::BackfillHashes {
+                namespace,
+                dry_run,
+                json,
+            }) => {
+                assert_eq!(namespace.as_deref(), Some("kb:transcripts"));
+                assert!(!dry_run, "operator opted into a live write");
+                assert!(json);
+            }
+            other => panic!("expected backfill-hashes, got {:?}", other),
+        }
     }
 }

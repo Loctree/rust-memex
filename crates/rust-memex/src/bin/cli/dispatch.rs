@@ -299,6 +299,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             ollama_model,
             ollama_endpoint,
             dedup,
+            allow_duplicates,
             progress,
             resume,
             pipeline,
@@ -317,6 +318,21 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             })?;
             let outer_synthesis =
                 parse_outer_synthesis_flag(&outer_synthesis, &ollama_model, &ollama_endpoint)?;
+            // Spec P4 escape hatch: `--allow-duplicates` is the explicit knob for
+            // "force reindex." It supersedes `--dedup` so an operator never needs
+            // to pass both flags, and the run log records that dedup was disabled
+            // intentionally rather than because the user forgot the flag.
+            let dedup_effective = if allow_duplicates {
+                if dedup {
+                    eprintln!(
+                        "Note: --allow-duplicates is set, disabling --dedup for this run \
+                         (force reindex)."
+                    );
+                }
+                false
+            } else {
+                dedup
+            };
 
             let result = run_batch_index(BatchIndexConfig {
                 path,
@@ -329,7 +345,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 sanitize_metadata,
                 slice_mode,
                 outer_synthesis,
-                dedup,
+                dedup: dedup_effective,
                 embedding_config: cfg.embedding_config,
                 show_progress: progress,
                 resume,
@@ -834,6 +850,14 @@ pub async fn run_command(cli: Cli) -> Result<()> {
         }) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             run_purge_quality(threshold, confirm, json, cfg.db_path).await
+        }
+        Some(Commands::BackfillHashes {
+            namespace,
+            dry_run,
+            json,
+        }) => {
+            let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
+            run_backfill_hashes(namespace, dry_run, json, cfg.db_path).await
         }
         Some(Commands::Auth { action }) => run_auth_command(action, cli.token_store_path).await,
         Some(Commands::Serve) | None => {

@@ -400,6 +400,95 @@ pub async fn run_audit(
     Ok(())
 }
 
+/// Backfill per-chunk `content_hash` and `source_hash` for legacy chunks.
+///
+/// Closes the operator surface for spec P0 backfill: the lib API
+/// (`diagnostics::backfill_chunk_and_source_hashes`) and the HTTP endpoint
+/// (`POST /api/backfill-hashes`) were added in marbles round 001, but the
+/// only way to invoke them from the shell was through `curl` against the
+/// running server. This command makes the backfill reachable from the same
+/// CLI surface as `dedup` / `audit`, which is what the spec asked for:
+/// "Uruchomić jako `rust-memex backfill-hashes --namespace <ns>` lub
+/// podobne".
+///
+/// Defaults to `--dry-run true` so an operator can preview before writing.
+/// Spec: `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`, P0 backfill.
+pub async fn run_backfill_hashes(
+    namespace: Option<String>,
+    dry_run: bool,
+    json: bool,
+    db_path: String,
+) -> Result<()> {
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    if !json {
+        let scope = namespace
+            .as_deref()
+            .map(|ns| format!("namespace '{}'", ns))
+            .unwrap_or_else(|| "all namespaces".to_string());
+        eprintln!(
+            "Backfilling content_hash + source_hash across {} (dry_run={})...",
+            scope, dry_run
+        );
+    }
+
+    let result =
+        diagnostics::backfill_chunk_and_source_hashes(&storage, namespace.as_deref(), dry_run)
+            .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║                   BACKFILL HASHES SUMMARY                      ║");
+    println!("╠════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║ {:48} {:>13} ║",
+        "Total documents inspected", result.total_docs
+    );
+    println!(
+        "║ {:48} {:>13} ║",
+        "content_hash backfilled (per-chunk SHA256)", result.content_hash_backfilled
+    );
+    println!(
+        "║ {:48} {:>13} ║",
+        "source_hash backfilled (recovered legacy)", result.source_hash_backfilled
+    );
+    println!(
+        "║ {:48} {:>13} ║",
+        "Already consistent (skipped)", result.already_consistent
+    );
+    println!(
+        "║ {:48} {:>13} ║",
+        "Skipped (no embedding)", result.skipped_no_embedding
+    );
+    println!("╚════════════════════════════════════════════════════════════════╝");
+
+    if result.dry_run {
+        let touched = result.content_hash_backfilled + result.source_hash_backfilled;
+        if touched > 0 {
+            println!();
+            println!(
+                "DRY RUN - {} document(s) would be rewritten. Re-run with --dry-run false to apply.",
+                touched
+            );
+        } else {
+            println!();
+            println!("DRY RUN - nothing would change. Backfill is a no-op for this scope.");
+        }
+    } else {
+        println!();
+        println!(
+            "Wrote {} content_hash + {} source_hash updates.",
+            result.content_hash_backfilled, result.source_hash_backfilled
+        );
+    }
+
+    Ok(())
+}
+
 /// Purge namespaces below quality threshold
 pub async fn run_purge_quality(
     threshold: u8,

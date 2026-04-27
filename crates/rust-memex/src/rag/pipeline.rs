@@ -941,9 +941,15 @@ async fn stage_read_files(
             };
 
             if already_indexed {
-                debug!(
-                    "Skipping duplicate source: {:?} (source_hash: {})",
-                    path,
+                // Spec P4 acceptance criterion: "Pipeline log: każdy skipped
+                // duplicate source jedna linia z source path + source_hash."
+                // Promoted from `debug!` to `info!` so the line shows in the
+                // default operator run log without needing RUST_LOG=debug; the
+                // `--allow-duplicates` flag on `index` is the documented escape
+                // hatch when an operator actually wants to re-embed.
+                info!(
+                    "Skip duplicate source: {} (source_hash {})",
+                    path.display(),
                     &content_hash[..16]
                 );
                 observer
