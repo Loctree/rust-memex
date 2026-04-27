@@ -108,9 +108,22 @@ fn parse_markdown_transcript_blocks(content: &str) -> Vec<RawBlock> {
     let mut blocks = Vec::new();
     let mut current_role: Option<String> = None;
     let mut current_lines = Vec::new();
+    // Track fenced-code-block state. Spec P2 acceptance: "Code blocks: 0%
+    // rozcięć w środku ` ``` `" — a heading-shaped line inside an open fence
+    // (e.g. an example transcript pasted into a user prompt) must NOT split
+    // the parent role block.
+    let mut in_fence = false;
 
     for line in content.lines() {
-        if let Some(role) = parse_markdown_heading(line) {
+        if is_fence_marker(line) {
+            in_fence = !in_fence;
+            current_lines.push(line.to_string());
+            continue;
+        }
+
+        if !in_fence
+            && let Some(role) = parse_markdown_heading(line)
+        {
             if let Some(existing_role) = current_role.take() {
                 push_raw_block(&mut blocks, existing_role, &current_lines.join("\n"));
             }
@@ -131,6 +144,16 @@ fn parse_markdown_transcript_blocks(content: &str) -> Vec<RawBlock> {
     }
 
     blocks
+}
+
+/// Recognises an opening or closing fenced-code-block delimiter. Toggles
+/// `in_fence` in `parse_markdown_transcript_blocks`. Conservative: matches any
+/// line whose first non-whitespace characters are 3+ backticks or 3+ tildes,
+/// covering CommonMark info strings (```rust, ```bash, etc.) and matched
+/// closers without language tags.
+fn is_fence_marker(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn push_raw_block(blocks: &mut Vec<RawBlock>, role: String, content: &str) {
@@ -665,7 +688,7 @@ fn create_structured_outer_core_slices(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_structured_outer, parse_blocks};
+    use super::{create_structured_outer, is_fence_marker, parse_blocks};
     use serde_json::json;
 
     #[test]
@@ -686,5 +709,99 @@ mod tests {
         assert!(outer.contains("Decision:"));
         assert!(outer.contains("Next:"));
         assert!(!outer.starts_with('['));
+    }
+
+    #[test]
+    fn fence_marker_detects_backtick_and_tilde_openers() {
+        assert!(is_fence_marker("```"));
+        assert!(is_fence_marker("```rust"));
+        assert!(is_fence_marker("    ```bash"));
+        assert!(is_fence_marker("~~~"));
+        assert!(is_fence_marker("~~~markdown"));
+        assert!(!is_fence_marker("`single`"));
+        assert!(!is_fence_marker("``two``"));
+        assert!(!is_fence_marker("## user"));
+        assert!(!is_fence_marker(""));
+    }
+
+    #[test]
+    fn parse_blocks_keeps_fenced_pseudo_headings_inside_user_turn() {
+        // Spec P2 acceptance: fenced ` ``` ` blocks must be atomic. A user
+        // pasting an example transcript into their question contains
+        // heading-shaped lines (`## assistant`, `## user`) inside a fence —
+        // the parser must NOT treat them as turn boundaries.
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript",
+        });
+        let content = "## user\n\
+                       Look at this snippet from yesterday's chat:\n\
+                       ```\n\
+                       ## assistant\n\
+                       fenced pseudo-response\n\
+                       ## user\n\
+                       fenced pseudo-followup\n\
+                       ```\n\
+                       Why does it look weird?\n\
+                       \n\
+                       ## assistant\n\
+                       Because the model echoed an example transcript verbatim.\n";
+
+        let blocks = parse_blocks(content, &metadata);
+
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected exactly two blocks (user, assistant); fenced pseudo-headings must not split the user turn"
+        );
+        assert_eq!(blocks[0].primary_label, "Request");
+        assert!(
+            blocks[0].content.contains("fenced pseudo-response"),
+            "user block lost its fenced example content: {:?}",
+            blocks[0].content
+        );
+        assert!(
+            blocks[0].content.contains("fenced pseudo-followup"),
+            "user block lost its fenced example content: {:?}",
+            blocks[0].content
+        );
+        assert!(
+            blocks[0].content.contains("Why does it look weird?"),
+            "user block dropped the trailing prose: {:?}",
+            blocks[0].content
+        );
+        assert_eq!(blocks[1].primary_label, "Response");
+        assert!(
+            blocks[1].content.contains("echoed an example transcript"),
+            "assistant block missing real response: {:?}",
+            blocks[1].content
+        );
+    }
+
+    #[test]
+    fn parse_blocks_keeps_fenced_pseudo_headings_inside_tilde_fence() {
+        // Same invariant as above, exercised against `~~~` fences (the second
+        // CommonMark fence form). Same toggle path — symmetry test.
+        let metadata = json!({
+            "type": "transcript_turn",
+            "format": "markdown_transcript",
+        });
+        let content = "## user\n\
+                       Tilde-fenced sample:\n\
+                       ~~~\n\
+                       ## assistant\n\
+                       still inside the fence\n\
+                       ~~~\n\
+                       \n\
+                       ## assistant\n\
+                       The real reply.\n";
+
+        let blocks = parse_blocks(content, &metadata);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].primary_label, "Request");
+        assert!(blocks[0].content.contains("still inside the fence"));
+        assert_eq!(blocks[1].primary_label, "Response");
+        assert!(blocks[1].content.contains("The real reply."));
     }
 }
