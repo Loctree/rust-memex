@@ -283,6 +283,33 @@ pub enum Commands {
         #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
         slice_mode: String,
 
+        /// Outer-layer synthesis strategy for onion modes (spec P3).
+        /// - "keyword" (default): TF-based keyword extraction. No I/O.
+        /// - "llm": Synthesize the outer layer via a local Ollama model. Requires --pipeline mode.
+        ///
+        /// When set to "llm" the slicer POSTs each document to
+        /// `{ollama-endpoint}/api/generate` with `{ollama-model, stream: false}`
+        /// and replaces the keyword outer with the model's 1-3 sentence summary.
+        /// Failures (network, non-2xx, malformed JSON, empty completion) silently
+        /// fall back to the keyword outer so the pipeline never stalls.
+        ///
+        /// Reachable only through --pipeline mode; the legacy non-pipeline path
+        /// always uses the keyword outer regardless of this flag, so passing
+        /// --outer-synthesis llm without --pipeline is rejected up-front.
+        #[arg(long, default_value = "keyword", value_parser = ["keyword", "llm"])]
+        outer_synthesis: String,
+
+        /// Ollama model name used when --outer-synthesis llm is set.
+        /// Spec P3 baseline: a small local model such as qwen2.5:3b or phi-3.5:mini
+        /// fits the 1-3 sentence summary budget cheaply.
+        #[arg(long, default_value = "qwen2.5:3b")]
+        ollama_model: String,
+
+        /// Ollama HTTP endpoint used when --outer-synthesis llm is set.
+        /// Defaults to a local Ollama daemon. Trailing slash is normalized.
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_endpoint: String,
+
         /// Enable exact-match deduplication (default: enabled).
         /// Skips indexing files whose content already exists in the namespace.
         /// Uses SHA256 hash of original content before any preprocessing.
@@ -1286,5 +1313,75 @@ mod tests {
     fn auth_mode_rejects_invalid_value() {
         let result = Cli::try_parse_from(["rust-memex", "--auth-mode", "bogus", "serve"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_command_outer_synthesis_defaults_to_keyword() {
+        let cli = Cli::parse_from(["rust-memex", "index", "/tmp"]);
+        match cli.command {
+            Some(Commands::Index {
+                outer_synthesis,
+                ollama_model,
+                ollama_endpoint,
+                ..
+            }) => {
+                assert_eq!(outer_synthesis, "keyword");
+                // Defaults are still populated even on the keyword path so the
+                // CLI surface stays consistent; downstream parser ignores them.
+                assert_eq!(ollama_model, "qwen2.5:3b");
+                assert_eq!(ollama_endpoint, "http://localhost:11434");
+            }
+            other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_command_accepts_outer_synthesis_llm_with_overrides() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "index",
+            "/tmp",
+            "--slice-mode",
+            "onion",
+            "--pipeline",
+            "--outer-synthesis",
+            "llm",
+            "--ollama-model",
+            "phi-3.5:mini",
+            "--ollama-endpoint",
+            "http://10.0.0.5:11434",
+        ]);
+        match cli.command {
+            Some(Commands::Index {
+                outer_synthesis,
+                ollama_model,
+                ollama_endpoint,
+                pipeline,
+                slice_mode,
+                ..
+            }) => {
+                assert_eq!(outer_synthesis, "llm");
+                assert_eq!(ollama_model, "phi-3.5:mini");
+                assert_eq!(ollama_endpoint, "http://10.0.0.5:11434");
+                assert!(pipeline);
+                assert_eq!(slice_mode, "onion");
+            }
+            other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn index_command_rejects_unknown_outer_synthesis() {
+        let result = Cli::try_parse_from([
+            "rust-memex",
+            "index",
+            "/tmp",
+            "--outer-synthesis",
+            "transformers",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap must reject unknown --outer-synthesis values up-front"
+        );
     }
 }

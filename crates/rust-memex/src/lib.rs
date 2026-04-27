@@ -67,6 +67,7 @@ pub use rag::{
     IndexResult,
     OnionSlice,
     OnionSliceConfig,
+    OuterSynthesis,
     PipelineConfig,
     PipelineEvent,
     PipelineGovernorConfig,

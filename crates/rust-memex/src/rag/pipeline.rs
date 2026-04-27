@@ -1121,9 +1121,7 @@ async fn create_chunks_from_content(
             SliceMode::Flat => "flat",
         },
     });
-    if is_transcript
-        && let serde_json::Value::Object(ref mut map) = metadata
-    {
+    if is_transcript && let serde_json::Value::Object(ref mut map) = metadata {
         map.insert(
             "format".to_string(),
             serde_json::json!("markdown_transcript"),

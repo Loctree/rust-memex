@@ -181,7 +181,14 @@ impl ChromaDocument {
         metadata: serde_json::Value,
         content_hash: String,
     ) -> Self {
-        Self::from_onion_slice_with_hashes(slice, namespace, embedding, metadata, content_hash, None)
+        Self::from_onion_slice_with_hashes(
+            slice,
+            namespace,
+            embedding,
+            metadata,
+            content_hash,
+            None,
+        )
     }
 
     /// Create an onion-slice document with both per-chunk and source hashes.

@@ -295,6 +295,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             preprocess,
             sanitize_metadata,
             slice_mode,
+            outer_synthesis,
+            ollama_model,
+            ollama_endpoint,
             dedup,
             progress,
             resume,
@@ -312,6 +315,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     slice_mode
                 )
             })?;
+            let outer_synthesis =
+                parse_outer_synthesis_flag(&outer_synthesis, &ollama_model, &ollama_endpoint)?;
 
             let result = run_batch_index(BatchIndexConfig {
                 path,
@@ -323,6 +328,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 preprocess,
                 sanitize_metadata,
                 slice_mode,
+                outer_synthesis,
                 dedup,
                 embedding_config: cfg.embedding_config,
                 show_progress: progress,

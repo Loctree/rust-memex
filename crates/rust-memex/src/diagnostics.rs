@@ -1074,10 +1074,7 @@ mod dedup_grouping_tests {
         // Group keys must contain the layer suffix so consumers can verify
         // per-layer onion preservation.
         assert!(
-            result
-                .groups
-                .iter()
-                .all(|g| g.group_key.contains("|layer")),
+            result.groups.iter().all(|g| g.group_key.contains("|layer")),
             "source-hash-layer keys must encode layer: {:?}",
             result
                 .groups

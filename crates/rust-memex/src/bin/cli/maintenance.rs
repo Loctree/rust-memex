@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 pub use rust_memex::diagnostics::{DedupGroup, DedupResult, KeepStrategy};
 use rust_memex::{
     CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig, IndexProgressTracker,
-    PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig, RAGPipeline, SliceMode,
-    StorageManager, diagnostics, merge_databases, migrate_namespace_atomic,
+    OuterSynthesis, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
+    RAGPipeline, SliceMode, StorageManager, diagnostics, merge_databases, migrate_namespace_atomic,
     rag::PipelineGovernorConfig, repair_writes as execute_repair_writes,
 };
 
@@ -151,6 +151,13 @@ pub struct BatchIndexConfig {
     /// Sanitize timestamps/UUIDs/session IDs (default: false = preserve for temporal queries)
     pub sanitize_metadata: bool,
     pub slice_mode: SliceMode,
+    /// Outer-layer synthesis strategy for onion modes (spec P3).
+    ///
+    /// `OuterSynthesis::Keyword` keeps the legacy TF-based path; `Llm` routes
+    /// the outer through a local Ollama model. The non-pipeline path always
+    /// uses `Keyword` regardless — see `run_batch_index` for the up-front
+    /// guard that rejects `Llm + !pipeline` instead of silently downgrading.
+    pub outer_synthesis: OuterSynthesis,
     pub dedup: bool,
     pub embedding_config: EmbeddingConfig,
     /// Show progress bar with calibration-based ETA
@@ -165,6 +172,49 @@ pub struct BatchIndexConfig {
     pub pipeline_governor: bool,
     /// Number of files to process in parallel (1-16, ignored in pipeline mode)
     pub parallel: u8,
+}
+
+/// Translate the CLI string flags `--outer-synthesis` / `--ollama-model` /
+/// `--ollama-endpoint` into a typed [`OuterSynthesis`] value.
+///
+/// Returns `OuterSynthesis::Keyword` for `"keyword"` (regardless of the model /
+/// endpoint values, which are simply ignored when irrelevant) and
+/// `OuterSynthesis::Llm { model, endpoint }` for `"llm"`. Any unknown variant
+/// raises an error so the operator sees the lie loud, never silent.
+///
+/// Empty model / endpoint strings are rejected at this layer so the lib API
+/// (which would silently fall back to keyword on a malformed Ollama call) is
+/// not asked to do operator-input validation.
+pub fn parse_outer_synthesis_flag(
+    variant: &str,
+    ollama_model: &str,
+    ollama_endpoint: &str,
+) -> Result<OuterSynthesis> {
+    match variant {
+        "keyword" => Ok(OuterSynthesis::Keyword),
+        "llm" => {
+            let model = ollama_model.trim();
+            let endpoint = ollama_endpoint.trim();
+            if model.is_empty() {
+                anyhow::bail!(
+                    "--outer-synthesis llm requires a non-empty --ollama-model (got empty string)"
+                );
+            }
+            if endpoint.is_empty() {
+                anyhow::bail!(
+                    "--outer-synthesis llm requires a non-empty --ollama-endpoint (got empty string)"
+                );
+            }
+            Ok(OuterSynthesis::Llm {
+                model: model.to_string(),
+                endpoint: endpoint.to_string(),
+            })
+        }
+        other => anyhow::bail!(
+            "Invalid --outer-synthesis '{}'. Use one of: keyword, llm",
+            other
+        ),
+    }
 }
 
 /// Result of indexing a single file (for parallel processing)
@@ -432,6 +482,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         preprocess,
         sanitize_metadata,
         slice_mode,
+        outer_synthesis,
         dedup,
         embedding_config,
         show_progress,
@@ -441,6 +492,30 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         pipeline_governor,
         parallel,
     } = config;
+
+    // Spec P3: only the --pipeline path threads `OuterSynthesis` through to the
+    // async slicers. The legacy non-pipeline path uses `OnionSliceConfig::default()`
+    // and would silently produce keyword outers regardless of this flag. Reject the
+    // combination up-front so an operator never thinks they ran an LLM rebuild
+    // when the keyword path actually shipped.
+    if matches!(outer_synthesis, OuterSynthesis::Llm { .. }) && !pipeline {
+        anyhow::bail!(
+            "--outer-synthesis llm requires --pipeline mode. The legacy non-pipeline path \
+             does not invoke the async slicer that drives Ollama, so without --pipeline \
+             every document would silently fall back to the keyword outer. Re-run with \
+             --pipeline (and --pipeline-governor for adaptive flow control)."
+        );
+    }
+    if matches!(outer_synthesis, OuterSynthesis::Llm { .. })
+        && !matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast)
+    {
+        anyhow::bail!(
+            "--outer-synthesis llm only applies to onion slice modes (got --slice-mode {:?}). \
+             The flat slicer has no outer layer to synthesize.",
+            slice_mode
+        );
+    }
+
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
     let expanded = shellexpand::tilde(path.to_str().unwrap_or("")).to_string();
     let canonical = Path::new(&expanded).canonicalize()?;
@@ -581,6 +656,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
         let pipeline_config = PipelineConfig {
             slice_mode,
+            outer_synthesis: outer_synthesis.clone(),
             dedup_enabled: dedup && !disable_storage_dedup,
             embed_concurrency: pipeline_embed_concurrency as usize,
             governor: pipeline_governor.then(|| {
@@ -595,6 +671,16 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             resumed_files: resumed_count,
             ..Default::default()
         };
+
+        // Operator-visible breadcrumb so the run log records which outer the
+        // P3 spec procedure actually got. The flag is silent on the keyword
+        // path (legacy behavior) and loud on the LLM path.
+        if let OuterSynthesis::Llm { model, endpoint } = &outer_synthesis {
+            eprintln!(
+                "Outer synthesis: LLM via Ollama (model={}, endpoint={})",
+                model, endpoint
+            );
+        }
 
         let pipeline_run = rust_memex::run_pipeline(
             pipeline_files,
@@ -1075,6 +1161,128 @@ mod tests {
     fn resume_checkpoint_disables_pipeline_storage_dedup_even_without_committed_files() {
         assert!(should_disable_pipeline_storage_dedup(true));
         assert!(!should_disable_pipeline_storage_dedup(false));
+    }
+
+    #[test]
+    fn parse_outer_synthesis_flag_keyword_ignores_ollama_overrides() {
+        let parsed = parse_outer_synthesis_flag("keyword", "ignored", "ignored").unwrap();
+        match parsed {
+            OuterSynthesis::Keyword => {}
+            other => panic!("expected Keyword, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_outer_synthesis_flag_llm_carries_model_and_endpoint() {
+        let parsed =
+            parse_outer_synthesis_flag("llm", "qwen2.5:3b", "http://10.0.0.5:11434").unwrap();
+        match parsed {
+            OuterSynthesis::Llm { model, endpoint } => {
+                assert_eq!(model, "qwen2.5:3b");
+                assert_eq!(endpoint, "http://10.0.0.5:11434");
+            }
+            other => panic!("expected Llm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_outer_synthesis_flag_rejects_empty_model_or_endpoint() {
+        assert!(
+            parse_outer_synthesis_flag("llm", "", "http://localhost:11434").is_err(),
+            "empty model must error so an Ollama call never silently goes out with no model"
+        );
+        assert!(
+            parse_outer_synthesis_flag("llm", "qwen2.5:3b", "").is_err(),
+            "empty endpoint must error so the helper does not fall back to a stale default"
+        );
+    }
+
+    #[test]
+    fn parse_outer_synthesis_flag_rejects_unknown_variant() {
+        let err = parse_outer_synthesis_flag("transformers", "model", "endpoint")
+            .expect_err("unknown variant must error");
+        assert!(
+            err.to_string().contains("Invalid --outer-synthesis"),
+            "error must name the offending flag, got: {}",
+            err
+        );
+    }
+
+    fn make_index_config_for_guard(
+        pipeline: bool,
+        outer_synthesis: OuterSynthesis,
+        slice_mode: SliceMode,
+    ) -> BatchIndexConfig {
+        BatchIndexConfig {
+            // The guard runs before canonicalization, so the path being
+            // missing is fine — we never reach disk I/O on the error paths.
+            path: PathBuf::from("/dev/null/this-path-must-not-exist"),
+            namespace: Some("test-ns".to_string()),
+            recursive: false,
+            glob_pattern: None,
+            max_depth: 0,
+            db_path: "/tmp/rust-memex-test".to_string(),
+            preprocess: false,
+            sanitize_metadata: false,
+            slice_mode,
+            outer_synthesis,
+            dedup: false,
+            embedding_config: EmbeddingConfig::default(),
+            show_progress: false,
+            resume: false,
+            pipeline,
+            pipeline_embed_concurrency: 1,
+            pipeline_governor: false,
+            parallel: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_batch_index_rejects_llm_without_pipeline_so_no_silent_keyword_downgrade() {
+        let config = make_index_config_for_guard(
+            false,
+            OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+            },
+            SliceMode::Onion,
+        );
+        let err = run_batch_index(config)
+            .await
+            .expect_err("LLM outer without --pipeline must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--outer-synthesis llm requires --pipeline mode"),
+            "guard message must point operator at --pipeline, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("keyword outer"),
+            "guard message must explain the silent-fallback risk so the operator \
+             understands WHY this is rejected, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn run_batch_index_rejects_llm_with_flat_slice_mode() {
+        let config = make_index_config_for_guard(
+            true,
+            OuterSynthesis::Llm {
+                model: "qwen2.5:3b".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+            },
+            SliceMode::Flat,
+        );
+        let err = run_batch_index(config)
+            .await
+            .expect_err("LLM outer with --slice-mode flat must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only applies to onion slice modes"),
+            "guard message must explain that flat has no outer layer, got: {}",
+            msg
+        );
     }
 }
 
