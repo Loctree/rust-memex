@@ -8,7 +8,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::{OptimizeAction, OptimizeStats};
+use lancedb::table::{NewColumnTransform, OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -477,6 +477,7 @@ impl StorageManager {
         }
 
         let table = self.ensure_table(dim).await?;
+        self.ensure_hash_schema_columns(&table).await?;
         let batch = self.docs_to_batch(&documents, dim)?;
         table.add(batch).execute().await?;
         debug!(
@@ -820,6 +821,40 @@ impl StorageManager {
             // already-ingested file.
             Field::new("source_hash", DataType::Utf8, true), // SHA256 of source document text
         ])
+    }
+
+    async fn ensure_hash_schema_columns(&self, table: &Table) -> Result<()> {
+        let schema = table.schema().await?;
+        let mut missing = Vec::new();
+
+        if schema.field_with_name("content_hash").is_err() {
+            missing.push(Field::new("content_hash", DataType::Utf8, true));
+        }
+        if schema.field_with_name("source_hash").is_err() {
+            missing.push(Field::new("source_hash", DataType::Utf8, true));
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let names = missing
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(
+            "Upgrading Lance table '{}' schema with missing nullable hash columns: {}",
+            self.collection_name, names
+        );
+        table
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
+                None,
+            )
+            .await?;
+        let _ = table.checkout_latest().await;
+        Ok(())
     }
 
     fn docs_to_batch(&self, documents: &[ChromaDocument], dim: usize) -> Result<BatchIter> {

@@ -827,7 +827,18 @@ where
             Ok(()) => {
                 stats.indexed_documents += 1;
             }
-            Err(_) => {
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to rebuild {}#{} into namespace '{}': {}",
+                    source_label,
+                    doc.canonical_id,
+                    namespace,
+                    err
+                );
+                eprintln!(
+                    "Failed to rebuild {}#{} into namespace '{}': {}",
+                    source_label, doc.canonical_id, namespace, err
+                );
                 stats.failed_ids.push(doc.canonical_id.clone());
             }
         }
