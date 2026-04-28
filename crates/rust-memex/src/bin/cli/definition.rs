@@ -925,6 +925,10 @@ pub enum Commands {
         #[arg(long)]
         skip_existing: bool,
 
+        /// Force rebuilding even when source_hash already exists in the target namespace
+        #[arg(long)]
+        allow_duplicates: bool,
+
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
         dry_run: bool,
@@ -965,6 +969,10 @@ pub enum Commands {
         /// Skip documents already rebuilt with the same source hash
         #[arg(long)]
         skip_existing: bool,
+
+        /// Force rebuilding even when source_hash already exists in the target namespace
+        #[arg(long)]
+        allow_duplicates: bool,
 
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
@@ -1478,6 +1486,46 @@ mod tests {
                 assert!(dedup);
             }
             other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reprocess_command_accepts_allow_duplicates_flag() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "reprocess",
+            "-n",
+            "kb:rebuilt",
+            "-i",
+            "/tmp/export.jsonl",
+            "--allow-duplicates",
+        ]);
+        match cli.command {
+            Some(Commands::Reprocess {
+                allow_duplicates, ..
+            }) => {
+                assert!(allow_duplicates);
+            }
+            other => panic!("expected reprocess command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reindex_command_accepts_allow_duplicates_flag() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "reindex",
+            "-n",
+            "kb:transcripts",
+            "--allow-duplicates",
+        ]);
+        match cli.command {
+            Some(Commands::Reindex {
+                allow_duplicates, ..
+            }) => {
+                assert!(allow_duplicates);
+            }
+            other => panic!("expected reindex command, got {:?}", other),
         }
     }
 

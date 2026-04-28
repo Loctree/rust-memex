@@ -19,6 +19,7 @@ pub struct ReprocessConfig {
     pub slice_mode: SliceMode,
     pub preprocess: bool,
     pub skip_existing: bool,
+    pub allow_duplicates: bool,
     pub dry_run: bool,
     pub db_path: String,
 }
@@ -29,6 +30,7 @@ pub struct ReindexConfig {
     pub slice_mode: SliceMode,
     pub preprocess: bool,
     pub skip_existing: bool,
+    pub allow_duplicates: bool,
     pub dry_run: bool,
     pub db_path: String,
 }
@@ -125,6 +127,7 @@ pub async fn run_reprocess(
         slice_mode,
         preprocess,
         skip_existing,
+        allow_duplicates,
         dry_run,
         db_path,
     } = config;
@@ -141,6 +144,7 @@ pub async fn run_reprocess(
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
         },
         |_| {},
@@ -214,6 +218,7 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
         slice_mode,
         preprocess,
         skip_existing,
+        allow_duplicates,
         dry_run,
         db_path,
     } = config;
@@ -230,6 +235,7 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
         },
         |_| {},

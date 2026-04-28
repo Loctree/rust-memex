@@ -766,6 +766,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
             db_path: cmd_db_path,
         }) => {
@@ -789,6 +790,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     slice_mode,
                     preprocess,
                     skip_existing,
+                    allow_duplicates,
                     dry_run,
                     db_path,
                 },
@@ -802,6 +804,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
             db_path: cmd_db_path,
         }) => {
@@ -827,6 +830,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     slice_mode,
                     preprocess,
                     skip_existing,
+                    allow_duplicates,
                     dry_run,
                     db_path,
                 },

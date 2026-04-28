@@ -78,6 +78,7 @@ pub struct ReprocessJob {
     pub slice_mode: SliceMode,
     pub preprocess: bool,
     pub skip_existing: bool,
+    pub allow_duplicates: bool,
     pub dry_run: bool,
 }
 
@@ -88,6 +89,7 @@ pub struct ReindexJob {
     pub slice_mode: SliceMode,
     pub preprocess: bool,
     pub skip_existing: bool,
+    pub allow_duplicates: bool,
     pub dry_run: bool,
 }
 
@@ -110,6 +112,7 @@ struct RebuildPlan {
     slice_mode: SliceMode,
     preprocess: bool,
     skip_existing: bool,
+    allow_duplicates: bool,
     dry_run: bool,
     parse_errors: usize,
 }
@@ -298,6 +301,7 @@ where
         slice_mode,
         preprocess,
         skip_existing,
+        allow_duplicates,
         dry_run,
     } = job;
     let (_validated, content) = path_utils::safe_read_to_string_async(&input_path).await?;
@@ -327,6 +331,7 @@ where
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
             parse_errors,
         },
@@ -372,6 +377,7 @@ where
         slice_mode,
         preprocess,
         skip_existing,
+        allow_duplicates,
         dry_run,
     } = job;
     if source_namespace == target_namespace {
@@ -438,6 +444,7 @@ where
             slice_mode,
             preprocess,
             skip_existing,
+            allow_duplicates,
             dry_run,
             parse_errors: 0,
         },
@@ -683,6 +690,7 @@ where
         slice_mode,
         preprocess,
         skip_existing,
+        allow_duplicates,
         dry_run,
         parse_errors: _parse_errors,
     } = plan;
@@ -699,10 +707,33 @@ where
 
     let preprocessor = preprocess.then(|| Preprocessor::new(PreprocessingConfig::default()));
     let min_length = PreprocessingConfig::default().min_content_length;
+    let storage = rag.storage_manager();
     let mut stats = RebuildStats::default();
     let mut progress = RebuildProgress::default();
 
     for (idx, doc) in docs.iter().enumerate() {
+        if !allow_duplicates
+            && storage
+                .has_source_hash(&namespace, &doc.source_text_hash)
+                .await?
+        {
+            tracing::info!(
+                "Skip duplicate source during rebuild: {}#{} (source_hash {})",
+                source_label,
+                doc.source_record_id,
+                &doc.source_text_hash[..16]
+            );
+            stats.skipped_existing_documents += 1;
+            progress.processed_documents = idx + 1;
+            progress.skipped_documents = stats.skipped_existing_documents
+                + stats.skipped_empty_documents
+                + stats.skipped_preprocess_short_documents;
+            progress.failed_documents = stats.failed_ids.len();
+            progress.indexed_documents = stats.indexed_documents;
+            emit_progress(&progress);
+            continue;
+        }
+
         let existing = rag.lookup_memory(&namespace, &doc.canonical_id).await?;
         if let Some(existing_doc) = existing.as_ref()
             && skip_existing
