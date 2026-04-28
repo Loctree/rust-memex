@@ -40,6 +40,7 @@ path = "src/bin/rust_memex.rs"
 required-features = ["cli"]
 
 [dependencies]
+aicx-parser.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
 arrow-array.workspace = true

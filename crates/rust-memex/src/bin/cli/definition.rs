@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use walkdir::WalkDir;
 
-use rust_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
+use rust_memex::{ChunkerKind, NamespaceSecurityConfig, ServerConfig, path_utils};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
@@ -245,8 +245,12 @@ pub enum Commands {
     /// Batch index documents into vector store
     Index {
         /// Path to file or directory to index
-        #[arg(required = true)]
-        path: PathBuf,
+        #[arg(value_name = "PATH", required_unless_present = "source")]
+        path: Option<PathBuf>,
+
+        /// Path to file or directory to index
+        #[arg(long, value_name = "PATH", conflicts_with = "path")]
+        source: Option<PathBuf>,
 
         /// Namespace for indexed documents (default: "rag")
         #[arg(long, short = 'n')]
@@ -282,6 +286,10 @@ pub enum Commands {
         /// - "flat": Traditional fixed-size chunks with overlap
         #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
         slice_mode: String,
+
+        /// Chunk provider override. If omitted, rust-memex routes per namespace/path.
+        #[arg(long, value_enum)]
+        chunker: Option<ChunkerKind>,
 
         /// Outer-layer synthesis strategy for onion modes (spec P3).
         /// - "keyword" (default): TF-based keyword extraction. No I/O.
@@ -917,6 +925,10 @@ pub enum Commands {
         #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
         slice_mode: String,
 
+        /// Chunk provider override. If omitted, rust-memex routes by source/namespace heuristic.
+        #[arg(long, value_enum)]
+        chunker: Option<ChunkerKind>,
+
         /// Apply preprocessing before rebuilding documents
         #[arg(long)]
         preprocess: bool,
@@ -924,6 +936,10 @@ pub enum Commands {
         /// Skip documents already rebuilt with the same source hash
         #[arg(long)]
         skip_existing: bool,
+
+        /// Force rebuilding even when source_hash already exists in the target namespace
+        #[arg(long)]
+        allow_duplicates: bool,
 
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
@@ -958,6 +974,10 @@ pub enum Commands {
         #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
         slice_mode: String,
 
+        /// Chunk provider override. If omitted, rust-memex routes by source/namespace heuristic.
+        #[arg(long, value_enum)]
+        chunker: Option<ChunkerKind>,
+
         /// Apply preprocessing before rebuilding documents
         #[arg(long)]
         preprocess: bool,
@@ -965,6 +985,10 @@ pub enum Commands {
         /// Skip documents already rebuilt with the same source hash
         #[arg(long)]
         skip_existing: bool,
+
+        /// Force rebuilding even when source_hash already exists in the target namespace
+        #[arg(long)]
+        allow_duplicates: bool,
 
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
@@ -1478,6 +1502,46 @@ mod tests {
                 assert!(dedup);
             }
             other => panic!("expected index command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reprocess_command_accepts_allow_duplicates_flag() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "reprocess",
+            "-n",
+            "kb:rebuilt",
+            "-i",
+            "/tmp/export.jsonl",
+            "--allow-duplicates",
+        ]);
+        match cli.command {
+            Some(Commands::Reprocess {
+                allow_duplicates, ..
+            }) => {
+                assert!(allow_duplicates);
+            }
+            other => panic!("expected reprocess command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reindex_command_accepts_allow_duplicates_flag() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "reindex",
+            "-n",
+            "kb:transcripts",
+            "--allow-duplicates",
+        ]);
+        match cli.command {
+            Some(Commands::Reindex {
+                allow_duplicates, ..
+            }) => {
+                assert!(allow_duplicates);
+            }
+            other => panic!("expected reindex command, got {:?}", other),
         }
     }
 

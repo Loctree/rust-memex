@@ -16,6 +16,7 @@ keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 
 [workspace.dependencies]
+aicx-parser = { path = "../aicx/crates/aicx-parser", version = "0.1.0" }
 anyhow = "1.0"
 argon2 = "0.5"
 arrow-array = "56.2"

@@ -52,6 +52,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aicx-parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5052,6 +5063,7 @@ dependencies = [
 name = "rust-memex"
 version = "0.6.3"
 dependencies = [
+ "aicx-parser",
  "anyhow",
  "argon2",
  "arrow-array",

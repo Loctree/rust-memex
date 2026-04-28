@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    ReindexJob, ReprocessJob, SliceMode, default_reindexed_namespace,
+    ChunkerKind, ReindexJob, ReprocessJob, SliceMode, default_reindexed_namespace,
     export_namespace_jsonl_stream, import_jsonl_bytes_stream, migrate_namespace_atomic,
     reindex_namespace, reprocess_jsonl_file,
 };
@@ -34,9 +34,13 @@ struct ReprocessRequest {
     target_namespace: String,
     slice_mode: String,
     #[serde(default)]
+    chunker: Option<ChunkerKind>,
+    #[serde(default)]
     preprocess: bool,
     #[serde(default)]
     skip_existing: bool,
+    #[serde(default)]
+    allow_duplicates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,9 +49,13 @@ struct ReindexRequest {
     target_namespace: Option<String>,
     slice_mode: String,
     #[serde(default)]
+    chunker: Option<ChunkerKind>,
+    #[serde(default)]
     preprocess: bool,
     #[serde(default)]
     skip_existing: bool,
+    #[serde(default)]
+    allow_duplicates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +94,10 @@ async fn sse_reprocess_handler(
     let input_path = PathBuf::from(request.input_path.clone());
     let target_namespace = request.target_namespace.clone();
     let slice_mode_name = request.slice_mode.clone();
+    let chunker = request.chunker;
     let preprocess = request.preprocess;
     let skip_existing = request.skip_existing;
+    let allow_duplicates = request.allow_duplicates;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let rag = state.rag.clone();
 
@@ -98,8 +108,10 @@ async fn sse_reprocess_handler(
                 "input_path": input_path.display().to_string(),
                 "target_namespace": target_namespace.clone(),
                 "slice_mode": slice_mode_name.clone(),
+                "chunker": chunker.map(|kind| kind.name()),
                 "preprocess": preprocess,
                 "skip_existing": skip_existing,
+                "allow_duplicates": allow_duplicates,
             }),
         ));
 
@@ -109,8 +121,10 @@ async fn sse_reprocess_handler(
                 input_path: input_path.clone(),
                 target_namespace: target_namespace.clone(),
                 slice_mode,
+                chunker,
                 preprocess,
                 skip_existing,
+                allow_duplicates,
                 dry_run: false,
             },
             |progress| {
@@ -165,8 +179,10 @@ async fn sse_reindex_handler(
         .clone()
         .unwrap_or_else(|| default_reindexed_namespace(&source_namespace));
     let slice_mode_name = request.slice_mode.clone();
+    let chunker = request.chunker;
     let preprocess = request.preprocess;
     let skip_existing = request.skip_existing;
+    let allow_duplicates = request.allow_duplicates;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let rag = state.rag.clone();
 
@@ -177,8 +193,10 @@ async fn sse_reindex_handler(
                 "source_namespace": source_namespace.clone(),
                 "target_namespace": target_namespace.clone(),
                 "slice_mode": slice_mode_name.clone(),
+                "chunker": chunker.map(|kind| kind.name()),
                 "preprocess": preprocess,
                 "skip_existing": skip_existing,
+                "allow_duplicates": allow_duplicates,
             }),
         ));
 
@@ -188,8 +206,10 @@ async fn sse_reindex_handler(
                 source_namespace: source_namespace.clone(),
                 target_namespace: target_namespace.clone(),
                 slice_mode,
+                chunker,
                 preprocess,
                 skip_existing,
+                allow_duplicates,
                 dry_run: false,
             },
             |progress| {
