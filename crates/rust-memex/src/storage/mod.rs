@@ -1788,3 +1788,26 @@ impl StorageManager {
         Ok(namespaces)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn flat_documents_preserve_separate_chunk_and_source_hashes() {
+        let doc = ChromaDocument::new_flat_with_hashes(
+            "doc-1".to_string(),
+            "kb:transcripts".to_string(),
+            vec![0.0, 1.0],
+            json!({"path": "sample.md"}),
+            "outer summary chunk".to_string(),
+            "chunk-sha256".to_string(),
+            Some("source-sha256".to_string()),
+        );
+
+        assert_eq!(doc.content_hash.as_deref(), Some("chunk-sha256"));
+        assert_eq!(doc.source_hash.as_deref(), Some("source-sha256"));
+        assert_ne!(doc.content_hash, doc.source_hash);
+    }
+}
