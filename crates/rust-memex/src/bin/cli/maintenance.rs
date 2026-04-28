@@ -11,10 +11,10 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 
 pub use rust_memex::diagnostics::{DedupGroup, DedupResult, KeepStrategy};
 use rust_memex::{
-    CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig, IndexProgressTracker,
+    ChunkerKind, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig, IndexProgressTracker,
     OuterSynthesis, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
-    RAGPipeline, SliceMode, StorageManager, diagnostics, merge_databases, migrate_namespace_atomic,
-    rag::PipelineGovernorConfig, repair_writes as execute_repair_writes,
+    RAGPipeline, SliceMode, StorageManager, detect_default_chunker, diagnostics, merge_databases,
+    migrate_namespace_atomic, rag::PipelineGovernorConfig, repair_writes as execute_repair_writes,
 };
 
 use crate::cli::definition::*;
@@ -151,6 +151,7 @@ pub struct BatchIndexConfig {
     /// Sanitize timestamps/UUIDs/session IDs (default: false = preserve for temporal queries)
     pub sanitize_metadata: bool,
     pub slice_mode: SliceMode,
+    pub chunker: Option<ChunkerKind>,
     /// Outer-layer synthesis strategy for onion modes (spec P3).
     ///
     /// `OuterSynthesis::Keyword` keeps the legacy TF-based path; `Llm` routes
@@ -482,6 +483,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         preprocess,
         sanitize_metadata,
         slice_mode,
+        chunker,
         outer_synthesis,
         dedup,
         embedding_config,
@@ -534,6 +536,9 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         SliceMode::OnionFast => "onion-fast (outer+core, 2 layers)",
         SliceMode::Flat => "flat (traditional chunks)",
     };
+    let chunker_name = chunker
+        .map(|kind| kind.name().to_string())
+        .unwrap_or_else(|| "auto".to_string());
 
     let use_progress_bar = show_progress && std::io::stderr().is_terminal();
     if show_progress && !use_progress_bar {
@@ -545,7 +550,10 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         t.display_pre_scan();
         Some(t)
     } else {
-        eprintln!("Found {} files to index (slice mode: {})", total, mode_name);
+        eprintln!(
+            "Found {} files to index (slice mode: {}, chunker: {})",
+            total, mode_name, chunker_name
+        );
         if preprocess {
             eprintln!("Preprocessing enabled: filtering tool artifacts, CLI output, and metadata");
         }
@@ -656,6 +664,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
         let pipeline_config = PipelineConfig {
             slice_mode,
+            chunker,
             outer_synthesis: outer_synthesis.clone(),
             dedup_enabled: dedup && !disable_storage_dedup,
             embed_concurrency: pipeline_embed_concurrency as usize,
@@ -825,7 +834,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         let ns = namespace.clone();
         let canonical = canonical.clone();
         let embedder_model = embedder_model.clone();
-        let _ns_name = ns_name.to_string();
+        let ns_name = ns_name.to_string();
 
         let handle = tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
@@ -879,8 +888,16 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     )
                     .await
                 } else {
-                    rag.index_document_with_dedup(&file_path, ns.as_deref(), effective_mode)
-                        .await
+                    let selected_chunker =
+                        chunker.unwrap_or_else(|| detect_default_chunker(&file_path, &ns_name));
+                    rag.index_document_with_chunker(
+                        &file_path,
+                        ns.as_deref(),
+                        selected_chunker,
+                        effective_mode,
+                        true,
+                    )
+                    .await
                 }
             } else {
                 // Use original indexing without dedup (convert to IndexResult-like outcome)
@@ -898,14 +915,16 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         tokens_estimated: None,
                     })
                 } else {
-                    rag.index_document_with_mode(&file_path, ns.as_deref(), effective_mode)
-                        .await
-                        .map(|()| rust_memex::IndexResult::Indexed {
-                            chunks_indexed: (file_bytes as usize / 500).max(1),
-                            content_hash: String::new(),
-                            embedder_ms: None,
-                            tokens_estimated: None,
-                        })
+                    let selected_chunker =
+                        chunker.unwrap_or_else(|| detect_default_chunker(&file_path, &ns_name));
+                    rag.index_document_with_chunker(
+                        &file_path,
+                        ns.as_deref(),
+                        selected_chunker,
+                        effective_mode,
+                        false,
+                    )
+                    .await
                 }
             };
 
@@ -1225,6 +1244,7 @@ mod tests {
             preprocess: false,
             sanitize_metadata: false,
             slice_mode,
+            chunker: None,
             outer_synthesis,
             dedup: false,
             embedding_config: EmbeddingConfig::default(),

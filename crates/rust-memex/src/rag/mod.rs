@@ -23,10 +23,15 @@ use crate::{
 
 // Async pipeline module for concurrent indexing
 pub mod pipeline;
+pub mod provider;
 pub mod structured;
 pub use pipeline::{
     Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineGovernorConfig,
     PipelineResult, PipelineSnapshot, PipelineStats, run_pipeline,
+};
+pub use provider::{
+    AicxChunkProvider, ChunkOpts, ChunkProvider, ChunkerKind, FlatChunkProvider,
+    OnionChunkProvider, detect_default_chunker,
 };
 
 const DEFAULT_NAMESPACE: &str = "rag";
@@ -2751,6 +2756,69 @@ impl RAGPipeline {
         })
     }
 
+    /// Index a document with an explicit chunk provider.
+    pub async fn index_document_with_chunker(
+        &self,
+        path: &Path,
+        namespace: Option<&str>,
+        chunker: ChunkerKind,
+        slice_mode: SliceMode,
+        dedup: bool,
+    ) -> Result<IndexResult> {
+        if chunker != ChunkerKind::Aicx {
+            let effective_mode = chunker.slice_mode(slice_mode);
+            if dedup {
+                return self
+                    .index_document_with_dedup(path, namespace, effective_mode)
+                    .await;
+            }
+            self.index_document_with_mode(path, namespace, effective_mode)
+                .await?;
+            return Ok(IndexResult::Indexed {
+                chunks_indexed: 1,
+                content_hash: String::new(),
+                embedder_ms: None,
+                tokens_estimated: None,
+            });
+        }
+
+        let validated_path = crate::path_utils::validate_read_path(path)?;
+        let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
+        let text = self.extract_text(&validated_path).await?;
+        let content_hash = compute_content_hash(&text);
+
+        if dedup && self.storage.has_content_hash(ns, &content_hash).await? {
+            debug!(
+                "Skipping duplicate content: {} (hash: {})",
+                path.display(),
+                &content_hash[..16]
+            );
+            return Ok(IndexResult::Skipped {
+                reason: "exact duplicate".to_string(),
+                content_hash,
+            });
+        }
+
+        let file_content = FileContent {
+            path: validated_path,
+            text,
+            namespace: ns.to_string(),
+            content_hash: content_hash.clone(),
+        };
+        let opts = ChunkOpts::new(chunker, SliceMode::Flat, OuterSynthesis::default());
+        let provider = chunker.into_provider();
+        let chunks = provider.chunk(&file_content, &opts).await?;
+        let (chunks_indexed, embedder_ms, tokens_estimated) =
+            self.embed_and_store_provider_chunks(chunks).await?;
+
+        Ok(IndexResult::Indexed {
+            chunks_indexed,
+            content_hash,
+            embedder_ms: Some(embedder_ms),
+            tokens_estimated: Some(tokens_estimated),
+        })
+    }
+
     /// Index a document with JSON-awareness: for JSON arrays, each element
     /// becomes a separate onion-sliced document.
     ///
@@ -3349,6 +3417,67 @@ impl RAGPipeline {
         Ok((total_chunks, total_embedder_ms, tokens_estimated))
     }
 
+    async fn embed_and_store_provider_chunks(
+        &self,
+        chunks: Vec<Chunk>,
+    ) -> Result<(usize, u64, usize)> {
+        let total_chunks = chunks.len();
+        let mut tokens_estimated = 0;
+        let mut total_embedder_ms = 0;
+        let token_config = crate::embeddings::TokenConfig::default();
+
+        for batch in chunks.chunks(STORAGE_BATCH_SIZE) {
+            tokens_estimated += batch
+                .iter()
+                .map(|chunk| crate::embeddings::estimate_tokens(&chunk.content, &token_config))
+                .sum::<usize>();
+
+            let batch_contents: Vec<String> =
+                batch.iter().map(|chunk| chunk.content.clone()).collect();
+            let embed_started_at = std::time::Instant::now();
+            let embeddings = self.embed_chunks(&batch_contents).await?;
+            total_embedder_ms += embed_started_at.elapsed().as_millis() as u64;
+
+            let documents: Vec<ChromaDocument> = batch
+                .iter()
+                .cloned()
+                .zip(embeddings.into_iter())
+                .map(|(chunk, embedding)| {
+                    let source_hash = Some(chunk.source_hash);
+                    if chunk.layer > 0 {
+                        ChromaDocument {
+                            id: chunk.id,
+                            namespace: chunk.namespace,
+                            embedding,
+                            metadata: chunk.metadata,
+                            document: chunk.content,
+                            layer: chunk.layer,
+                            parent_id: chunk.parent_id,
+                            children_ids: chunk.children_ids,
+                            keywords: chunk.keywords,
+                            content_hash: Some(chunk.chunk_hash),
+                            source_hash,
+                        }
+                    } else {
+                        ChromaDocument::new_flat_with_hashes(
+                            chunk.id,
+                            chunk.namespace,
+                            embedding,
+                            chunk.metadata,
+                            chunk.content,
+                            chunk.chunk_hash,
+                            source_hash,
+                        )
+                    }
+                })
+                .collect();
+
+            self.persist_documents(documents).await?;
+        }
+
+        Ok((total_chunks, total_embedder_ms, tokens_estimated))
+    }
+
     async fn index_flat_memory_family_with_hash(
         &self,
         text: &str,
@@ -3504,6 +3633,7 @@ impl RAGPipeline {
         text: &str,
         metadata: serde_json::Value,
         slice_mode: SliceMode,
+        chunker: Option<ChunkerKind>,
     ) -> Result<()> {
         let slice_mode_name = match slice_mode {
             SliceMode::Onion => "onion",
@@ -3515,9 +3645,39 @@ impl RAGPipeline {
 
         if let serde_json::Value::Object(ref mut map) = metadata {
             map.insert("slice_mode".to_string(), json!(slice_mode_name));
+            if let Some(chunker) = chunker {
+                map.insert("chunker".to_string(), json!(chunker.name()));
+            }
             if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
                 map.insert("original_id".to_string(), json!(id));
             }
+        }
+
+        if chunker == Some(ChunkerKind::Aicx) {
+            let path = metadata
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    metadata
+                        .get("reprocess_source")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or(id);
+            let file_content = FileContent {
+                path: std::path::PathBuf::from(path),
+                text: text.to_string(),
+                namespace: namespace.to_string(),
+                content_hash: content_hash.clone(),
+            };
+            let opts = ChunkOpts::new(
+                ChunkerKind::Aicx,
+                SliceMode::Flat,
+                OuterSynthesis::default(),
+            );
+            let provider = ChunkerKind::Aicx.into_provider();
+            let chunks = provider.chunk(&file_content, &opts).await?;
+            self.embed_and_store_provider_chunks(chunks).await?;
+            return Ok(());
         }
 
         match slice_mode {
@@ -3572,10 +3732,18 @@ impl RAGPipeline {
                 ));
             }
         };
+        let chunker = metadata
+            .get("chunker")
+            .and_then(|value| value.as_str())
+            .map(str::parse::<ChunkerKind>)
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
 
         self.delete_memory_family(namespace, &id).await?;
-        self.index_text_memory_family_with_hash(namespace, &id, &text, metadata, slice_mode)
-            .await?;
+        self.index_text_memory_family_with_hash(
+            namespace, &id, &text, metadata, slice_mode, chunker,
+        )
+        .await?;
         Ok(())
     }
 

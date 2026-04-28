@@ -27,10 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::embeddings::EmbeddingClient;
-use crate::rag::{
-    OnionSlice, OnionSliceConfig, OuterSynthesis, SliceMode, create_onion_slices_async,
-    create_onion_slices_fast_async,
-};
+use crate::rag::{ChunkOpts, ChunkerKind, OuterSynthesis, SliceMode, detect_default_chunker};
 use crate::storage::{ChromaDocument, StorageManager};
 
 /// Channel buffer size for backpressure.
@@ -422,6 +419,8 @@ pub struct PipelineConfig {
     pub embedder_buffer: usize,
     /// Slicing mode for chunking.
     pub slice_mode: SliceMode,
+    /// Optional provider override. When absent, the chunker stage routes per file.
+    pub chunker: Option<ChunkerKind>,
     /// Outer-layer synthesis strategy for onion modes (spec P3). Defaults to
     /// the legacy `Keyword` (TF-based) path; set to `Llm { model, endpoint }`
     /// to route the outer layer through a local Ollama model. Failures are
@@ -452,6 +451,7 @@ impl Default for PipelineConfig {
             chunker_buffer: CHANNEL_BUFFER_SIZE,
             embedder_buffer: CHANNEL_BUFFER_SIZE,
             slice_mode: SliceMode::default(),
+            chunker: None,
             outer_synthesis: OuterSynthesis::default(),
             dedup_enabled: true,
             embed_concurrency: 1,
@@ -1016,18 +1016,33 @@ async fn stage_chunk_content(
     mut rx: mpsc::Receiver<FileContent>,
     tx: mpsc::Sender<ChunkBatch>,
     slice_mode: SliceMode,
+    chunker: Option<ChunkerKind>,
     outer_synthesis: OuterSynthesis,
     observer: PipelineObserver,
 ) {
-    let config = OnionSliceConfig {
-        outer_synthesis,
-        ..OnionSliceConfig::default()
-    };
-
     while let Some(file_content) = rx.recv().await {
         let path = file_content.path.clone();
         let content_hash = file_content.content_hash.clone();
-        let chunks = create_chunks_from_content(&file_content, slice_mode, &config).await;
+        let selected_chunker = chunker
+            .unwrap_or_else(|| detect_default_chunker(&file_content.path, &file_content.namespace));
+        let opts = ChunkOpts::new(
+            selected_chunker,
+            selected_chunker.slice_mode(slice_mode),
+            outer_synthesis.clone(),
+        );
+        let provider = selected_chunker.into_provider();
+        let chunks = match provider.chunk(&file_content, &opts).await {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                warn!(
+                    "Chunker {} failed for {}: {}",
+                    provider.name(),
+                    file_content.path.display(),
+                    err
+                );
+                Vec::new()
+            }
+        };
         let count = chunks.len();
 
         if tx
@@ -1053,212 +1068,6 @@ async fn stage_chunk_content(
     }
 
     info!("Chunker stage complete");
-}
-
-/// Heuristic: does this file look like a Claude Code / Codex / chat transcript?
-///
-/// Triggers the structured slicing path which builds semantic cards from
-/// turn boundaries instead of relying on TF-IDF over raw markdown soup.
-/// Conservative — fires only when at least two distinct role headings appear,
-/// so plain markdown notes still flow through the unstructured path.
-fn looks_like_markdown_transcript(text: &str, path: &Path) -> bool {
-    // Filename hints (Claude Code / Codex / mass exports use these patterns).
-    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-        let lower = name.to_ascii_lowercase();
-        if lower.starts_with("claude")
-            || lower.starts_with("codex")
-            || lower.contains("transcript")
-            || lower.contains("__clean")
-            || lower.contains("__dupe__")
-        {
-            return true;
-        }
-    }
-
-    // Content-shape hint: at least one user heading AND one assistant heading
-    // within the first ~200 lines. Cheap; bail early on long files.
-    let mut user_seen = false;
-    let mut assistant_seen = false;
-    for (idx, line) in text.lines().enumerate() {
-        if idx > 200 {
-            break;
-        }
-        let trimmed = line.trim();
-        let lowered = trimmed.to_ascii_lowercase();
-        if lowered == "## user"
-            || lowered == "### user"
-            || lowered == "[user]"
-            || lowered == "user request:"
-        {
-            user_seen = true;
-        } else if lowered == "## assistant"
-            || lowered == "### assistant"
-            || lowered == "[assistant]"
-            || lowered == "assistant response:"
-        {
-            assistant_seen = true;
-        }
-        if user_seen && assistant_seen {
-            return true;
-        }
-    }
-    false
-}
-
-/// Create chunks from file content based on slicing mode.
-async fn create_chunks_from_content(
-    content: &FileContent,
-    slice_mode: SliceMode,
-    config: &OnionSliceConfig,
-) -> Vec<Chunk> {
-    let is_transcript = looks_like_markdown_transcript(&content.text, &content.path);
-
-    // Tagging the metadata with `format: "markdown_transcript"` flips
-    // structured.rs::is_structured_conversation() to true, which routes the
-    // slicer to semantic-card outer/middle/inner — bypassing the TF-IDF
-    // keyword splat that pollutes transcript namespaces (P2).
-    let mut metadata = serde_json::json!({
-        "path": content.path.to_str(),
-        "content_hash": &content.content_hash,
-        "source_hash": &content.content_hash,
-        "slice_mode": match slice_mode {
-            SliceMode::Onion => "onion",
-            SliceMode::OnionFast => "onion-fast",
-            SliceMode::Flat => "flat",
-        },
-    });
-    if is_transcript && let serde_json::Value::Object(ref mut map) = metadata {
-        map.insert(
-            "format".to_string(),
-            serde_json::json!("markdown_transcript"),
-        );
-        map.insert("type".to_string(), serde_json::json!("conversation"));
-    }
-
-    match slice_mode {
-        SliceMode::Onion => {
-            // `_async` resolves `OuterSynthesis::Llm` against Ollama before slicing
-            // (or skips the call when set to `Keyword`); failures fall back
-            // transparently to the keyword outer so the pipeline never stalls on
-            // a flaky LLM endpoint (spec P3).
-            let slices = create_onion_slices_async(&content.text, &metadata, config).await;
-            slices_to_chunks(slices, content)
-        }
-        SliceMode::OnionFast => {
-            let slices = create_onion_slices_fast_async(&content.text, &metadata, config).await;
-            slices_to_chunks(slices, content)
-        }
-        SliceMode::Flat => create_flat_chunks(&content.text, content, metadata),
-    }
-}
-
-/// Convert onion slices to pipeline chunks.
-fn slices_to_chunks(slices: Vec<OnionSlice>, content: &FileContent) -> Vec<Chunk> {
-    slices
-        .into_iter()
-        .map(|slice| {
-            let chunk_hash = crate::rag::compute_content_hash(&slice.content);
-            let metadata = serde_json::json!({
-                "path": content.path.to_str(),
-                "source_hash": &content.content_hash,
-                "chunk_hash": &chunk_hash,
-                "layer": slice.layer.name(),
-            });
-
-            Chunk {
-                id: slice.id,
-                content: slice.content,
-                source_path: content.path.clone(),
-                namespace: content.namespace.clone(),
-                chunk_hash,
-                source_hash: content.content_hash.clone(),
-                layer: slice.layer.as_u8(),
-                parent_id: slice.parent_id,
-                children_ids: slice.children_ids,
-                keywords: slice.keywords,
-                metadata,
-            }
-        })
-        .collect()
-}
-
-/// Create flat chunks from content.
-fn create_flat_chunks(
-    text: &str,
-    content: &FileContent,
-    base_metadata: serde_json::Value,
-) -> Vec<Chunk> {
-    let chunks = split_into_chunks(text, 512, 128);
-    let total_chunks = chunks.len();
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(idx, chunk_text)| {
-            let chunk_hash = crate::rag::compute_content_hash(&chunk_text);
-            let mut metadata = base_metadata.clone();
-            if let serde_json::Value::Object(ref mut map) = metadata {
-                map.insert("chunk_index".to_string(), serde_json::json!(idx));
-                map.insert("total_chunks".to_string(), serde_json::json!(total_chunks));
-                map.insert(
-                    "source_hash".to_string(),
-                    serde_json::json!(&content.content_hash),
-                );
-                map.insert("chunk_hash".to_string(), serde_json::json!(&chunk_hash));
-            }
-
-            let id = format!(
-                "{}_{}_{}",
-                content.path.to_str().unwrap_or("unknown"),
-                content.content_hash.get(..8).unwrap_or(""),
-                idx
-            );
-
-            Chunk {
-                id,
-                content: chunk_text,
-                source_path: content.path.clone(),
-                namespace: content.namespace.clone(),
-                chunk_hash,
-                source_hash: content.content_hash.clone(),
-                layer: 0,
-                parent_id: None,
-                children_ids: vec![],
-                keywords: vec![],
-                metadata,
-            }
-        })
-        .collect()
-}
-
-/// Simple chunking with overlap.
-fn split_into_chunks(text: &str, target_size: usize, overlap: usize) -> Vec<String> {
-    let mut char_offsets: Vec<usize> = text.char_indices().map(|(byte_idx, _)| byte_idx).collect();
-    let len = char_offsets.len();
-
-    if len <= target_size {
-        return vec![text.to_string()];
-    }
-
-    char_offsets.push(text.len());
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < len {
-        let end = (start + target_size).min(len);
-        let start_byte = char_offsets[start];
-        let end_byte = char_offsets[end];
-        chunks.push(text[start_byte..end_byte].to_string());
-
-        if end >= len {
-            break;
-        }
-
-        start = end.saturating_sub(overlap);
-    }
-
-    chunks
 }
 
 // =============================================================================
@@ -1714,6 +1523,7 @@ pub async fn run_pipeline(
     let storage_for_storage = storage;
     let ns_for_reader = namespace.clone();
     let slice_mode = config.slice_mode;
+    let chunker = config.chunker;
     let outer_synthesis = config.outer_synthesis.clone();
     let dedup_enabled = config.dedup_enabled;
 
@@ -1730,6 +1540,7 @@ pub async fn run_pipeline(
         rx1,
         tx2,
         slice_mode,
+        chunker,
         outer_synthesis,
         observer.clone(),
     ));
@@ -1773,7 +1584,7 @@ mod tests {
     #[test]
     fn test_split_into_chunks_short_text() {
         let text = "Hello world";
-        let chunks = split_into_chunks(text, 100, 20);
+        let chunks = crate::rag::provider::split_into_chunks(text, 100, 20);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], "Hello world");
     }
@@ -1781,7 +1592,7 @@ mod tests {
     #[test]
     fn test_split_into_chunks_with_overlap() {
         let text = "abcdefghijklmnopqrstuvwxyz";
-        let chunks = split_into_chunks(text, 10, 3);
+        let chunks = crate::rag::provider::split_into_chunks(text, 10, 3);
         assert!(chunks.len() > 1);
         assert_eq!(chunks[0].len(), 10);
         assert!(chunks[0].ends_with(&chunks[1][..3]));

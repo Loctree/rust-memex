@@ -8,8 +8,8 @@ pub use rust_memex::contracts::audit::{
     AuditRecommendation, AuditResult as NamespaceAuditResult, ChunkQuality, QualityTier,
 };
 use rust_memex::{
-    EmbeddingClient, EmbeddingConfig, RAGPipeline, ReindexJob, ReprocessJob, SliceMode,
-    StorageManager, diagnostics, export_namespace_jsonl_stream, import_jsonl_file,
+    ChunkerKind, EmbeddingClient, EmbeddingConfig, RAGPipeline, ReindexJob, ReprocessJob,
+    SliceMode, StorageManager, diagnostics, export_namespace_jsonl_stream, import_jsonl_file,
     reindex_namespace, reprocess_jsonl_file,
 };
 
@@ -17,6 +17,7 @@ pub struct ReprocessConfig {
     pub namespace: String,
     pub input: PathBuf,
     pub slice_mode: SliceMode,
+    pub chunker: Option<ChunkerKind>,
     pub preprocess: bool,
     pub skip_existing: bool,
     pub dry_run: bool,
@@ -27,6 +28,7 @@ pub struct ReindexConfig {
     pub source_namespace: String,
     pub target_namespace: String,
     pub slice_mode: SliceMode,
+    pub chunker: Option<ChunkerKind>,
     pub preprocess: bool,
     pub skip_existing: bool,
     pub dry_run: bool,
@@ -123,6 +125,7 @@ pub async fn run_reprocess(
         namespace,
         input,
         slice_mode,
+        chunker,
         preprocess,
         skip_existing,
         dry_run,
@@ -139,6 +142,7 @@ pub async fn run_reprocess(
             input_path: input.clone(),
             target_namespace: namespace.clone(),
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,
@@ -212,6 +216,7 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
         source_namespace,
         target_namespace,
         slice_mode,
+        chunker,
         preprocess,
         skip_existing,
         dry_run,
@@ -228,6 +233,7 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
             source_namespace: source_namespace.clone(),
             target_namespace: target_namespace.clone(),
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,

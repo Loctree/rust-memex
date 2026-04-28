@@ -57,6 +57,9 @@ pub use query::{
 };
 pub use rag::{
     Chunk as PipelineChunk,
+    ChunkOpts,
+    ChunkProvider,
+    ChunkerKind,
     ContextPrefixConfig,
     CrossStoreRecoveryBatchReport,
     CrossStoreRecoveryReport,
@@ -82,6 +85,7 @@ pub use rag::{
     compute_content_hash,
     create_enriched_chunks,
     create_onion_slices,
+    detect_default_chunker,
     inspect_cross_store_recovery,
     repair_cross_store_recovery,
     // Async pipeline exports

@@ -288,6 +288,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
         }
         Some(Commands::Index {
             path,
+            source,
             namespace,
             recursive,
             glob,
@@ -295,6 +296,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             preprocess,
             sanitize_metadata,
             slice_mode,
+            chunker,
             outer_synthesis,
             ollama_model,
             ollama_endpoint,
@@ -307,6 +309,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             pipeline_governor,
             parallel,
         }) => {
+            let path = path
+                .or(source)
+                .ok_or_else(|| anyhow::anyhow!("index requires PATH or --source <PATH>"))?;
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             let _cache_mb = cli.cache_mb.or(cfg.file_cfg.cache_mb).unwrap_or(4096);
             let preprocess = preprocess || cfg.file_cfg.preprocessing_enabled.unwrap_or(false);
@@ -344,6 +349,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 preprocess,
                 sanitize_metadata,
                 slice_mode,
+                chunker,
                 outer_synthesis,
                 dedup: dedup_effective,
                 embedding_config: cfg.embedding_config,
@@ -764,6 +770,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             namespace,
             input,
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,
@@ -787,6 +794,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     namespace,
                     input,
                     slice_mode,
+                    chunker,
                     preprocess,
                     skip_existing,
                     dry_run,
@@ -800,6 +808,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             namespace,
             target_namespace,
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,
@@ -825,6 +834,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     source_namespace: namespace,
                     target_namespace,
                     slice_mode,
+                    chunker,
                     preprocess,
                     skip_existing,
                     dry_run,

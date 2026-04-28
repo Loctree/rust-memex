@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::{
-    ChromaDocument, PreprocessingConfig, Preprocessor, RAGPipeline, SliceMode, StorageManager,
-    compute_content_hash, path_utils,
+    ChromaDocument, ChunkerKind, PreprocessingConfig, Preprocessor, RAGPipeline, SliceMode,
+    StorageManager, compute_content_hash, detect_default_chunker, path_utils,
 };
 
 const EXPORT_PAGE_SIZE: usize = 5_000;
@@ -76,6 +76,7 @@ pub struct ReprocessJob {
     pub input_path: PathBuf,
     pub target_namespace: String,
     pub slice_mode: SliceMode,
+    pub chunker: Option<ChunkerKind>,
     pub preprocess: bool,
     pub skip_existing: bool,
     pub dry_run: bool,
@@ -86,6 +87,7 @@ pub struct ReindexJob {
     pub source_namespace: String,
     pub target_namespace: String,
     pub slice_mode: SliceMode,
+    pub chunker: Option<ChunkerKind>,
     pub preprocess: bool,
     pub skip_existing: bool,
     pub dry_run: bool,
@@ -108,6 +110,7 @@ struct RebuildPlan {
     source_records: usize,
     docs: Vec<ReprocessDocument>,
     slice_mode: SliceMode,
+    chunker: Option<ChunkerKind>,
     preprocess: bool,
     skip_existing: bool,
     dry_run: bool,
@@ -296,6 +299,7 @@ where
         input_path,
         target_namespace,
         slice_mode,
+        chunker,
         preprocess,
         skip_existing,
         dry_run,
@@ -325,6 +329,7 @@ where
             source_records,
             docs,
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,
@@ -370,6 +375,7 @@ where
         source_namespace,
         target_namespace,
         slice_mode,
+        chunker,
         preprocess,
         skip_existing,
         dry_run,
@@ -436,6 +442,7 @@ where
             source_records,
             docs,
             slice_mode,
+            chunker,
             preprocess,
             skip_existing,
             dry_run,
@@ -557,16 +564,20 @@ fn reprocess_slice_mode_name(slice_mode: SliceMode) -> &'static str {
     }
 }
 
-fn prepare_reprocess_metadata(
-    metadata: &Value,
-    source_record_id: &str,
-    source_text_hash: &str,
+struct ReprocessMetadataInput<'a> {
+    metadata: &'a Value,
+    source_record_id: &'a str,
+    source_text_hash: &'a str,
     collapsed_records: usize,
     slice_mode: SliceMode,
-    source_label: &str,
+    chunker: Option<ChunkerKind>,
+    namespace: &'a str,
+    source_label: &'a str,
     preprocess: bool,
-) -> Value {
-    let mut map = match metadata.clone() {
+}
+
+fn prepare_reprocess_metadata(input: ReprocessMetadataInput<'_>) -> Value {
+    let mut map = match input.metadata.clone() {
         Value::Object(map) => map,
         _ => Map::new(),
     };
@@ -577,26 +588,34 @@ fn prepare_reprocess_metadata(
         "children_ids",
         "original_id",
         "slice_mode",
+        "chunker",
         "content_hash",
     ] {
         map.remove(key);
     }
 
+    let selected_chunker = input
+        .chunker
+        .unwrap_or_else(|| detect_default_chunker(Path::new(input.source_label), input.namespace));
     map.insert(
         "slice_mode".to_string(),
-        json!(reprocess_slice_mode_name(slice_mode)),
+        json!(reprocess_slice_mode_name(input.slice_mode)),
     );
+    map.insert("chunker".to_string(), json!(selected_chunker.name()));
     map.insert(
         "reprocess_source_record_id".to_string(),
-        json!(source_record_id),
+        json!(input.source_record_id),
     );
-    map.insert("reprocess_source_hash".to_string(), json!(source_text_hash));
+    map.insert(
+        "reprocess_source_hash".to_string(),
+        json!(input.source_text_hash),
+    );
     map.insert(
         "reprocess_collapsed_records".to_string(),
-        json!(collapsed_records),
+        json!(input.collapsed_records),
     );
-    map.insert("reprocess_source".to_string(), json!(source_label));
-    if preprocess {
+    map.insert("reprocess_source".to_string(), json!(input.source_label));
+    if input.preprocess {
         map.insert("reprocess_preprocessed".to_string(), json!(true));
     }
 
@@ -681,6 +700,7 @@ where
         source_records,
         docs,
         slice_mode,
+        chunker,
         preprocess,
         skip_existing,
         dry_run,
@@ -753,15 +773,17 @@ where
             continue;
         }
 
-        let metadata = prepare_reprocess_metadata(
-            &doc.metadata,
-            &doc.source_record_id,
-            &doc.source_text_hash,
-            doc.collapsed_records,
+        let metadata = prepare_reprocess_metadata(ReprocessMetadataInput {
+            metadata: &doc.metadata,
+            source_record_id: &doc.source_record_id,
+            source_text_hash: &doc.source_text_hash,
+            collapsed_records: doc.collapsed_records,
             slice_mode,
-            &source_label,
+            chunker,
+            namespace: &namespace,
+            source_label: &source_label,
             preprocess,
-        );
+        });
 
         if existing.is_some() {
             stats.replaced_documents += 1;
@@ -867,18 +889,21 @@ mod tests {
             "project": "vista"
         });
 
-        let prepared = prepare_reprocess_metadata(
-            &metadata,
-            "core-1",
-            "fresh-hash",
-            4,
-            SliceMode::OnionFast,
-            "legacy.jsonl",
-            true,
-        );
+        let prepared = prepare_reprocess_metadata(ReprocessMetadataInput {
+            metadata: &metadata,
+            source_record_id: "core-1",
+            source_text_hash: "fresh-hash",
+            collapsed_records: 4,
+            slice_mode: SliceMode::OnionFast,
+            chunker: Some(ChunkerKind::Onion),
+            namespace: "kb:test",
+            source_label: "legacy.jsonl",
+            preprocess: true,
+        });
 
         assert_eq!(prepared["project"], "vista");
         assert_eq!(prepared["slice_mode"], "onion-fast");
+        assert_eq!(prepared["chunker"], "onion");
         assert_eq!(prepared["reprocess_source_record_id"], "core-1");
         assert_eq!(prepared["reprocess_source_hash"], "fresh-hash");
         assert_eq!(prepared["reprocess_collapsed_records"], 4);
