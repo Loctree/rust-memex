@@ -1452,6 +1452,15 @@ mod tests {
     }
 
     #[test]
+    fn default_token_ceiling_stays_above_long_transcript_floor() {
+        let config = TokenConfig::default();
+
+        assert_eq!(DEFAULT_MAX_TOKENS, 35_000);
+        assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!(config.max_tokens >= 35_000);
+    }
+
+    #[test]
     fn test_chunk_validation() {
         let config = TokenConfig::default().with_max_tokens(100);
 

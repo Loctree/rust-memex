@@ -39,6 +39,8 @@ struct ReprocessRequest {
     preprocess: bool,
     #[serde(default)]
     skip_existing: bool,
+    #[serde(default)]
+    allow_duplicates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +54,8 @@ struct ReindexRequest {
     preprocess: bool,
     #[serde(default)]
     skip_existing: bool,
+    #[serde(default)]
+    allow_duplicates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +97,7 @@ async fn sse_reprocess_handler(
     let chunker = request.chunker;
     let preprocess = request.preprocess;
     let skip_existing = request.skip_existing;
+    let allow_duplicates = request.allow_duplicates;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let rag = state.rag.clone();
 
@@ -106,6 +111,7 @@ async fn sse_reprocess_handler(
                 "chunker": chunker.map(|kind| kind.name()),
                 "preprocess": preprocess,
                 "skip_existing": skip_existing,
+                "allow_duplicates": allow_duplicates,
             }),
         ));
 
@@ -118,6 +124,7 @@ async fn sse_reprocess_handler(
                 chunker,
                 preprocess,
                 skip_existing,
+                allow_duplicates,
                 dry_run: false,
             },
             |progress| {
@@ -175,6 +182,7 @@ async fn sse_reindex_handler(
     let chunker = request.chunker;
     let preprocess = request.preprocess;
     let skip_existing = request.skip_existing;
+    let allow_duplicates = request.allow_duplicates;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let rag = state.rag.clone();
 
@@ -188,6 +196,7 @@ async fn sse_reindex_handler(
                 "chunker": chunker.map(|kind| kind.name()),
                 "preprocess": preprocess,
                 "skip_existing": skip_existing,
+                "allow_duplicates": allow_duplicates,
             }),
         ));
 
@@ -200,6 +209,7 @@ async fn sse_reindex_handler(
                 chunker,
                 preprocess,
                 skip_existing,
+                allow_duplicates,
                 dry_run: false,
             },
             |progress| {
