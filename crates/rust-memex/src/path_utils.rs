@@ -262,6 +262,18 @@ pub async fn safe_read_to_string_async(path: &Path) -> Result<(PathBuf, String)>
     Ok((validated, contents))
 }
 
+/// Async variant: validate path and open a file in one atomic step.
+pub async fn safe_open_file_async(path: &Path) -> Result<(PathBuf, tokio::fs::File)> {
+    let validated = validate_read_path(path)?;
+    // Atomic wrapper: `validated` comes from validate_read_path(), which
+    // canonicalizes the path and enforces the allowed-base policy.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = tokio::fs::File::open(&validated)
+        .await
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+    Ok((validated, file))
+}
+
 /// Async variant: validate path and read directory in one atomic step.
 pub async fn safe_read_dir(path: &Path) -> Result<(PathBuf, tokio::fs::ReadDir)> {
     let validated = validate_read_path(path)?;

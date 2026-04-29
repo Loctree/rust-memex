@@ -183,10 +183,7 @@ pub async fn import_jsonl_file(
     input: &Path,
     skip_existing: bool,
 ) -> Result<ImportOutcome> {
-    let validated = path_utils::validate_read_path(input)?;
-    let file = tokio::fs::File::open(&validated)
-        .await
-        .map_err(|err| anyhow!("Failed to open '{}': {}", validated.display(), err))?;
+    let (_validated, file) = path_utils::safe_open_file_async(input).await?;
     let reader = BufReader::new(file);
     import_jsonl_reader(rag, namespace, skip_existing, reader).await
 }

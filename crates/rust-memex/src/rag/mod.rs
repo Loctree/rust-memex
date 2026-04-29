@@ -3664,7 +3664,7 @@ impl RAGPipeline {
                 })
                 .unwrap_or(id);
             let file_content = FileContent {
-                path: std::path::PathBuf::from(path),
+                path: metadata_path_label(path),
                 text: text.to_string(),
                 namespace: namespace.to_string(),
                 content_hash: content_hash.clone(),
@@ -4654,6 +4654,13 @@ fn canonical_project_identity(value: &str) -> String {
         "loctree" | "vetcoders" => "vetcoders".to_string(),
         other => other.to_string(),
     }
+}
+
+fn metadata_path_label(path: &str) -> std::path::PathBuf {
+    // This path is provenance metadata passed to the chunker, not a filesystem
+    // read target. Real file I/O in this module goes through path_utils.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::path::PathBuf::from(path)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -16,7 +16,7 @@ keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 
 [workspace.dependencies]
-aicx-parser = { version = "0.1.0", path = "../aicx/crates/aicx-parser" }
+aicx-parser = "0.1.0"
 anyhow = "1.0"
 argon2 = "0.5"
 arrow-array = "56.2"
@@ -55,6 +55,7 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"
 
 [patch.crates-io]
+aicx-parser = { path = "../aicx/crates/aicx-parser" }
 # Keep local directory namespaces without pulling unused cloud backends into the graph.
 lance-namespace-impls = { path = "vendor/lance-namespace-impls" }
 
