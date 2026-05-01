@@ -302,6 +302,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             ollama_endpoint,
             dedup,
             allow_duplicates,
+            strict,
+            max_failure_rate,
+            json,
             progress,
             resume,
             pipeline,
@@ -352,6 +355,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 chunker,
                 outer_synthesis,
                 dedup: dedup_effective,
+                strict,
+                max_failure_rate,
+                json,
                 embedding_config: cfg.embedding_config,
                 show_progress: progress,
                 resume,
@@ -536,10 +542,11 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             }
             let meta: serde_json::Value = serde_json::from_str(&metadata)
                 .map_err(|e| anyhow::anyhow!("Invalid metadata JSON: {}", e))?;
+            let storage = Arc::new(StorageManager::new_lance_only(&cfg.db_path).await?);
+            storage.require_current_schema_for_writes().await?;
             let embedding_client = Arc::new(Mutex::new(
                 EmbeddingClient::new(&cfg.embedding_config).await?,
             ));
-            let storage = Arc::new(StorageManager::new_lance_only(&cfg.db_path).await?);
             let rag = RAGPipeline::new(embedding_client, storage.clone()).await?;
             rag.memory_upsert(&namespace, id.clone(), content.clone(), meta)
                 .await?;
@@ -774,6 +781,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             preprocess,
             skip_existing,
             allow_duplicates,
+            strict,
+            max_failure_rate,
+            json,
             dry_run,
             db_path: cmd_db_path,
         }) => {
@@ -799,6 +809,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     preprocess,
                     skip_existing,
                     allow_duplicates,
+                    strict,
+                    max_failure_rate,
+                    json,
                     dry_run,
                     db_path,
                 },
@@ -814,6 +827,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             preprocess,
             skip_existing,
             allow_duplicates,
+            strict,
+            max_failure_rate,
+            json,
             dry_run,
             db_path: cmd_db_path,
         }) => {
@@ -841,6 +857,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                     preprocess,
                     skip_existing,
                     allow_duplicates,
+                    strict,
+                    max_failure_rate,
+                    json,
                     dry_run,
                     db_path,
                 },
@@ -865,13 +884,27 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             run_purge_quality(threshold, confirm, json, cfg.db_path).await
         }
+        Some(Commands::MigrateSchema { target, check_only }) => {
+            let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
+            run_migrate_schema(target, check_only, cfg.db_path).await
+        }
         Some(Commands::BackfillHashes {
             namespace,
             dry_run,
             json,
+            strict,
+            max_failure_rate,
         }) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
-            run_backfill_hashes(namespace, dry_run, json, cfg.db_path).await
+            run_backfill_hashes(
+                namespace,
+                dry_run,
+                json,
+                strict,
+                max_failure_rate,
+                cfg.db_path,
+            )
+            .await
         }
         Some(Commands::Auth { action }) => run_auth_command(action, cli.token_store_path).await,
         Some(Commands::Serve) | None => {

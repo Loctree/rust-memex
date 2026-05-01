@@ -17,6 +17,7 @@ use rust_memex::{
     migrate_namespace_atomic, rag::PipelineGovernorConfig, repair_writes as execute_repair_writes,
 };
 
+use crate::cli::batch_policy::{BatchFailurePolicy, BatchRunSummary};
 use crate::cli::definition::*;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -160,6 +161,9 @@ pub struct BatchIndexConfig {
     /// guard that rejects `Llm + !pipeline` instead of silently downgrading.
     pub outer_synthesis: OuterSynthesis,
     pub dedup: bool,
+    pub strict: bool,
+    pub max_failure_rate: f64,
+    pub json: bool,
     pub embedding_config: EmbeddingConfig,
     /// Show progress bar with calibration-based ETA
     pub show_progress: bool,
@@ -228,7 +232,7 @@ pub enum FileIndexResult {
     /// File was skipped (already in checkpoint)
     SkippedResume,
     /// Indexing failed
-    Failed,
+    Failed { path: String, error: String },
 }
 
 fn pipeline_embed_rate(snapshot: &PipelineSnapshot) -> f64 {
@@ -486,6 +490,9 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         chunker,
         outer_synthesis,
         dedup,
+        strict,
+        max_failure_rate,
+        json,
         embedding_config,
         show_progress,
         resume,
@@ -494,6 +501,7 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         pipeline_governor,
         parallel,
     } = config;
+    let failure_policy = BatchFailurePolicy::new(strict, max_failure_rate)?;
 
     // Spec P3: only the --pipeline path threads `OuterSynthesis` through to the
     // async slicers. The legacy non-pipeline path uses `OnionSliceConfig::default()`
@@ -528,6 +536,9 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
     if total == 0 {
         eprintln!("No files found matching criteria");
+        if json {
+            BatchRunSummary::new(0, 0, 0, Vec::new()).emit_json()?;
+        }
         return Ok(());
     }
 
@@ -571,8 +582,9 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     }
 
     // Use full storage for CLI batch indexing to ensure BM25 is written
-    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
     let storage = Arc::new(StorageManager::new(&expanded_db).await?);
+    storage.require_current_schema_for_writes().await?;
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
 
     let ns_name = namespace.as_deref().unwrap_or("rag");
 
@@ -623,6 +635,9 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             eprintln!("Pipeline resume complete: all files already committed");
             if resume {
                 IndexCheckpoint::delete(&db_path, ns_name);
+            }
+            if json {
+                BatchRunSummary::new(0, 0, total, Vec::new()).emit_json()?;
             }
             return Ok(());
         }
@@ -753,6 +768,22 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 result.stats.files_failed
             );
         }
+
+        let summary = BatchRunSummary::new(
+            result.stats.files_committed,
+            result.stats.files_failed,
+            total,
+            result.errors.iter().map(ToString::to_string).collect(),
+        );
+        if json {
+            summary.emit_json()?;
+        } else if summary.failed > 0 {
+            eprintln!(
+                "WARNING: {}/{} files failed to index. See log above.",
+                summary.failed, summary.total
+            );
+        }
+        summary.enforce(failure_policy, "files")?;
 
         return Ok(());
     }
@@ -1003,7 +1034,10 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         eprintln!("  -> {} FAILED: {}", display_path, e);
                     }
 
-                    FileIndexResult::Failed
+                    FileIndexResult::Failed {
+                        path: display_path,
+                        error: e.to_string(),
+                    }
                 }
             };
 
@@ -1023,6 +1057,10 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 // Task panicked - count as failure
                 failed_count.fetch_add(1, Ordering::SeqCst);
                 eprintln!("Task panicked: {}", e);
+                results.push(FileIndexResult::Failed {
+                    path: "<task>".to_string(),
+                    error: e.to_string(),
+                });
             }
         }
     }
@@ -1107,6 +1145,24 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             failed
         );
     }
+
+    let errors = results
+        .iter()
+        .filter_map(|result| match result {
+            FileIndexResult::Failed { path, error } => Some(format!("{path}: {error}")),
+            _ => None,
+        })
+        .collect();
+    let summary = BatchRunSummary::new(indexed, failed, total, errors);
+    if json {
+        summary.emit_json()?;
+    } else if summary.failed > 0 {
+        eprintln!(
+            "WARNING: {}/{} files failed to index. See log above.",
+            summary.failed, summary.total
+        );
+    }
+    summary.enforce(failure_policy, "files")?;
 
     Ok(())
 }
@@ -1247,6 +1303,9 @@ mod tests {
             chunker: None,
             outer_synthesis,
             dedup: false,
+            strict: false,
+            max_failure_rate: 1.0,
+            json: false,
             embedding_config: EmbeddingConfig::default(),
             show_progress: false,
             resume: false,

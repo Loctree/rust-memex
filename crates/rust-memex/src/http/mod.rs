@@ -87,7 +87,7 @@ use crate::diagnostics::{
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
 use crate::search::{HybridSearchResult, SearchMode};
-use crate::storage::ChromaDocument;
+use crate::storage::{ChromaDocument, SchemaMismatchWriteError};
 
 const DASHBOARD_SESSION_COOKIE: &str = "rust_memex_dashboard_session";
 const DIAGNOSTIC_APPROVAL_TTL: Duration = Duration::from_secs(300);
@@ -3187,8 +3187,15 @@ async fn sse_namespaces_handler(
 async fn upsert_handler(
     State(state): State<HttpState>,
     Json(req): Json<UpsertRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let metadata = req.metadata.unwrap_or(serde_json::json!({}));
+
+    state
+        .rag
+        .storage_manager()
+        .require_current_schema_for_writes()
+        .await
+        .map_err(|e| write_error_response("upsert", &req.namespace, e))?;
 
     state
         .rag
@@ -3199,10 +3206,7 @@ async fn upsert_handler(
             metadata,
         )
         .await
-        .map_err(|e| {
-            error!("Upsert error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| write_error_response("upsert", &req.namespace, e))?;
 
     mark_namespace_activity(&state, &req.namespace).await;
 
@@ -3217,7 +3221,7 @@ async fn upsert_handler(
 async fn index_handler(
     State(state): State<HttpState>,
     Json(req): Json<IndexRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use crate::rag::SliceMode;
 
     let mode = match req.slice_mode.as_str() {
@@ -3225,6 +3229,13 @@ async fn index_handler(
         "onion_fast" | "fast" => SliceMode::OnionFast,
         _ => SliceMode::Flat,
     };
+
+    state
+        .rag
+        .storage_manager()
+        .require_current_schema_for_writes()
+        .await
+        .map_err(|e| write_error_response("index", &req.namespace, e))?;
 
     // Generate ID from content hash
     let id = format!(
@@ -3246,10 +3257,7 @@ async fn index_handler(
             mode,
         )
         .await
-        .map_err(|e| {
-            error!("Index error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| write_error_response("index", &req.namespace, e))?;
 
     mark_namespace_activity(&state, &req.namespace).await;
 
@@ -3259,6 +3267,52 @@ async fn index_handler(
         "id": result_id,
         "slice_mode": req.slice_mode
     })))
+}
+
+fn write_error_response(
+    operation: &str,
+    namespace: &str,
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(schema_error) = error.downcast_ref::<SchemaMismatchWriteError>() {
+        let remediation = schema_error.remediation();
+        error!(
+            error_kind = "schema_mismatch",
+            operation = %operation,
+            namespace = %namespace,
+            db_path = %schema_error.db_path(),
+            missing_columns = ?schema_error.missing_columns(),
+            remediation = %remediation,
+            file = file!(),
+            line = line!(),
+            "HTTP write failed due to schema mismatch"
+        );
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({
+                "error": "schema_mismatch",
+                "error_kind": "schema_mismatch",
+                "missing_columns": schema_error.missing_columns(),
+                "remediation": remediation,
+            })),
+        );
+    }
+
+    error!(
+        operation = %operation,
+        namespace = %namespace,
+        file = file!(),
+        line = line!(),
+        "HTTP write failed: {error}"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "internal",
+            "error_kind": "internal",
+            "message": error.to_string(),
+        })),
+    )
 }
 
 /// Expand onion slice - get children (GET /expand/:ns/:id)

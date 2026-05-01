@@ -5,6 +5,8 @@ use rust_memex::{
     path_utils,
 };
 
+pub const DEFAULT_DB_PATH: &str = "~/.rmcp-servers/rust-memex/lancedb";
+
 /// Standard config discovery locations (in priority order)
 const CONFIG_SEARCH_PATHS: &[&str] = &[
     "~/.rmcp-servers/rust-memex/config.toml",
@@ -58,6 +60,7 @@ pub fn load_or_discover_config(
 }
 
 #[derive(serde::Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Legacy compatibility field. Parsed but ignored when building ServerConfig.
     pub mode: Option<String>,
@@ -99,6 +102,7 @@ pub struct FileConfig {
 }
 
 #[derive(serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardOidcFileConfig {
     pub issuer_url: String,
     pub client_id: String,
@@ -120,9 +124,14 @@ pub fn default_dashboard_oidc_scopes() -> Vec<String> {
 
 /// New embedding configuration from TOML
 #[derive(serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingsFileConfig {
     #[serde(default = "default_dimension")]
     pub required_dimension: usize,
+    #[serde(default = "default_max_batch_chars")]
+    pub max_batch_chars: usize,
+    #[serde(default = "default_max_batch_items")]
+    pub max_batch_items: usize,
     #[serde(default)]
     pub providers: Vec<ProviderFileConfig>,
     #[serde(default)]
@@ -133,10 +142,20 @@ pub fn default_dimension() -> usize {
     DEFAULT_REQUIRED_DIMENSION
 }
 
+pub fn default_max_batch_chars() -> usize {
+    EmbeddingConfig::default().max_batch_chars
+}
+
+pub fn default_max_batch_items() -> usize {
+    EmbeddingConfig::default().max_batch_items
+}
+
 impl Default for EmbeddingsFileConfig {
     fn default() -> Self {
         Self {
             required_dimension: default_dimension(),
+            max_batch_chars: default_max_batch_chars(),
+            max_batch_items: default_max_batch_items(),
             providers: vec![],
             reranker: None,
         }
@@ -144,6 +163,7 @@ impl Default for EmbeddingsFileConfig {
 }
 
 #[derive(serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderFileConfig {
     pub name: String,
     pub base_url: String,
@@ -163,6 +183,7 @@ pub fn default_endpoint() -> String {
 }
 
 #[derive(serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RerankerFileConfig {
     pub base_url: String,
     pub model: String,
@@ -176,6 +197,7 @@ pub fn default_rerank_endpoint() -> String {
 
 /// Legacy MLX embedding server configuration from TOML (deprecated)
 #[derive(serde::Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MlxFileConfig {
     #[serde(default)]
     pub disabled: bool,
@@ -206,6 +228,7 @@ impl MlxFileConfig {
 
 /// Maintenance configuration for automatic optimization
 #[derive(serde::Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceFileConfig {
     /// Enable automatic optimization when version threshold is exceeded
     #[serde(default)]
@@ -225,6 +248,33 @@ pub fn default_version_threshold() -> usize {
 }
 
 impl FileConfig {
+    pub fn resolve_db_path(
+        cli_db_path: Option<&str>,
+        file_db_path: Option<&str>,
+        warn_on_default: bool,
+        expand: bool,
+    ) -> String {
+        let db_path = cli_db_path
+            .map(str::to_string)
+            .or_else(|| file_db_path.map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
+
+        if cli_db_path.is_none() && file_db_path.is_none() && warn_on_default {
+            let displayed_db_path = shellexpand::tilde(&db_path).to_string();
+            eprintln!(
+                "WARN: config db_path not specified at top level, defaulting to {}. \
+If you intended a custom path, ensure `db_path` appears before any section such as [embeddings] in config.toml.",
+                displayed_db_path
+            );
+        }
+
+        if expand {
+            shellexpand::tilde(&db_path).to_string()
+        } else {
+            db_path
+        }
+    }
+
     /// Convert to EmbeddingConfig - new format takes precedence over legacy
     pub fn resolve_embedding_config(&self) -> EmbeddingConfig {
         // New format takes precedence, even when it only overrides dimension or reranker.
@@ -243,6 +293,8 @@ impl FileConfig {
             };
 
             config.required_dimension = emb.required_dimension;
+            config.max_batch_chars = emb.max_batch_chars;
+            config.max_batch_items = emb.max_batch_items;
 
             if !emb.providers.is_empty() {
                 config.providers = emb
@@ -298,11 +350,12 @@ impl ResolvedConfig {
         let embedding_config = file_cfg.resolve_embedding_config();
         let maintenance_config = file_cfg.maintenance.clone();
 
-        let db_path = cli_db_path
-            .map(|s| s.to_string())
-            .or_else(|| file_cfg.db_path.clone())
-            .unwrap_or_else(|| "~/.rmcp-servers/rust-memex/lancedb".to_string());
-        let db_path = shellexpand::tilde(&db_path).to_string();
+        let db_path = FileConfig::resolve_db_path(
+            cli_db_path,
+            file_cfg.db_path.as_deref(),
+            config_path.is_some(),
+            true,
+        );
 
         Ok(Self {
             file_cfg,

@@ -102,7 +102,9 @@ pub use search::{
 pub use security::NamespaceSecurityConfig;
 pub use storage::{
     ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
-    CrossStoreRecoveryStatus, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+    CrossStoreRecoveryStatus, DEFAULT_TABLE_NAME, GcConfig, GcStats, SchemaMigrationReport,
+    SchemaMismatchWriteError, SchemaVersion, StorageManager, TableStats, parse_duration_string,
+    required_columns_for,
 };
 
 // High-level engine API

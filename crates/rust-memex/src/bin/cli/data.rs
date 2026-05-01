@@ -8,10 +8,12 @@ pub use rust_memex::contracts::audit::{
     AuditRecommendation, AuditResult as NamespaceAuditResult, ChunkQuality, QualityTier,
 };
 use rust_memex::{
-    ChunkerKind, EmbeddingClient, EmbeddingConfig, RAGPipeline, ReindexJob, ReprocessJob,
-    SliceMode, StorageManager, diagnostics, export_namespace_jsonl_stream, import_jsonl_file,
-    reindex_namespace, reprocess_jsonl_file,
+    ChunkerKind, EmbeddingClient, EmbeddingConfig, RAGPipeline, ReindexJob, ReindexOutcome,
+    ReprocessJob, ReprocessOutcome, SchemaVersion, SliceMode, StorageManager, diagnostics,
+    export_namespace_jsonl_stream, import_jsonl_file, reindex_namespace, reprocess_jsonl_file,
 };
+
+use crate::cli::batch_policy::{BatchFailurePolicy, BatchRunSummary};
 
 pub struct ReprocessConfig {
     pub namespace: String,
@@ -21,6 +23,9 @@ pub struct ReprocessConfig {
     pub preprocess: bool,
     pub skip_existing: bool,
     pub allow_duplicates: bool,
+    pub strict: bool,
+    pub max_failure_rate: f64,
+    pub json: bool,
     pub dry_run: bool,
     pub db_path: String,
 }
@@ -33,6 +38,9 @@ pub struct ReindexConfig {
     pub preprocess: bool,
     pub skip_existing: bool,
     pub allow_duplicates: bool,
+    pub strict: bool,
+    pub max_failure_rate: f64,
+    pub json: bool,
     pub dry_run: bool,
     pub db_path: String,
 }
@@ -43,6 +51,42 @@ fn slice_mode_name(slice_mode: SliceMode) -> &'static str {
         SliceMode::OnionFast => "onion-fast",
         SliceMode::Flat => "flat",
     }
+}
+
+fn reprocess_summary(outcome: &ReprocessOutcome) -> BatchRunSummary {
+    let failed = outcome.failed_ids.len() + outcome.parse_errors;
+    let total = outcome.canonical_documents + outcome.parse_errors;
+    let mut errors = outcome
+        .failed_ids
+        .iter()
+        .map(|id| format!("document {id} failed"))
+        .collect::<Vec<_>>();
+    if outcome.parse_errors > 0 {
+        errors.push(format!(
+            "{} input record(s) failed to parse",
+            outcome.parse_errors
+        ));
+    }
+    BatchRunSummary::new(
+        outcome.indexed_documents + outcome.replaced_documents,
+        failed,
+        total,
+        errors,
+    )
+}
+
+fn reindex_summary(outcome: &ReindexOutcome) -> BatchRunSummary {
+    let errors = outcome
+        .failed_ids
+        .iter()
+        .map(|id| format!("document {id} failed"))
+        .collect();
+    BatchRunSummary::new(
+        outcome.indexed_documents + outcome.replaced_documents,
+        outcome.failed_ids.len(),
+        outcome.canonical_documents,
+        errors,
+    )
 }
 
 /// Export a namespace to JSONL file for portable backup
@@ -131,9 +175,13 @@ pub async fn run_reprocess(
         preprocess,
         skip_existing,
         allow_duplicates,
+        strict,
+        max_failure_rate,
+        json,
         dry_run,
         db_path,
     } = config;
+    let failure_policy = BatchFailurePolicy::new(strict, max_failure_rate)?;
 
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
@@ -212,6 +260,13 @@ pub async fn run_reprocess(
     if outcome.parse_errors > 0 {
         eprintln!("  Parse errors:    {}", outcome.parse_errors);
     }
+    let summary = reprocess_summary(&outcome);
+    if json {
+        summary.emit_json()?;
+    } else {
+        summary.emit_warning("documents");
+    }
+    summary.enforce(failure_policy, "documents")?;
     Ok(())
 }
 
@@ -224,9 +279,13 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
         preprocess,
         skip_existing,
         allow_duplicates,
+        strict,
+        max_failure_rate,
+        json,
         dry_run,
         db_path,
     } = config;
+    let failure_policy = BatchFailurePolicy::new(strict, max_failure_rate)?;
 
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
@@ -268,6 +327,13 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
     if !outcome.failed_ids.is_empty() {
         eprintln!("  Failed:   {}", outcome.failed_ids.len());
     }
+    let summary = reindex_summary(&outcome);
+    if json {
+        summary.emit_json()?;
+    } else {
+        summary.emit_warning("documents");
+    }
+    summary.enforce(failure_policy, "documents")?;
     Ok(())
 }
 
@@ -429,8 +495,11 @@ pub async fn run_backfill_hashes(
     namespace: Option<String>,
     dry_run: bool,
     json: bool,
+    strict: bool,
+    max_failure_rate: f64,
     db_path: String,
 ) -> Result<()> {
+    let failure_policy = BatchFailurePolicy::new(strict, max_failure_rate)?;
     let storage = StorageManager::new_lance_only(&db_path).await?;
 
     if !json {
@@ -448,8 +517,23 @@ pub async fn run_backfill_hashes(
         diagnostics::backfill_chunk_and_source_hashes(&storage, namespace.as_deref(), dry_run)
             .await?;
 
+    let summary = BatchRunSummary::new(
+        result.content_hash_backfilled + result.source_hash_backfilled,
+        result.skipped_no_embedding,
+        result.total_docs,
+        if result.skipped_no_embedding > 0 {
+            vec![format!(
+                "{} document(s) could not be backfilled because embedding was missing",
+                result.skipped_no_embedding
+            )]
+        } else {
+            Vec::new()
+        },
+    );
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        summary.emit_json()?;
+        summary.enforce(failure_policy, "documents")?;
         return Ok(());
     }
 
@@ -498,6 +582,46 @@ pub async fn run_backfill_hashes(
         );
     }
 
+    summary.emit_warning("documents");
+    summary.enforce(failure_policy, "documents")?;
+
+    Ok(())
+}
+
+pub async fn run_migrate_schema(
+    target: SchemaVersion,
+    check_only: bool,
+    db_path: String,
+) -> Result<()> {
+    let report = StorageManager::migrate_lance_schema(&db_path, target, check_only).await?;
+    let missing_names = report.missing_column_names();
+
+    if missing_names.is_empty() {
+        println!(
+            "Schema is up-to-date (target={}). No migration needed.",
+            report.target
+        );
+        return Ok(());
+    }
+
+    if check_only {
+        println!("Migration needed. Missing columns: {missing_names:?}");
+        std::process::exit(1);
+    }
+
+    println!(
+        "Migrating schema to {}: adding {} columns",
+        report.target,
+        report.missing_columns.len()
+    );
+    for field in &report.missing_columns {
+        println!(
+            "  + adding column: {} ({:?})",
+            field.name(),
+            field.data_type()
+        );
+    }
+    println!("Migration complete. Schema is now {}.", report.target);
     Ok(())
 }
 

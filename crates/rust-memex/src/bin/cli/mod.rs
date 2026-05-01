@@ -1,3 +1,4 @@
+pub mod batch_policy;
 pub mod config;
 pub mod data;
 pub mod definition;

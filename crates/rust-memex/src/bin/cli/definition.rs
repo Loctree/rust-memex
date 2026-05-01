@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use walkdir::WalkDir;
 
-use rust_memex::{ChunkerKind, NamespaceSecurityConfig, ServerConfig, path_utils};
+use rust_memex::{ChunkerKind, NamespaceSecurityConfig, SchemaVersion, ServerConfig, path_utils};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
@@ -339,6 +339,18 @@ pub enum Commands {
         /// whether dedup was active and which sources were collapsed.
         #[arg(long)]
         allow_duplicates: bool,
+
+        /// Exit non-zero if any file failed to index
+        #[arg(long)]
+        strict: bool,
+
+        /// Exit non-zero if failure rate exceeds threshold (0.0-1.0)
+        #[arg(long, default_value = "1.0")]
+        max_failure_rate: f64,
+
+        /// Emit JSON summary on stdout as the last line
+        #[arg(long)]
+        json: bool,
 
         /// Show progress bar with ETA when running in an interactive terminal.
         /// Non-interactive runs fall back to line logs.
@@ -941,6 +953,18 @@ pub enum Commands {
         #[arg(long)]
         allow_duplicates: bool,
 
+        /// Exit non-zero if any document failed to reprocess
+        #[arg(long)]
+        strict: bool,
+
+        /// Exit non-zero if failure rate exceeds threshold (0.0-1.0)
+        #[arg(long, default_value = "1.0")]
+        max_failure_rate: f64,
+
+        /// Emit JSON summary on stdout as the last line
+        #[arg(long)]
+        json: bool,
+
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
         dry_run: bool,
@@ -989,6 +1013,18 @@ pub enum Commands {
         /// Force rebuilding even when source_hash already exists in the target namespace
         #[arg(long)]
         allow_duplicates: bool,
+
+        /// Exit non-zero if any document failed to reindex
+        #[arg(long)]
+        strict: bool,
+
+        /// Exit non-zero if failure rate exceeds threshold (0.0-1.0)
+        #[arg(long, default_value = "1.0")]
+        max_failure_rate: f64,
+
+        /// Emit JSON summary on stdout as the last line
+        #[arg(long)]
+        json: bool,
 
         /// Show what would be rebuilt without writing anything
         #[arg(long)]
@@ -1052,6 +1088,27 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Migrate the LanceDB table schema to the target binary contract
+    ///
+    /// Adds missing nullable columns in-place without rewriting rows. This closes
+    /// the pre-v4 -> v4 chicken-and-egg where `backfill-hashes` needs the
+    /// `source_hash` column before it can repair legacy hash data.
+    ///
+    /// Examples:
+    ///   rust-memex migrate-schema --check-only
+    ///   rust-memex migrate-schema --db-path /path/to/lancedb
+    ///   rust-memex migrate-schema --target v4
+    MigrateSchema {
+        /// Target schema version (default: v4)
+        #[arg(long, default_value_t = SchemaVersion::current())]
+        target: SchemaVersion,
+
+        /// Report whether migration is needed without changing the table.
+        /// Exits 1 when required columns are missing.
+        #[arg(long)]
+        check_only: bool,
+    },
+
     /// Backfill per-chunk `content_hash` and `source_hash` for legacy chunks
     ///
     /// Walks the namespace (or every namespace when `-n` is omitted) and
@@ -1085,6 +1142,14 @@ pub enum Commands {
         /// Output as JSON instead of human-readable format
         #[arg(long)]
         json: bool,
+
+        /// Exit non-zero if any document could not be backfilled
+        #[arg(long)]
+        strict: bool,
+
+        /// Exit non-zero if failure rate exceeds threshold (0.0-1.0)
+        #[arg(long, default_value = "1.0")]
+        max_failure_rate: f64,
     },
 
     /// Manage auth tokens with per-token scopes and namespace ACL
@@ -1181,6 +1246,12 @@ impl Cli {
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.resolve_embedding_config();
         let default_cfg = ServerConfig::default();
+        let db_path = FileConfig::resolve_db_path(
+            self.db_path.as_deref(),
+            file_cfg.db_path.as_deref(),
+            config_path.is_some(),
+            false,
+        );
 
         // Build security config from CLI and file settings
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
@@ -1191,10 +1262,7 @@ impl Cli {
                 .cache_mb
                 .or(file_cfg.cache_mb)
                 .unwrap_or(default_cfg.cache_mb),
-            db_path: self
-                .db_path
-                .or(file_cfg.db_path)
-                .unwrap_or(default_cfg.db_path),
+            db_path,
             max_request_bytes: self
                 .max_request_bytes
                 .or(file_cfg.max_request_bytes)
@@ -1546,6 +1614,40 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Spec memex-001: `migrate-schema` CLI surface
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn migrate_schema_command_defaults_to_v4_live_run() {
+        let cli = Cli::parse_from(["rust-memex", "migrate-schema"]);
+        match cli.command {
+            Some(Commands::MigrateSchema { target, check_only }) => {
+                assert_eq!(target, SchemaVersion::V4);
+                assert!(!check_only);
+            }
+            other => panic!("expected migrate-schema, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn migrate_schema_command_accepts_check_only_and_target_alias() {
+        let cli = Cli::parse_from([
+            "rust-memex",
+            "migrate-schema",
+            "--target",
+            "4",
+            "--check-only",
+        ]);
+        match cli.command {
+            Some(Commands::MigrateSchema { target, check_only }) => {
+                assert_eq!(target, SchemaVersion::V4);
+                assert!(check_only);
+            }
+            other => panic!("expected migrate-schema, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Spec P0 backfill: `backfill-hashes` CLI surface
     // -------------------------------------------------------------------------
 
@@ -1557,6 +1659,7 @@ mod tests {
                 namespace,
                 dry_run,
                 json,
+                ..
             }) => {
                 assert!(namespace.is_none(), "no -n means all namespaces");
                 assert!(dry_run, "default must be dry-run for safety");
@@ -1582,6 +1685,7 @@ mod tests {
                 namespace,
                 dry_run,
                 json,
+                ..
             }) => {
                 assert_eq!(namespace.as_deref(), Some("kb:transcripts"));
                 assert!(!dry_run, "operator opted into a live write");

@@ -2701,6 +2701,8 @@ impl RAGPipeline {
         namespace: Option<&str>,
         slice_mode: SliceMode,
     ) -> Result<IndexResult> {
+        self.storage.require_current_schema_for_writes().await?;
+
         // Security: validate path before any file operations
         let validated_path = crate::path_utils::validate_read_path(path)?;
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
@@ -3003,6 +3005,8 @@ impl RAGPipeline {
         preprocess_config: Option<PreprocessingConfig>,
         slice_mode: SliceMode,
     ) -> Result<()> {
+        self.storage.require_current_schema_for_writes().await?;
+
         // Security: validate path before any file operations
         let validated_path = crate::path_utils::validate_read_path(path)?;
         let text = self.extract_text(&validated_path).await?;
@@ -3565,6 +3569,8 @@ impl RAGPipeline {
         metadata: serde_json::Value,
         slice_mode: SliceMode,
     ) -> Result<String> {
+        self.storage.require_current_schema_for_writes().await?;
+
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE).to_string();
         let slice_mode_name = match slice_mode {
             SliceMode::Onion => "onion",
@@ -3716,6 +3722,8 @@ impl RAGPipeline {
         text: String,
         metadata: serde_json::Value,
     ) -> Result<()> {
+        self.storage.require_current_schema_for_writes().await?;
+
         let slice_mode = match metadata
             .get("slice_mode")
             .and_then(|value| value.as_str())

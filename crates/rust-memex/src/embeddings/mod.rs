@@ -547,8 +547,8 @@ impl EmbeddingClient {
     /// Create a stub client for tests that don't need real embeddings.
     /// The client will fail on any actual embed() call, but lets McpCore
     /// be constructed and dispatch protocol-level requests.
-    #[cfg(test)]
-    pub(crate) fn stub_for_tests() -> Self {
+    #[doc(hidden)]
+    pub fn stub_for_tests() -> Self {
         Self {
             client: reqwest::Client::new(),
             embedder_url: "http://stub:0/v1/embeddings".to_string(),

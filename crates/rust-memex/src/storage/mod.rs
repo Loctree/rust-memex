@@ -12,10 +12,12 @@ use lancedb::table::{NewColumnTransform, OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::rag::SliceLayer;
@@ -31,6 +33,164 @@ use crate::rag::SliceLayer;
 ///            this without breaking old data.
 /// See docs/MIGRATION.md for migration procedures.
 pub const SCHEMA_VERSION: u32 = 4;
+pub const DEFAULT_TABLE_NAME: &str = "mcp_documents";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaVersion {
+    V3,
+    V4,
+}
+
+impl SchemaVersion {
+    pub fn current() -> Self {
+        Self::V4
+    }
+}
+
+impl fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V3 => f.write_str("v3"),
+            Self::V4 => f.write_str("v4"),
+        }
+    }
+}
+
+impl FromStr for SchemaVersion {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "3" | "v3" => Ok(Self::V3),
+            "4" | "v4" => Ok(Self::V4),
+            other => Err(anyhow!(
+                "unsupported schema target '{other}' (expected v3 or v4)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaMigrationReport {
+    pub target: SchemaVersion,
+    pub missing_columns: Vec<Field>,
+    pub applied: bool,
+}
+
+impl SchemaMigrationReport {
+    pub fn missing_column_names(&self) -> Vec<&str> {
+        self.missing_columns
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect()
+    }
+}
+
+pub fn required_columns_for(version: SchemaVersion) -> Vec<Field> {
+    let mut fields = vec![Field::new("content_hash", DataType::Utf8, true)];
+    if matches!(version, SchemaVersion::V4) {
+        fields.push(Field::new("source_hash", DataType::Utf8, true));
+    }
+    fields
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaMismatchWriteError {
+    table_name: String,
+    db_path: String,
+    missing_columns: Vec<String>,
+    message: String,
+}
+
+impl SchemaMismatchWriteError {
+    fn new(
+        table_name: impl Into<String>,
+        db_path: impl Into<String>,
+        missing_columns: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            table_name: table_name.into(),
+            db_path: db_path.into(),
+            missing_columns,
+            message: message.into(),
+        }
+    }
+
+    pub fn missing_columns(&self) -> &[String] {
+        &self.missing_columns
+    }
+
+    pub fn db_path(&self) -> &str {
+        &self.db_path
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn remediation(&self) -> String {
+        format!("rust-memex migrate-schema --db-path {}", self.db_path)
+    }
+}
+
+impl fmt::Display for SchemaMismatchWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ERROR schema mismatch while writing Lance table '{}': missing columns {:?}. {}. Remediation: {}",
+            self.table_name,
+            self.missing_columns,
+            self.message,
+            self.remediation()
+        )
+    }
+}
+
+impl std::error::Error for SchemaMismatchWriteError {}
+
+fn is_schema_mismatch_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("schema mismatch")
+        || lower.contains("append with different schema")
+        || lower.contains("fields did not match")
+        || lower.contains("missing=[")
+}
+
+fn extract_missing_columns(message: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut rest = message;
+
+    while let Some(start) = rest.find("missing=[") {
+        rest = &rest[start + "missing=[".len()..];
+        let Some(end) = rest.find(']') else {
+            break;
+        };
+        let list = &rest[..end];
+        for item in list.split(',') {
+            let column = item
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !column.is_empty() && !columns.iter().any(|existing| existing == column) {
+                columns.push(column.to_string());
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+
+    if columns.is_empty() {
+        for field in required_columns_for(SchemaVersion::current()) {
+            let name = field.name();
+            if message.contains(name) {
+                columns.push(name.to_string());
+            }
+        }
+    }
+
+    columns
+}
 
 // =============================================================================
 // STORAGE BACKEND INTERFACE
@@ -294,7 +454,7 @@ impl StorageManager {
         Ok(Self {
             lance,
             table: Arc::new(Mutex::new(None)),
-            collection_name: "mcp_documents".to_string(),
+            collection_name: DEFAULT_TABLE_NAME.to_string(),
             lance_path,
         })
     }
@@ -308,13 +468,78 @@ impl StorageManager {
         Ok(Self {
             lance,
             table: Arc::new(Mutex::new(None)),
-            collection_name: "mcp_documents".to_string(),
+            collection_name: DEFAULT_TABLE_NAME.to_string(),
             lance_path,
         })
     }
 
     pub fn lance_path(&self) -> &str {
         &self.lance_path
+    }
+
+    pub async fn require_current_schema_for_writes(&self) -> Result<()> {
+        let Some(table) = self.open_table_if_exists().await? else {
+            return Ok(());
+        };
+        self.ensure_hash_schema_columns(&table).await
+    }
+
+    pub async fn missing_required_columns(
+        table: &Table,
+        target: SchemaVersion,
+    ) -> Result<Vec<Field>> {
+        let schema = table.schema().await?;
+        Ok(required_columns_for(target)
+            .into_iter()
+            .filter(|field| schema.field_with_name(field.name()).is_err())
+            .collect())
+    }
+
+    pub async fn migrate_lance_schema(
+        db_path: &str,
+        target: SchemaVersion,
+        check_only: bool,
+    ) -> Result<SchemaMigrationReport> {
+        let lance_path = shellexpand::tilde(db_path).to_string();
+        let lance = connect(&lance_path).execute().await?;
+        let table = lance.open_table(DEFAULT_TABLE_NAME).execute().await?;
+        let missing = Self::missing_required_columns(&table, target).await?;
+
+        if missing.is_empty() || check_only {
+            return Ok(SchemaMigrationReport {
+                target,
+                missing_columns: missing,
+                applied: false,
+            });
+        }
+
+        let transform = NewColumnTransform::AllNulls(Arc::new(Schema::new(missing.clone())));
+        if let Err(error) = table.add_columns(transform, None).await {
+            let _ = table.checkout_latest().await;
+            let remaining = Self::missing_required_columns(&table, target).await?;
+            if remaining.is_empty() {
+                warn!(
+                    "Lance table '{}' schema migration raced with another writer and is already complete",
+                    DEFAULT_TABLE_NAME
+                );
+                return Ok(SchemaMigrationReport {
+                    target,
+                    missing_columns: missing,
+                    applied: true,
+                });
+            }
+            return Err(anyhow!(
+                "failed to migrate Lance table '{}' schema to {target}: {error}",
+                DEFAULT_TABLE_NAME
+            ));
+        }
+
+        let _ = table.checkout_latest().await;
+        Ok(SchemaMigrationReport {
+            target,
+            missing_columns: missing,
+            applied: true,
+        })
     }
 
     pub fn cross_store_recovery_dir(&self) -> PathBuf {
@@ -479,7 +704,9 @@ impl StorageManager {
         let table = self.ensure_table(dim).await?;
         self.ensure_hash_schema_columns(&table).await?;
         let batch = self.docs_to_batch(&documents, dim)?;
-        table.add(batch).execute().await?;
+        if let Err(error) = table.add(batch).execute().await {
+            return Err(self.map_lancedb_write_error(error));
+        }
         debug!(
             "Inserted {} documents into Lance (validated)",
             documents.len()
@@ -824,37 +1051,60 @@ impl StorageManager {
     }
 
     async fn ensure_hash_schema_columns(&self, table: &Table) -> Result<()> {
-        let schema = table.schema().await?;
-        let mut missing = Vec::new();
-
-        if schema.field_with_name("content_hash").is_err() {
-            missing.push(Field::new("content_hash", DataType::Utf8, true));
-        }
-        if schema.field_with_name("source_hash").is_err() {
-            missing.push(Field::new("source_hash", DataType::Utf8, true));
-        }
+        let missing = Self::missing_required_columns(table, SchemaVersion::current()).await?;
 
         if missing.is_empty() {
             return Ok(());
         }
 
-        let names = missing
+        let missing_columns = missing
             .iter()
-            .map(|field| field.name().as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        info!(
-            "Upgrading Lance table '{}' schema with missing nullable hash columns: {}",
-            self.collection_name, names
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
+        let error = SchemaMismatchWriteError::new(
+            self.collection_name.clone(),
+            self.lance_path.clone(),
+            missing_columns,
+            "table is older than the current writer schema",
         );
-        table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
-                None,
-            )
-            .await?;
-        let _ = table.checkout_latest().await;
-        Ok(())
+        self.log_schema_mismatch(&error);
+        Err(error.into())
+    }
+
+    fn map_lancedb_write_error(&self, error: lancedb::error::Error) -> anyhow::Error {
+        let message = match &error {
+            lancedb::error::Error::Lance { source } => source.to_string(),
+            lancedb::error::Error::Schema { message } => message.clone(),
+            lancedb::error::Error::Arrow { source } => source.to_string(),
+            _ => return error.into(),
+        };
+
+        if !is_schema_mismatch_message(&message) {
+            return error.into();
+        }
+
+        let missing_columns = extract_missing_columns(&message);
+        let error = SchemaMismatchWriteError::new(
+            self.collection_name.clone(),
+            self.lance_path.clone(),
+            missing_columns,
+            message,
+        );
+        self.log_schema_mismatch(&error);
+        error.into()
+    }
+
+    fn log_schema_mismatch(&self, error: &SchemaMismatchWriteError) {
+        error!(
+            error_kind = "schema_mismatch",
+            table = %error.table_name(),
+            db_path = %error.db_path(),
+            missing_columns = ?error.missing_columns(),
+            remediation = %error.remediation(),
+            file = file!(),
+            line = line!(),
+            "write-path schema mismatch"
+        );
     }
 
     fn docs_to_batch(&self, documents: &[ChromaDocument], dim: usize) -> Result<BatchIter> {
