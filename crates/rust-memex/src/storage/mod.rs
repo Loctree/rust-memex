@@ -86,6 +86,15 @@ impl SchemaMigrationReport {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SchemaStatusReport {
+    pub schema_version: SchemaVersion,
+    pub expected_schema: SchemaVersion,
+    pub needs_migration: bool,
+    pub missing_columns: Vec<String>,
+    pub manifest_version: Option<u64>,
+}
+
 pub fn required_columns_for(version: SchemaVersion) -> Vec<Field> {
     let mut fields = vec![Field::new("content_hash", DataType::Utf8, true)];
     if matches!(version, SchemaVersion::V4) {
@@ -482,6 +491,44 @@ impl StorageManager {
             return Ok(());
         };
         self.ensure_hash_schema_columns(&table).await
+    }
+
+    pub async fn schema_status(
+        &self,
+        expected_schema: SchemaVersion,
+    ) -> Result<SchemaStatusReport> {
+        let Some(table) = self.open_table_if_exists().await? else {
+            return Ok(SchemaStatusReport {
+                schema_version: expected_schema,
+                expected_schema,
+                needs_migration: false,
+                missing_columns: Vec::new(),
+                manifest_version: None,
+            });
+        };
+
+        let missing_columns = Self::missing_required_columns(&table, expected_schema)
+            .await?
+            .into_iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
+        let manifest_version = table
+            .list_versions()
+            .await
+            .ok()
+            .and_then(|versions| versions.iter().map(|version| version.version).max());
+
+        Ok(SchemaStatusReport {
+            schema_version: if missing_columns.is_empty() {
+                expected_schema
+            } else {
+                SchemaVersion::V3
+            },
+            expected_schema,
+            needs_migration: !missing_columns.is_empty(),
+            missing_columns,
+            manifest_version,
+        })
     }
 
     pub async fn missing_required_columns(

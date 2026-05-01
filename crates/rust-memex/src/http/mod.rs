@@ -44,7 +44,7 @@
 mod lifecycle;
 mod recovery;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -87,7 +87,7 @@ use crate::diagnostics::{
 use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
 use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
 use crate::search::{HybridSearchResult, SearchMode};
-use crate::storage::{ChromaDocument, SchemaMismatchWriteError};
+use crate::storage::{ChromaDocument, SchemaMismatchWriteError, SchemaVersion};
 
 const DASHBOARD_SESSION_COOKIE: &str = "rust_memex_dashboard_session";
 const DIAGNOSTIC_APPROVAL_TTL: Duration = Duration::from_secs(300);
@@ -957,6 +957,8 @@ pub struct HttpState {
     pub cached_namespaces: Arc<RwLock<Option<Vec<NamespaceInfo>>>>,
     /// Per-namespace last activity timestamp (updated on upsert/index)
     pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
+    /// Last successful append timestamp across all HTTP write paths.
+    pub last_successful_append_at: Arc<RwLock<Option<String>>>,
     /// Recent destructive diagnostic dry-runs approved for follow-up execute calls.
     pub diagnostic_dry_run_approvals: Arc<RwLock<HashMap<String, Instant>>>,
     /// Optional Bearer token for authenticating mutating requests
@@ -980,6 +982,7 @@ impl HttpState {
             mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
             cached_namespaces: Arc::new(RwLock::new(None)),
             namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            last_successful_append_at: Arc::new(RwLock::new(None)),
             diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
             auth_token: None,
             auth_mode: AuthMode::MutatingOnly,
@@ -1579,6 +1582,19 @@ pub struct HealthResponse {
     pub status: String,
     pub db_path: String,
     pub embedding_provider: String,
+    pub schema_version: String,
+    pub expected_schema: String,
+    pub needs_migration: bool,
+    pub missing_columns: Vec<String>,
+    pub manifest_version: Option<u64>,
+    pub last_successful_append_at: Option<String>,
+    pub namespaces: BTreeMap<String, HealthNamespaceStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthNamespaceStatus {
+    pub chunks: usize,
+    pub last_indexed_at: Option<String>,
 }
 
 /// Extract bearer token from Authorization header or ?token= query param.
@@ -2210,11 +2226,84 @@ fn diagnostic_authed_routes() -> Router<HttpState> {
 
 /// Health check endpoint
 async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
-    Json(HealthResponse {
-        status: "ok".to_string(),
+    Json(build_health_response(&state).await)
+}
+
+async fn build_health_response(state: &HttpState) -> HealthResponse {
+    let expected_schema = SchemaVersion::current();
+    let schema_status = state
+        .rag
+        .storage_manager()
+        .schema_status(expected_schema)
+        .await
+        .ok();
+    let namespace_counts = state
+        .rag
+        .storage_manager()
+        .list_namespaces()
+        .await
+        .unwrap_or_default();
+    let activity = state.namespace_activity.read().await;
+    let namespaces = namespace_counts
+        .into_iter()
+        .map(|(namespace, chunks)| {
+            (
+                namespace.clone(),
+                HealthNamespaceStatus {
+                    chunks,
+                    last_indexed_at: activity.get(&namespace).cloned(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let last_successful_append_at = state.last_successful_append_at.read().await.clone();
+
+    let (schema_version, expected_schema, needs_migration, missing_columns, manifest_version) =
+        schema_status
+            .map(|status| {
+                (
+                    health_schema_version_label(status.schema_version, status.needs_migration),
+                    status.expected_schema.to_string(),
+                    status.needs_migration,
+                    status.missing_columns,
+                    status.manifest_version,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "unknown".to_string(),
+                    expected_schema.to_string(),
+                    false,
+                    Vec::new(),
+                    None,
+                )
+            });
+
+    HealthResponse {
+        status: if needs_migration {
+            "needs_migration"
+        } else {
+            "ok"
+        }
+        .to_string(),
         db_path: state.rag.storage_manager().lance_path().to_string(),
         embedding_provider: state.rag.mlx_connected_to(),
-    })
+        schema_version,
+        expected_schema,
+        needs_migration,
+        missing_columns,
+        manifest_version,
+        last_successful_append_at,
+        namespaces,
+    }
+}
+
+fn health_schema_version_label(version: SchemaVersion, needs_migration: bool) -> String {
+    if needs_migration && matches!(version, SchemaVersion::V3) {
+        "v3-pre".to_string()
+    } else {
+        version.to_string()
+    }
 }
 
 // ============================================================================
@@ -2302,11 +2391,13 @@ async fn refresh_namespace_cache(state: &HttpState) -> anyhow::Result<()> {
 }
 
 async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
     state
         .namespace_activity
         .write()
         .await
-        .insert(namespace.to_string(), chrono::Utc::now().to_rfc3339());
+        .insert(namespace.to_string(), now.clone());
+    *state.last_successful_append_at.write().await = Some(now);
     if let Err(error) = refresh_namespace_cache(state).await {
         warn!(
             "Namespace cache refresh failed after activity update: {}",
@@ -3642,6 +3733,7 @@ pub async fn start_server(
         mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
         cached_namespaces: cached_namespaces.clone(),
         namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+        last_successful_append_at: Arc::new(RwLock::new(None)),
         diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
         auth_token: server_config.auth_token.clone(),
         auth_mode: server_config.auth_mode.clone(),
@@ -3790,6 +3882,7 @@ mod tests {
             mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
             cached_namespaces: Arc::new(RwLock::new(None)),
             namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            last_successful_append_at: Arc::new(RwLock::new(None)),
             diagnostic_dry_run_approvals: Arc::new(RwLock::new(HashMap::new())),
             auth_token: None,
             auth_mode: AuthMode::MutatingOnly,
