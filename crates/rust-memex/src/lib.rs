@@ -16,6 +16,7 @@ pub mod rag;
 pub mod recovery;
 pub mod search;
 pub mod security;
+pub mod startup;
 pub mod storage;
 #[cfg(test)]
 mod tests;
@@ -100,6 +101,7 @@ pub use search::{
     StemLanguage,
 };
 pub use security::NamespaceSecurityConfig;
+pub use startup::{StartupSchemaGuard, guard_daemon_startup_schema};
 pub use storage::{
     ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
     CrossStoreRecoveryStatus, DEFAULT_TABLE_NAME, GcConfig, GcStats, SchemaMigrationReport,

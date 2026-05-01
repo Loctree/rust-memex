@@ -239,6 +239,7 @@ async fn run_http_only_command(cli: Cli, port: u16, auto_open_browser: bool) -> 
     let http_server_config = resolve_http_server_config(&cli, &file_cfg, port)?;
     validate_http_preconditions(&http_server_config, cli.allow_network_without_auth)?;
     let dashboard_url = dashboard_browser_url(http_server_config.bind_address, port);
+    let auto_migrate = cli.auto_migrate;
 
     let mut config = cli.into_server_config()?;
     config.hybrid.bm25.read_only = true;
@@ -253,6 +254,8 @@ async fn run_http_only_command(cli: Cli, port: u16, auto_open_browser: bool) -> 
     info!("Starting RMCP Memex");
     info!("Cache: {}MB", config.cache_mb);
     info!("DB Path: {}", config.db_path);
+
+    rust_memex::guard_daemon_startup_schema(&config.db_path, auto_migrate).await?;
 
     let server = create_server(config).await?;
     let mcp_core = server.mcp_core();
@@ -910,6 +913,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
         Some(Commands::Serve) | None => {
             let http_port = cli.http_port;
             let http_only = cli.http_only;
+            let auto_migrate = cli.auto_migrate;
             if http_only && http_port.is_none() {
                 return Err(anyhow::anyhow!(
                     "--http-only requires --http-port to be set"
@@ -954,6 +958,9 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             info!("Starting RMCP Memex");
             info!("Cache: {}MB", config.cache_mb);
             info!("DB Path: {}", config.db_path);
+            if http_port.is_some() || http_only {
+                rust_memex::guard_daemon_startup_schema(&config.db_path, auto_migrate).await?;
+            }
             let server = create_server(config).await?;
             if http_only {
                 let port = http_port.expect("validated above");

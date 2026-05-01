@@ -129,6 +129,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub http_only: bool,
 
+    /// Migrate an older LanceDB schema at daemon startup instead of refusing to start.
+    /// Default is fail-fast; run `rust-memex migrate-schema --db-path <path>` for manual control.
+    #[arg(long, global = true)]
+    pub auto_migrate: bool,
+
     /// Bearer token for authenticating HTTP endpoints.
     /// API/SSE/MCP access stays Bearer even when dashboard OIDC is enabled.
     /// Can also be set via MEMEX_AUTH_TOKEN env var.
@@ -1645,6 +1650,18 @@ mod tests {
             }
             other => panic!("expected migrate-schema, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn auto_migrate_defaults_off_and_is_global_for_daemon_modes() {
+        let cli = Cli::parse_from(["rust-memex", "sse"]);
+        assert!(!cli.auto_migrate);
+
+        let cli = Cli::parse_from(["rust-memex", "--auto-migrate", "sse"]);
+        assert!(cli.auto_migrate);
+
+        let cli = Cli::parse_from(["rust-memex", "dashboard", "--auto-migrate"]);
+        assert!(cli.auto_migrate);
     }
 
     // -------------------------------------------------------------------------
