@@ -428,6 +428,43 @@ pub struct BackfillHashesResult {
 /// 4. Re-write the row by deleting + inserting (LanceDB has no per-row update
 ///    that accepts a fixed-size vector update for our schema).
 ///
+fn fmt_duration(secs: f64) -> String {
+    if secs > 3600.0 {
+        format!("{:.0}h{:02.0}m", secs / 3600.0, (secs % 3600.0) / 60.0)
+    } else if secs > 60.0 {
+        format!("{:.0}m{:02.0}s", secs / 60.0, secs % 60.0)
+    } else {
+        format!("{:.0}s", secs)
+    }
+}
+
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn emit_backfill_progress(
+    processed: usize,
+    total: usize,
+    started: &std::time::Instant,
+    last_report: &mut std::time::Instant,
+) {
+    if total == 0 || last_report.elapsed().as_secs() < 10 {
+        return;
+    }
+    *last_report = std::time::Instant::now();
+    let pct = (processed as f64 / total as f64 * 100.0).min(100.0);
+    let elapsed = started.elapsed().as_secs_f64();
+    let rate = processed as f64 / elapsed;
+    let eta = if rate > 0.0 {
+        (total - processed) as f64 / rate
+    } else {
+        0.0
+    };
+    let tick = (elapsed as usize / 10) % SPINNER.len();
+    eprint!(
+        "\r  {} [{:>6}/{:>6}] {:5.1}%  {:.0} docs/s  ETA {}   ",
+        SPINNER[tick], processed, total, pct, rate, fmt_duration(eta)
+    );
+}
+
 /// Spec: `2026-04-27_kb-transcripts-onion-slicer-fix-spec.md`, P0 backfill.
 pub async fn backfill_chunk_and_source_hashes(
     storage: &StorageManager,
@@ -439,8 +476,17 @@ pub async fn backfill_chunk_and_source_hashes(
         ..Default::default()
     };
 
+    // Pre-count total documents for progress reporting.
+    let total_count = match namespace {
+        Some(ns) => storage.count_namespace(ns).await.unwrap_or(0),
+        None => storage.stats().await.map(|s| s.row_count).unwrap_or(0),
+    };
+
     const PAGE: usize = 5_000;
     let mut offset = 0;
+    let mut processed = 0usize;
+    let started = std::time::Instant::now();
+    let mut last_report = started;
 
     loop {
         let page = storage.all_documents_page(namespace, offset, PAGE).await?;
@@ -451,8 +497,11 @@ pub async fn backfill_chunk_and_source_hashes(
         result.total_docs += page_len;
 
         for doc in &page {
+            processed += 1;
+
             if doc.embedding.is_empty() {
                 result.skipped_no_embedding += 1;
+                emit_backfill_progress(processed, total_count, &started, &mut last_report);
                 continue;
             }
 
@@ -491,6 +540,7 @@ pub async fn backfill_chunk_and_source_hashes(
 
             if !needs_content && !needs_source {
                 result.already_consistent += 1;
+                emit_backfill_progress(processed, total_count, &started, &mut last_report);
                 continue;
             }
 
@@ -502,6 +552,7 @@ pub async fn backfill_chunk_and_source_hashes(
             }
 
             if dry_run {
+                emit_backfill_progress(processed, total_count, &started, &mut last_report);
                 continue;
             }
 
@@ -522,12 +573,21 @@ pub async fn backfill_chunk_and_source_hashes(
             };
             storage.delete_document(&doc.namespace, &doc.id).await?;
             storage.add_to_store(vec![new_doc]).await?;
+            emit_backfill_progress(processed, total_count, &started, &mut last_report);
         }
 
         if page_len < PAGE {
             break;
         }
         offset += page_len;
+    }
+
+    if total_count > 0 && processed > 0 {
+        eprintln!(
+            "\r  [{0}/{0}] 100.0%  done in {1}                    ",
+            processed,
+            fmt_duration(started.elapsed().as_secs_f64())
+        );
     }
 
     Ok(result)

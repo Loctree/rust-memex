@@ -50,8 +50,8 @@ help: ## Show this help
 build: ## Build release binary
 	cargo build --release
 
-install: build ## Build and install to ~/.cargo/bin
-	@cp ./target/release/$(BINARY) $(INSTALL_PATH)
+install: ## Build and install to ~/.cargo/bin
+	cargo install --path crates/rust-memex --locked --force --bin $(BINARY)
 	@echo "Installed to $(INSTALL_PATH)"
 
 # ============================================================================
