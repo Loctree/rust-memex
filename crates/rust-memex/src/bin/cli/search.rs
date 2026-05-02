@@ -11,6 +11,16 @@ use rust_memex::{
 
 use crate::cli::config::*;
 use crate::cli::formatting::*;
+
+/// Derive BM25 index path as sibling of the Lance db_path.
+/// e.g. "~/.rmcp-servers/rmcp-memex/lancedb" → "/.../rmcp-memex/bm25"
+fn bm25_path_from_db(db_path: &str) -> String {
+    let expanded = shellexpand::tilde(db_path).to_string();
+    std::path::Path::new(&expanded)
+        .parent()
+        .map(|p| p.join("bm25").to_string_lossy().to_string())
+        .unwrap_or_else(|| BM25Config::default().index_path)
+}
 /// Check if auto-optimization should run and execute if needed
 pub async fn check_and_maybe_optimize(
     storage: &StorageManager,
@@ -75,6 +85,7 @@ pub async fn run_search(config: SearchConfig<'_>) -> Result<()> {
         let hybrid_config = HybridConfig {
             mode: search_mode,
             bm25: BM25Config {
+                index_path: bm25_path_from_db(&db_path),
                 read_only: true,
                 ..Default::default()
             },
@@ -401,6 +412,7 @@ pub async fn run_cross_search(
     let hybrid_config = HybridConfig {
         mode: search_mode,
         bm25: BM25Config {
+            index_path: bm25_path_from_db(&db_path),
             read_only: true,
             ..Default::default()
         },

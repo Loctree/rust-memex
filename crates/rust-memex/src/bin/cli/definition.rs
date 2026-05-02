@@ -1262,6 +1262,15 @@ impl Cli {
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
+        // Derive BM25 index path as sibling of db_path:
+        //   db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
+        //   bm25    = "~/.rmcp-servers/rmcp-memex/bm25"
+        let mut hybrid = default_cfg.hybrid;
+        let expanded_db = shellexpand::tilde(&db_path).to_string();
+        if let Some(parent) = std::path::Path::new(&expanded_db).parent() {
+            hybrid.bm25.index_path = parent.join("bm25").to_string_lossy().to_string();
+        }
+
         Ok(ServerConfig {
             cache_mb: self
                 .cache_mb
@@ -1286,7 +1295,7 @@ impl Cli {
                 token_store_path,
             },
             embeddings,
-            hybrid: default_cfg.hybrid,
+            hybrid,
         })
     }
 }
