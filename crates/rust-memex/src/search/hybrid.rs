@@ -267,6 +267,11 @@ impl HybridSearcher {
             .ok_or_else(|| anyhow::anyhow!("BM25 index not initialized for keyword search"))?;
 
         let bm25_results = bm25.search(query, namespace, candidate_limit(limit, &options))?;
+        if bm25_results.is_empty() {
+            return self
+                .keyword_scan_fallback(query, namespace, limit, options)
+                .await;
+        }
 
         // Fetch full documents from storage
         let mut results = Vec::with_capacity(bm25_results.len());
@@ -287,6 +292,76 @@ impl HybridSearcher {
                     keywords: doc.keywords,
                 });
             }
+        }
+
+        Self::apply_post_search_processing(query, &mut results, &options);
+        Self::dedup_by_chunk_hash(&mut results);
+        Self::dedup_by_source_path(&mut results);
+        Self::enforce_source_diversity(&mut results, self.config.max_per_source);
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn keyword_scan_fallback(
+        &self,
+        query: &str,
+        namespace: Option<&str>,
+        limit: usize,
+        options: SearchOptions,
+    ) -> Result<Vec<HybridSearchResult>> {
+        let terms = query
+            .split_whitespace()
+            .map(|term| {
+                term.trim_matches(|ch: char| !ch.is_alphanumeric())
+                    .to_ascii_lowercase()
+            })
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let docs = self.storage.all_documents(namespace, 100_000).await?;
+        let mut results = Vec::new();
+        for doc in docs {
+            let searchable = format!(
+                "{} {} {}",
+                doc.document,
+                doc.keywords.join(" "),
+                doc.metadata
+            )
+            .to_ascii_lowercase();
+            let score = terms
+                .iter()
+                .map(|term| searchable.matches(term).count())
+                .sum::<usize>();
+            if score == 0 {
+                continue;
+            }
+
+            let layer = doc.slice_layer();
+            let layer_matches = match options.layer_filter {
+                Some(SliceLayer::Outer) => layer.is_none() || layer == Some(SliceLayer::Outer),
+                Some(expected) => layer == Some(expected),
+                None => true,
+            };
+            if !layer_matches {
+                continue;
+            }
+
+            results.push(HybridSearchResult {
+                id: doc.id,
+                namespace: doc.namespace,
+                document: doc.document,
+                combined_score: score as f32,
+                vector_score: None,
+                bm25_score: Some(0.0),
+                metadata: doc.metadata,
+                layer,
+                parent_id: doc.parent_id,
+                children_ids: doc.children_ids,
+                keywords: doc.keywords,
+            });
         }
 
         Self::apply_post_search_processing(query, &mut results, &options);
@@ -815,6 +890,51 @@ mod tests {
                 .iter()
                 .any(|result| result.namespace == "namespace-b")
         );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_falls_back_to_lance_text_when_bm25_is_empty() {
+        let storage_dir = TempDir::new().unwrap();
+        let bm25_dir = TempDir::new().unwrap();
+        let storage = Arc::new(
+            StorageManager::new_lance_only(storage_dir.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+
+        storage
+            .add_to_store(vec![ChromaDocument::new_flat(
+                "doc-1".to_string(),
+                "namespace-a".to_string(),
+                vec![0.1f32; 8],
+                json!({"path": "fallback.txt"}),
+                "needle term only exists in Lance".to_string(),
+            )])
+            .await
+            .unwrap();
+
+        let config = HybridConfig {
+            mode: SearchMode::Keyword,
+            bm25: BM25Config::default().with_path(bm25_dir.path().to_str().unwrap()),
+            max_per_source: 0,
+            ..Default::default()
+        };
+        let searcher = HybridSearcher::new(storage, config).await.unwrap();
+
+        let results = searcher
+            .search(
+                "needle",
+                vec![],
+                Some("namespace-a"),
+                10,
+                SearchOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "doc-1");
+        assert_eq!(results[0].namespace, "namespace-a");
     }
 
     #[tokio::test]

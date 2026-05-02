@@ -12,6 +12,8 @@ use lancedb::table::{NewColumnTransform, OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -34,6 +36,7 @@ use crate::rag::SliceLayer;
 /// See docs/MIGRATION.md for migration procedures.
 pub const SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_TABLE_NAME: &str = "mcp_documents";
+const NAMESPACE_TABLE_PREFIX: &str = "mcp_documents__ns__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaVersion {
@@ -398,6 +401,7 @@ impl ChromaDocument {
 pub struct StorageManager {
     lance: Connection,
     table: Arc<Mutex<Option<Table>>>,
+    namespace_tables: Arc<Mutex<HashMap<String, Table>>>,
     collection_name: String,
     lance_path: String,
 }
@@ -463,6 +467,7 @@ impl StorageManager {
         Ok(Self {
             lance,
             table: Arc::new(Mutex::new(None)),
+            namespace_tables: Arc::new(Mutex::new(HashMap::new())),
             collection_name: DEFAULT_TABLE_NAME.to_string(),
             lance_path,
         })
@@ -477,6 +482,7 @@ impl StorageManager {
         Ok(Self {
             lance,
             table: Arc::new(Mutex::new(None)),
+            namespace_tables: Arc::new(Mutex::new(HashMap::new())),
             collection_name: DEFAULT_TABLE_NAME.to_string(),
             lance_path,
         })
@@ -669,6 +675,7 @@ impl StorageManager {
     pub async fn refresh(&self) -> Result<()> {
         let mut guard = self.table.lock().await;
         *guard = None;
+        self.namespace_tables.lock().await.clear();
         tracing::info!("LanceDB table cache cleared - will refresh on next query");
         Ok(())
     }
@@ -748,16 +755,25 @@ impl StorageManager {
             }
         }
 
-        let table = self.ensure_table(dim).await?;
-        self.ensure_hash_schema_columns(&table).await?;
-        let batch = self.docs_to_batch(&documents, dim)?;
-        if let Err(error) = table.add(batch).execute().await {
-            return Err(self.map_lancedb_write_error(error));
+        let mut by_namespace: HashMap<String, Vec<ChromaDocument>> = HashMap::new();
+        for document in documents {
+            by_namespace
+                .entry(document.namespace.clone())
+                .or_default()
+                .push(document);
         }
-        debug!(
-            "Inserted {} documents into Lance (validated)",
-            documents.len()
-        );
+
+        let mut inserted = 0usize;
+        for (namespace, docs) in by_namespace {
+            let table = self.ensure_namespace_table(&namespace, dim).await?;
+            self.ensure_hash_schema_columns(&table).await?;
+            let batch = self.docs_to_batch(&docs, dim)?;
+            if let Err(error) = table.add(batch).execute().await {
+                return Err(self.map_lancedb_write_error(error));
+            }
+            inserted += docs.len();
+        }
+        debug!("Inserted {} documents into Lance (validated)", inserted);
         Ok(())
     }
 
@@ -770,19 +786,51 @@ impl StorageManager {
         if embedding.is_empty() {
             return Ok(vec![]);
         }
-        let dim = embedding.len();
-        let table = self.ensure_table(dim).await?;
-
-        let mut query = table.query();
-        if let Some(ns) = namespace {
-            query = query.only_if(self.namespace_filter(ns).as_str());
-        }
-        let mut stream = query.nearest_to(embedding)?.limit(k).execute().await?;
-
         let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            results.append(&mut docs);
+        if let Some(ns) = namespace {
+            if let Some(table) = self.open_namespace_table_if_exists(ns).await? {
+                let mut stream = table
+                    .query()
+                    .nearest_to(embedding.clone())?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            if let Some(table) = self.legacy_table_if_exists().await? {
+                let mut stream = table
+                    .query()
+                    .only_if(self.namespace_filter(ns).as_str())
+                    .nearest_to(embedding)?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            results.truncate(k);
+        } else {
+            for table_name in self.data_table_names().await? {
+                let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                    continue;
+                };
+                let mut stream = table
+                    .query()
+                    .nearest_to(embedding.clone())?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            results.truncate(k);
         }
         debug!("Lance returned {} results", results.len());
         Ok(results)
@@ -799,24 +847,41 @@ impl StorageManager {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(vec![]),
-        };
-
-        let mut query = table.query().limit(limit).offset(offset);
-        if let Some(ns) = namespace {
-            query = query.only_if(self.namespace_filter(ns).as_str());
-        }
-        let mut stream = query.execute().await?;
-
         let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            results.append(&mut docs);
+        if let Some(ns) = namespace {
+            if let Some(table) = self.open_namespace_table_if_exists(ns).await? {
+                results.append(
+                    &mut self
+                        .query_table_page(&table, None, 0, offset + limit)
+                        .await?,
+                );
+            }
+            if let Some(table) = self.legacy_table_if_exists().await? {
+                results.append(
+                    &mut self
+                        .query_table_page(
+                            &table,
+                            Some(self.namespace_filter(ns)),
+                            0,
+                            offset + limit,
+                        )
+                        .await?,
+                );
+            }
+        } else {
+            for table_name in self.data_table_names().await? {
+                let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                    continue;
+                };
+                results.append(
+                    &mut self
+                        .query_table_page(&table, None, 0, offset + limit)
+                        .await?,
+                );
+            }
         }
 
-        Ok(results)
+        Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 
     /// Return documents without running a vector search.
@@ -831,55 +896,61 @@ impl StorageManager {
     }
 
     pub async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let filter = format!(
-            "{} AND {}",
-            self.namespace_filter(namespace),
-            self.id_filter(id)
-        );
-        let mut stream = table
-            .query()
-            .only_if(filter.as_str())
-            .limit(1)
-            .execute()
-            .await?;
-        if let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            if let Some(doc) = docs.pop() {
-                return Ok(Some(doc));
+        let id_filter = self.id_filter(id);
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+            let mut stream = table
+                .query()
+                .only_if(id_filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
+            if let Some(batch) = stream.try_next().await? {
+                let mut docs = self.batch_to_docs(&batch)?;
+                if let Some(doc) = docs.pop() {
+                    return Ok(Some(doc));
+                }
+            }
+        }
+
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            let filter = format!("{} AND {}", self.namespace_filter(namespace), id_filter);
+            let mut stream = table
+                .query()
+                .only_if(filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
+            if let Some(batch) = stream.try_next().await? {
+                let mut docs = self.batch_to_docs(&batch)?;
+                if let Some(doc) = docs.pop() {
+                    return Ok(Some(doc));
+                }
             }
         }
         Ok(None)
     }
 
     pub async fn delete_document(&self, namespace: &str, id: &str) -> Result<usize> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(0),
-        };
-        let predicate = format!(
-            "{} AND {}",
-            self.namespace_filter(namespace),
-            self.id_filter(id)
-        );
-        let pre_count = table
-            .query()
-            .only_if(predicate.as_str())
-            .execute()
-            .await?
-            .try_fold(
-                0usize,
-                |acc, batch| async move { Ok(acc + batch.num_rows()) },
-            )
-            .await?;
-        if pre_count == 0 {
-            return Ok(0);
+        let mut deleted = 0usize;
+        let id_filter = self.id_filter(id);
+
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+            let pre_count = table.count_rows(Some(id_filter.clone())).await?;
+            if pre_count > 0 {
+                table.delete(id_filter.as_str()).await?;
+                deleted += pre_count;
+            }
         }
-        table.delete(predicate.as_str()).await?;
-        Ok(pre_count)
+
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            let predicate = format!("{} AND {}", self.namespace_filter(namespace), id_filter);
+            let pre_count = table.count_rows(Some(predicate.clone())).await?;
+            if pre_count > 0 {
+                table.delete(predicate.as_str()).await?;
+                deleted += pre_count;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Batch delete documents by IDs within a namespace.
@@ -892,12 +963,7 @@ impl StorageManager {
         if ids.is_empty() {
             return Ok(0);
         }
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(0),
-        };
         const CHUNK: usize = 500;
-        let ns_filter = self.namespace_filter(namespace);
         let mut total_deleted = 0usize;
         for batch in ids.chunks(CHUNK) {
             let id_list = batch
@@ -905,38 +971,47 @@ impl StorageManager {
                 .map(|id| format!("'{}'", id.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let predicate = format!("{} AND id IN ({})", ns_filter, id_list);
-            let pre_count = table.count_rows(Some(predicate.clone())).await?;
-            if pre_count == 0 {
-                continue;
+            let id_predicate = format!("id IN ({})", id_list);
+            if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+                let pre_count = table.count_rows(Some(id_predicate.clone())).await?;
+                if pre_count > 0 {
+                    table.delete(id_predicate.as_str()).await?;
+                    total_deleted += pre_count;
+                }
             }
-            table.delete(predicate.as_str()).await?;
-            total_deleted += pre_count;
+            if let Some(table) = self.legacy_table_if_exists().await? {
+                let predicate =
+                    format!("{} AND {}", self.namespace_filter(namespace), id_predicate);
+                let pre_count = table.count_rows(Some(predicate.clone())).await?;
+                if pre_count > 0 {
+                    table.delete(predicate.as_str()).await?;
+                    total_deleted += pre_count;
+                }
+            }
         }
         Ok(total_deleted)
     }
 
     pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(0),
-        };
-        let predicate = self.namespace_filter(namespace);
-        let pre_count = table
-            .query()
-            .only_if(predicate.as_str())
-            .execute()
-            .await?
-            .try_fold(
-                0usize,
-                |acc, batch| async move { Ok(acc + batch.num_rows()) },
-            )
-            .await?;
-        if pre_count == 0 {
-            return Ok(0);
+        let mut deleted = 0usize;
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+            let pre_count = table.count_rows(None).await?;
+            if pre_count > 0 {
+                table
+                    .delete(self.namespace_filter(namespace).as_str())
+                    .await?;
+                deleted += pre_count;
+            }
         }
-        table.delete(predicate.as_str()).await?;
-        Ok(pre_count)
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            let predicate = self.namespace_filter(namespace);
+            let pre_count = table.count_rows(Some(predicate.clone())).await?;
+            if pre_count > 0 {
+                table.delete(predicate.as_str()).await?;
+                deleted += pre_count;
+            }
+        }
+        Ok(deleted)
     }
 
     pub async fn rename_namespace_atomic(&self, from: &str, to: &str) -> Result<usize> {
@@ -944,19 +1019,12 @@ impl StorageManager {
             return Ok(0);
         }
 
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(0),
-        };
-
-        let source_filter = self.namespace_filter(from);
-        let source_count = table.count_rows(Some(source_filter.clone())).await?;
+        let source_count = self.count_namespace(from).await?;
         if source_count == 0 {
             return Ok(0);
         }
 
-        let target_filter = self.namespace_filter(to);
-        let target_count = table.count_rows(Some(target_filter)).await?;
+        let target_count = self.count_namespace(to).await?;
         if target_count > 0 {
             return Err(anyhow!(
                 "Target namespace '{}' already exists with {} rows",
@@ -965,55 +1033,145 @@ impl StorageManager {
             ));
         }
 
-        let sql_literal = format!("'{}'", to.replace('\'', "''"));
-        let update = table
-            .update()
-            .only_if(source_filter)
-            .column("namespace", sql_literal)
-            .execute()
-            .await?;
+        let mut docs = self.all_documents(Some(from), source_count).await?;
+        for doc in &mut docs {
+            doc.namespace = to.to_string();
+        }
+        self.add_to_store(docs).await?;
+        let deleted = self.delete_namespace_documents(from).await?;
 
-        Ok(update.rows_updated as usize)
+        Ok(deleted)
     }
 
     pub fn get_collection_name(&self) -> &str {
         &self.collection_name
     }
 
-    async fn ensure_table(&self, dim: usize) -> Result<Table> {
-        let mut guard = self.table.lock().await;
-        if let Some(table) = guard.as_ref() {
-            return Ok(table.clone());
+    fn namespace_table_name(namespace: &str) -> String {
+        let mut safe = namespace
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        while safe.contains("__") {
+            safe = safe.replace("__", "_");
+        }
+        let safe = safe.trim_matches('_');
+        let safe = if safe.is_empty() { "default" } else { safe };
+        let safe = safe.chars().take(48).collect::<String>();
+        let hash = Sha256::digest(namespace.as_bytes());
+        let suffix = hash[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{NAMESPACE_TABLE_PREFIX}{safe}_{suffix}")
+    }
+
+    fn is_namespace_table_name(table_name: &str) -> bool {
+        table_name.starts_with(NAMESPACE_TABLE_PREFIX)
+    }
+
+    async fn data_table_names(&self) -> Result<Vec<String>> {
+        let table_names = self.lance.table_names().execute().await?;
+        Ok(table_names
+            .into_iter()
+            .filter(|name| name == DEFAULT_TABLE_NAME || Self::is_namespace_table_name(name))
+            .collect())
+    }
+
+    async fn open_named_table_if_exists(&self, table_name: &str) -> Result<Option<Table>> {
+        match self.lance.open_table(table_name).execute().await {
+            Ok(table) => Ok(Some(table)),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("not found")
+                    || msg.contains("does not exist")
+                    || msg.contains("no such file")
+                {
+                    Ok(None)
+                } else {
+                    Err(anyhow!("LanceDB error on table '{}': {}", table_name, e))
+                }
+            }
+        }
+    }
+
+    async fn open_namespace_table_if_exists(&self, namespace: &str) -> Result<Option<Table>> {
+        let table_name = Self::namespace_table_name(namespace);
+        if let Some(table) = self.namespace_tables.lock().await.get(&table_name).cloned() {
+            return Ok(Some(table));
+        }
+        let table = self.open_named_table_if_exists(&table_name).await?;
+        if let Some(table) = &table {
+            self.namespace_tables
+                .lock()
+                .await
+                .insert(table_name, table.clone());
+        }
+        Ok(table)
+    }
+
+    async fn ensure_namespace_table(&self, namespace: &str, dim: usize) -> Result<Table> {
+        let table_name = Self::namespace_table_name(namespace);
+        if let Some(table) = self.namespace_tables.lock().await.get(&table_name).cloned() {
+            return Ok(table);
         }
 
-        let maybe_table = self
-            .lance
-            .open_table(self.collection_name.as_str())
-            .execute()
-            .await;
-
-        let table = if let Ok(tbl) = maybe_table {
-            tbl
-        } else {
-            if dim == 0 {
-                return Err(anyhow!(
-                    "Vector table '{}' not found and dimension is unknown",
-                    self.collection_name
-                ));
+        let table = match self.open_named_table_if_exists(&table_name).await? {
+            Some(table) => table,
+            None => {
+                if dim == 0 {
+                    return Err(anyhow!(
+                        "Vector table '{}' not found and dimension is unknown",
+                        table_name
+                    ));
+                }
+                info!(
+                    "Creating Lance namespace table '{}' for '{}' with vector dimension {} (schema v{})",
+                    table_name, namespace, dim, SCHEMA_VERSION
+                );
+                let schema = Arc::new(Self::create_schema(dim));
+                self.lance
+                    .create_empty_table(table_name.as_str(), schema)
+                    .execute()
+                    .await?
             }
-            info!(
-                "Creating Lance table '{}' with vector dimension {} (schema v{})",
-                self.collection_name, dim, SCHEMA_VERSION
-            );
-            let schema = Arc::new(Self::create_schema(dim));
-            self.lance
-                .create_empty_table(self.collection_name.as_str(), schema)
-                .execute()
-                .await?
         };
 
-        *guard = Some(table.clone());
+        self.namespace_tables
+            .lock()
+            .await
+            .insert(table_name, table.clone());
         Ok(table)
+    }
+
+    async fn query_table_page(
+        &self,
+        table: &Table,
+        filter: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ChromaDocument>> {
+        let mut query = table.query().limit(limit).offset(offset);
+        if let Some(filter) = filter {
+            query = query.only_if(filter.as_str());
+        }
+        let mut stream = query.execute().await?;
+        let mut results = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            let mut docs = self.batch_to_docs(&batch)?;
+            results.append(&mut docs);
+        }
+        Ok(results)
+    }
+
+    async fn legacy_table_if_exists(&self) -> Result<Option<Table>> {
+        self.open_table_if_exists().await
     }
 
     /// Try to open the table without creating it.
@@ -1056,16 +1214,6 @@ impl StorageManager {
                 }
             }
         }
-    }
-
-    async fn open_existing_table(&self) -> Result<Table> {
-        self.open_table_if_exists().await?.ok_or_else(|| {
-            anyhow!(
-                "Vector table '{}' not found at {}. Index data first so rust-memex can use the stored embedding dimension instead of guessing.",
-                self.collection_name,
-                self.lance_path
-            )
-        })
     }
 
     /// Create the LanceDB schema with onion slice fields and content hash
@@ -1379,16 +1527,21 @@ impl StorageManager {
         namespace: &str,
         filter: &str,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(vec![]),
-        };
-        let combined = format!("{} AND ({})", self.namespace_filter(namespace), filter);
-        let mut stream = table.query().only_if(combined.as_str()).execute().await?;
         let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            results.append(&mut docs);
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+            let mut stream = table.query().only_if(filter).execute().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let mut docs = self.batch_to_docs(&batch)?;
+                results.append(&mut docs);
+            }
+        }
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            let combined = format!("{} AND ({})", self.namespace_filter(namespace), filter);
+            let mut stream = table.query().only_if(combined.as_str()).execute().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let mut docs = self.batch_to_docs(&batch)?;
+                results.append(&mut docs);
+            }
         }
         Ok(results)
     }
@@ -1404,31 +1557,68 @@ impl StorageManager {
         if embedding.is_empty() {
             return Ok(vec![]);
         }
-        let dim = embedding.len();
-        let table = self.ensure_table(dim).await?;
-
-        let mut query = table.query();
-
         // Build combined filter
         let mut filters = Vec::new();
-        if let Some(ns) = namespace {
-            filters.push(self.namespace_filter(ns));
-        }
         if let Some(layer) = layer_filter {
             filters.push(self.layer_filter(layer));
         }
-
-        if !filters.is_empty() {
-            let combined = filters.join(" AND ");
-            query = query.only_if(combined.as_str());
-        }
-
-        let mut stream = query.nearest_to(embedding)?.limit(k).execute().await?;
-
         let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            results.append(&mut docs);
+
+        if let Some(ns) = namespace {
+            if let Some(table) = self.open_namespace_table_if_exists(ns).await? {
+                let mut query = table.query();
+                if !filters.is_empty() {
+                    let combined = filters.join(" AND ");
+                    query = query.only_if(combined.as_str());
+                }
+                let mut stream = query
+                    .nearest_to(embedding.clone())?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            if let Some(table) = self.legacy_table_if_exists().await? {
+                let mut legacy_filters = vec![self.namespace_filter(ns)];
+                legacy_filters.extend(filters.clone());
+                let combined = legacy_filters.join(" AND ");
+                let mut stream = table
+                    .query()
+                    .only_if(combined.as_str())
+                    .nearest_to(embedding)?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            results.truncate(k);
+        } else {
+            for table_name in self.data_table_names().await? {
+                let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                    continue;
+                };
+                let mut query = table.query();
+                if !filters.is_empty() {
+                    let combined = filters.join(" AND ");
+                    query = query.only_if(combined.as_str());
+                }
+                let mut stream = query
+                    .nearest_to(embedding.clone())?
+                    .limit(k)
+                    .execute()
+                    .await?;
+                while let Some(batch) = stream.try_next().await? {
+                    let mut docs = self.batch_to_docs(&batch)?;
+                    results.append(&mut docs);
+                }
+            }
+            results.truncate(k);
         }
         debug!(
             "Lance returned {} results (layer filter: {:?})",
@@ -1530,36 +1720,42 @@ impl StorageManager {
     /// - Table doesn't exist yet
     /// - Table has old schema without content_hash column (graceful degradation)
     pub async fn has_content_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
-        // Graceful handling of old schema without content_hash column
-        if !Self::table_has_content_hash(&table).await {
-            tracing::warn!(
-                "Table '{}' has old schema without content_hash column. \
-                 Deduplication disabled. Consider re-indexing with new schema.",
-                self.collection_name
-            );
-            return Ok(false); // Can't check for duplicates, treat as new
+        let hash_filter = self.content_hash_filter(hash);
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await?
+            && Self::table_has_content_hash(&table).await
+        {
+            let mut stream = table
+                .query()
+                .only_if(hash_filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
+            if let Some(batch) = stream.try_next().await? {
+                return Ok(batch.num_rows() > 0);
+            }
         }
 
-        let filter = format!(
-            "{} AND {}",
-            self.namespace_filter(namespace),
-            self.content_hash_filter(hash)
-        );
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            if !Self::table_has_content_hash(&table).await {
+                tracing::warn!(
+                    "Table '{}' has old schema without content_hash column. \
+                     Deduplication disabled. Consider re-indexing with new schema.",
+                    self.collection_name
+                );
+                return Ok(false); // Can't check for duplicates, treat as new
+            }
 
-        let mut stream = table
-            .query()
-            .only_if(filter.as_str())
-            .limit(1)
-            .execute()
-            .await?;
+            let filter = format!("{} AND {}", self.namespace_filter(namespace), hash_filter);
+            let mut stream = table
+                .query()
+                .only_if(filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
 
-        if let Some(batch) = stream.try_next().await? {
-            return Ok(batch.num_rows() > 0);
+            if let Some(batch) = stream.try_next().await? {
+                return Ok(batch.num_rows() > 0);
+            }
         }
 
         Ok(false)
@@ -1573,35 +1769,42 @@ impl StorageManager {
     /// pre-v4 schema without the `source_hash` column (graceful degradation —
     /// older namespaces should be backfilled via `/admin/backfill-hashes`).
     pub async fn has_source_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
-        if !Self::table_has_source_hash(&table).await {
-            tracing::debug!(
-                "Table '{}' has pre-v4 schema without source_hash column. \
-                 Source-level dedup disabled until backfill.",
-                self.collection_name
-            );
-            return Ok(false);
+        let hash_filter = self.source_hash_filter(hash);
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await?
+            && Self::table_has_source_hash(&table).await
+        {
+            let mut stream = table
+                .query()
+                .only_if(hash_filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
+            if let Some(batch) = stream.try_next().await? {
+                return Ok(batch.num_rows() > 0);
+            }
         }
 
-        let filter = format!(
-            "{} AND {}",
-            self.namespace_filter(namespace),
-            self.source_hash_filter(hash)
-        );
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            if !Self::table_has_source_hash(&table).await {
+                tracing::debug!(
+                    "Table '{}' has pre-v4 schema without source_hash column. \
+                     Source-level dedup disabled until backfill.",
+                    self.collection_name
+                );
+                return Ok(false);
+            }
 
-        let mut stream = table
-            .query()
-            .only_if(filter.as_str())
-            .limit(1)
-            .execute()
-            .await?;
+            let filter = format!("{} AND {}", self.namespace_filter(namespace), hash_filter);
+            let mut stream = table
+                .query()
+                .only_if(filter.as_str())
+                .limit(1)
+                .execute()
+                .await?;
 
-        if let Some(batch) = stream.try_next().await? {
-            return Ok(batch.num_rows() > 0);
+            if let Some(batch) = stream.try_next().await? {
+                return Ok(batch.num_rows() > 0);
+            }
         }
 
         Ok(false)
@@ -1620,49 +1823,68 @@ impl StorageManager {
             return Ok(vec![]);
         }
 
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(hashes.iter().collect()),
-        };
-
-        // Graceful handling of old schema without content_hash column
-        if !Self::table_has_content_hash(&table).await {
-            tracing::warn!(
-                "Table '{}' has old schema without content_hash column. \
-                 Deduplication disabled. Consider re-indexing with new schema.",
-                self.collection_name
-            );
-            return Ok(hashes.iter().collect()); // All are "new" since we can't check
-        }
-
         // Query for existing hashes in this namespace
         // We build a filter with OR conditions for all hashes
         let hash_conditions: Vec<String> =
             hashes.iter().map(|h| self.content_hash_filter(h)).collect();
 
-        let filter = format!(
-            "{} AND ({})",
-            self.namespace_filter(namespace),
-            hash_conditions.join(" OR ")
-        );
-
-        let mut stream = table
-            .query()
-            .only_if(filter.as_str())
-            .limit(hashes.len())
-            .execute()
-            .await?;
-
-        // Collect existing hashes from results
         let mut existing_hashes = std::collections::HashSet::new();
-        while let Some(batch) = stream.try_next().await? {
-            if let Some(hash_col) = batch
-                .column_by_name("content_hash")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            {
-                for i in 0..batch.num_rows() {
-                    if !hash_col.is_null(i) {
-                        existing_hashes.insert(hash_col.value(i).to_string());
+
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await?
+            && Self::table_has_content_hash(&table).await
+        {
+            let filter = hash_conditions.join(" OR ");
+            let mut stream = table
+                .query()
+                .only_if(filter.as_str())
+                .limit(hashes.len())
+                .execute()
+                .await?;
+            while let Some(batch) = stream.try_next().await? {
+                if let Some(hash_col) = batch
+                    .column_by_name("content_hash")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    for i in 0..batch.num_rows() {
+                        if !hash_col.is_null(i) {
+                            existing_hashes.insert(hash_col.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            // Graceful handling of old schema without content_hash column
+            if !Self::table_has_content_hash(&table).await {
+                tracing::warn!(
+                    "Table '{}' has old schema without content_hash column. \
+                     Deduplication disabled. Consider re-indexing with new schema.",
+                    self.collection_name
+                );
+                return Ok(hashes.iter().collect()); // All are "new" since we can't check
+            }
+
+            let filter = format!(
+                "{} AND ({})",
+                self.namespace_filter(namespace),
+                hash_conditions.join(" OR ")
+            );
+            let mut stream = table
+                .query()
+                .only_if(filter.as_str())
+                .limit(hashes.len())
+                .execute()
+                .await?;
+            while let Some(batch) = stream.try_next().await? {
+                if let Some(hash_col) = batch
+                    .column_by_name("content_hash")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    for i in 0..batch.num_rows() {
+                        if !hash_col.is_null(i) {
+                            existing_hashes.insert(hash_col.value(i).to_string());
+                        }
                     }
                 }
             }
@@ -1681,8 +1903,16 @@ impl StorageManager {
 
     /// Run all optimizations (compact + prune old versions)
     pub async fn optimize(&self) -> Result<OptimizeStats> {
-        let table = self.open_existing_table().await?;
-        let stats = table.optimize(OptimizeAction::All).await?;
+        let mut stats = OptimizeStats {
+            compaction: None,
+            prune: None,
+        };
+        for table_name in self.data_table_names().await? {
+            let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                continue;
+            };
+            stats = table.optimize(OptimizeAction::All).await?;
+        }
         info!(
             "Optimize complete: compaction={:?}, prune={:?}",
             stats.compaction, stats.prune
@@ -1692,41 +1922,62 @@ impl StorageManager {
 
     /// Compact small files into larger ones for better performance
     pub async fn compact(&self) -> Result<OptimizeStats> {
-        let table = self.open_existing_table().await?;
-        let stats = table
-            .optimize(OptimizeAction::Compact {
-                options: Default::default(),
-                remap_options: None,
-            })
-            .await?;
+        let mut stats = OptimizeStats {
+            compaction: None,
+            prune: None,
+        };
+        for table_name in self.data_table_names().await? {
+            let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                continue;
+            };
+            stats = table
+                .optimize(OptimizeAction::Compact {
+                    options: Default::default(),
+                    remap_options: None,
+                })
+                .await?;
+        }
         info!("Compaction complete: {:?}", stats.compaction);
         Ok(stats)
     }
 
     /// Remove old versions older than specified duration (default: 7 days)
     pub async fn cleanup(&self, older_than_days: Option<u64>) -> Result<OptimizeStats> {
-        let table = self.open_existing_table().await?;
         let days = older_than_days.unwrap_or(7) as i64;
         let duration = chrono::TimeDelta::days(days);
-        let stats = table
-            .optimize(OptimizeAction::Prune {
-                older_than: Some(duration),
-                delete_unverified: Some(false),
-                error_if_tagged_old_versions: None,
-            })
-            .await?;
+        let mut stats = OptimizeStats {
+            compaction: None,
+            prune: None,
+        };
+        for table_name in self.data_table_names().await? {
+            let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                continue;
+            };
+            stats = table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(duration),
+                    delete_unverified: Some(false),
+                    error_if_tagged_old_versions: None,
+                })
+                .await?;
+        }
         info!("Cleanup complete: {:?}", stats.prune);
         Ok(stats)
     }
 
     /// Get table statistics (row count, fragments, etc.)
     pub async fn stats(&self) -> Result<TableStats> {
-        let table = self.open_existing_table().await?;
-        let row_count = table.count_rows(None).await?;
+        let table_names = self.data_table_names().await?;
+        let mut row_count = 0usize;
+        let mut version_count = 0usize;
 
-        // Get version count
-        let versions = table.list_versions().await.unwrap_or_default();
-        let version_count = versions.len();
+        for table_name in &table_names {
+            let Some(table) = self.open_named_table_if_exists(table_name).await? else {
+                continue;
+            };
+            row_count += table.count_rows(None).await.unwrap_or(0);
+            version_count += table.list_versions().await.unwrap_or_default().len();
+        }
 
         Ok(TableStats {
             row_count,
@@ -1738,12 +1989,14 @@ impl StorageManager {
 
     /// Count rows in a specific namespace
     pub async fn count_namespace(&self, namespace: &str) -> Result<usize> {
-        let table = match self.open_table_if_exists().await? {
-            Some(table) => table,
-            None => return Ok(0),
-        };
-        let filter = self.namespace_filter(namespace);
-        let count = table.count_rows(Some(filter)).await?;
+        let mut count = 0usize;
+        if let Some(table) = self.open_namespace_table_if_exists(namespace).await? {
+            count += table.count_rows(None).await?;
+        }
+        if let Some(table) = self.legacy_table_if_exists().await? {
+            let filter = self.namespace_filter(namespace);
+            count += table.count_rows(Some(filter)).await?;
+        }
         Ok(count)
     }
 
@@ -1752,20 +2005,7 @@ impl StorageManager {
     /// Note: This uses a full table scan with namespace filter.
     /// For very large namespaces, consider batching.
     pub async fn get_all_in_namespace(&self, namespace: &str) -> Result<Vec<ChromaDocument>> {
-        let table = match self.open_table_if_exists().await? {
-            Some(t) => t,
-            None => return Ok(vec![]),
-        };
-
-        let filter = self.namespace_filter(namespace);
-        let mut stream = table.query().only_if(filter.as_str()).execute().await?;
-
-        let mut results = Vec::new();
-        while let Some(batch) = stream.try_next().await? {
-            let mut docs = self.batch_to_docs(&batch)?;
-            results.append(&mut docs);
-        }
-
+        let results = self.all_documents(Some(namespace), 100_000).await?;
         debug!(
             "Retrieved {} documents from namespace '{}'",
             results.len(),
@@ -2101,18 +2341,25 @@ impl StorageManager {
         let mut namespace_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
-        const PAGE_SIZE: usize = 5000;
-        let mut offset = 0;
-        loop {
-            let page = self.all_documents_page(None, offset, PAGE_SIZE).await?;
-            let page_len = page.len();
-            for doc in &page {
-                *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+        for table_name in self.data_table_names().await? {
+            let Some(table) = self.open_named_table_if_exists(&table_name).await? else {
+                continue;
+            };
+            const PAGE_SIZE: usize = 5000;
+            let mut offset = 0;
+            loop {
+                let page = self
+                    .query_table_page(&table, None, offset, PAGE_SIZE)
+                    .await?;
+                let page_len = page.len();
+                for doc in &page {
+                    *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+                }
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset += page_len;
             }
-            if page_len < PAGE_SIZE {
-                break;
-            }
-            offset += page_len;
         }
 
         let mut namespaces: Vec<(String, usize)> = namespace_counts.into_iter().collect();
@@ -2125,6 +2372,7 @@ impl StorageManager {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn flat_documents_preserve_separate_chunk_and_source_hashes() {
@@ -2141,5 +2389,65 @@ mod tests {
         assert_eq!(doc.content_hash.as_deref(), Some("chunk-sha256"));
         assert_eq!(doc.source_hash.as_deref(), Some("source-sha256"));
         assert_ne!(doc.content_hash, doc.source_hash);
+    }
+
+    #[tokio::test]
+    async fn namespace_writes_use_separate_lance_tables_and_keep_contracts() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("lancedb");
+        let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
+            .await
+            .expect("storage");
+
+        let embedding = vec![0.25_f32; 8];
+        storage
+            .add_to_store(vec![
+                ChromaDocument::new_flat(
+                    "shared-id".to_string(),
+                    "kb:alpha".to_string(),
+                    embedding.clone(),
+                    json!({"ns": "alpha"}),
+                    "alpha memory".to_string(),
+                ),
+                ChromaDocument::new_flat(
+                    "shared-id".to_string(),
+                    "kb:beta".to_string(),
+                    embedding.clone(),
+                    json!({"ns": "beta"}),
+                    "beta memory".to_string(),
+                ),
+            ])
+            .await
+            .expect("write two namespaces");
+
+        let table_names = storage.lance.table_names().execute().await.expect("tables");
+        let namespace_tables = table_names
+            .iter()
+            .filter(|name| StorageManager::is_namespace_table_name(name))
+            .count();
+        assert_eq!(namespace_tables, 2, "{table_names:?}");
+        assert!(!table_names.iter().any(|name| name == DEFAULT_TABLE_NAME));
+
+        assert_eq!(storage.count_namespace("kb:alpha").await.unwrap(), 1);
+        assert_eq!(storage.count_namespace("kb:beta").await.unwrap(), 1);
+        assert_eq!(
+            storage
+                .get_document("kb:alpha", "shared-id")
+                .await
+                .unwrap()
+                .unwrap()
+                .document,
+            "alpha memory"
+        );
+        assert_eq!(
+            storage
+                .search_store(Some("kb:beta"), embedding, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|doc| doc.document)
+                .collect::<Vec<_>>(),
+            vec!["beta memory"]
+        );
     }
 }
