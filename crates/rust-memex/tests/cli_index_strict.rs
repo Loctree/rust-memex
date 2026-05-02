@@ -164,7 +164,7 @@ fn run_index(base_url: &str, extra_args: &[&str]) -> Output {
     fs::create_dir_all(&corpus).expect("create corpus");
     fs::write(
         corpus.join("doc.md"),
-        "# Broken embedding\n\nThis file should fail.\n",
+        "# Broken embedding test document\n\nThis document exists solely to trigger an embedding failure.\nThe mock embedding server will return HTTP 500 for this content.\nWe need enough text to pass the 50-char minimum document threshold.\n",
     )
     .expect("write sample file");
     let db_path = tmp.path().join("lancedb");
@@ -183,6 +183,8 @@ fn run_index(base_url: &str, extra_args: &[&str]) -> Output {
         "cli-index-strict".to_string(),
         "--recursive".to_string(),
         "--slice-mode".to_string(),
+        "flat".to_string(),
+        "--chunker".to_string(),
         "flat".to_string(),
         "--parallel".to_string(),
         "1".to_string(),
