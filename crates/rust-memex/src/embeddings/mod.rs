@@ -30,6 +30,8 @@ use std::time::Duration;
 
 pub const DEFAULT_REQUIRED_DIMENSION: usize = 2560;
 pub const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "qwen3-embedding:4b";
+const DEFAULT_MAX_BATCH_RETRIES: usize = 10;
+const DEFAULT_MAX_BATCH_BACKOFF_SECS: u64 = 30;
 
 // =============================================================================
 // REQUEST/RESPONSE TYPES (OpenAI-compatible)
@@ -99,6 +101,22 @@ fn default_priority() -> u8 {
 
 fn default_embeddings_endpoint() -> String {
     "/v1/embeddings".to_string()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Reranker configuration (optional, separate from embedders)
@@ -854,9 +872,16 @@ impl EmbeddingClient {
             model: self.embedder_model.clone(),
         };
 
-        // Retry with exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
-        const MAX_BATCH_RETRIES: usize = 10;
-        const MAX_BACKOFF_SECS: u64 = 30;
+        // Retry with exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max by default).
+        // Operators can lower this for deterministic failure-policy tests or short smokes.
+        let max_batch_retries = env_usize(
+            "RUST_MEMEX_EMBED_BATCH_MAX_RETRIES",
+            DEFAULT_MAX_BATCH_RETRIES,
+        );
+        let max_backoff_secs = env_u64(
+            "RUST_MEMEX_EMBED_BATCH_MAX_BACKOFF_SECS",
+            DEFAULT_MAX_BATCH_BACKOFF_SECS,
+        );
         let mut attempt = 0;
 
         loop {
@@ -870,27 +895,27 @@ impl EmbeddingClient {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    if attempt >= MAX_BATCH_RETRIES {
+                    if attempt >= max_batch_retries {
                         tracing::error!(
                             "Batch embedding failed after {} retries: {:?}\n  URL: {}\n  Model: {}",
-                            MAX_BATCH_RETRIES,
+                            max_batch_retries,
                             e,
                             self.embedder_url,
                             self.embedder_model
                         );
                         return Err(anyhow!(
                             "Embedding request failed after {} retries: {}",
-                            MAX_BATCH_RETRIES,
+                            max_batch_retries,
                             e
                         ));
                     }
 
                     // Exponential backoff with cap
-                    let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                    let backoff_secs = (1u64 << attempt.min(5)).min(max_backoff_secs);
                     tracing::warn!(
                         "Embedding request failed (attempt {}/{}), retrying in {}s: {}",
                         attempt,
-                        MAX_BATCH_RETRIES,
+                        max_batch_retries,
                         backoff_secs,
                         e
                     );
@@ -904,21 +929,21 @@ impl EmbeddingClient {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
 
-                if attempt >= MAX_BATCH_RETRIES {
+                if attempt >= max_batch_retries {
                     tracing::error!(
                         "Embedding API error after {} retries: {} - {}",
-                        MAX_BATCH_RETRIES,
+                        max_batch_retries,
                         status,
                         body
                     );
                     return Err(anyhow!("Embedding API error: {} - {}", status, body));
                 }
 
-                let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                let backoff_secs = (1u64 << attempt.min(5)).min(max_backoff_secs);
                 tracing::warn!(
                     "Embedding API error (attempt {}/{}), retrying in {}s: {} - {}",
                     attempt,
-                    MAX_BATCH_RETRIES,
+                    max_batch_retries,
                     backoff_secs,
                     status,
                     body
@@ -931,14 +956,14 @@ impl EmbeddingClient {
             let embedding_response: EmbeddingResponse = match response.json().await {
                 Ok(r) => r,
                 Err(e) => {
-                    if attempt >= MAX_BATCH_RETRIES {
+                    if attempt >= max_batch_retries {
                         return Err(anyhow!("Failed to parse embedding response: {}", e));
                     }
-                    let backoff_secs = (1u64 << attempt.min(5)).min(MAX_BACKOFF_SECS);
+                    let backoff_secs = (1u64 << attempt.min(5)).min(max_backoff_secs);
                     tracing::warn!(
                         "Failed to parse response (attempt {}/{}), retrying in {}s: {}",
                         attempt,
-                        MAX_BATCH_RETRIES,
+                        max_batch_retries,
                         backoff_secs,
                         e
                     );

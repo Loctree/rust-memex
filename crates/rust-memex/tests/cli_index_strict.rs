@@ -193,6 +193,8 @@ fn run_index(base_url: &str, extra_args: &[&str]) -> Output {
 
     Command::new(env!("CARGO_BIN_EXE_rust-memex"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("RUST_MEMEX_EMBED_BATCH_MAX_RETRIES", "1")
+        .env("RUST_MEMEX_EMBED_BATCH_MAX_BACKOFF_SECS", "0")
         .args(args)
         .output()
         .expect("run rust-memex index")
