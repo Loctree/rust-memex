@@ -261,7 +261,7 @@ async fn merge_endpoint_dry_run_and_execute_work() {
             .expect("dry-run merge body"),
     )
     .expect("dry-run merge json");
-    assert_eq!(dry_run_json["dry_run"], true);
+    assert!(dry_run_json["dry_run"].as_bool().unwrap());
     assert_eq!(dry_run_json["progress"]["total_docs"], 2);
     assert_eq!(dry_run_json["progress"]["docs_copied"], 2);
     assert_eq!(
@@ -559,6 +559,6 @@ async fn recovery_sse_endpoints_stream_independent_operations_and_alias() {
         .find(|(event, _)| event == "done")
         .map(|(_, data)| data.clone())
         .expect("optimize done");
-    assert_eq!(optimize_done["compact_ok"], true);
-    assert_eq!(optimize_done["prune_ok"], true);
+    assert!(optimize_done["compact_ok"].as_bool().unwrap());
+    assert!(optimize_done["prune_ok"].as_bool().unwrap());
 }

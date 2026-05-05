@@ -218,7 +218,7 @@ fn jsonrpc_success_includes_id_when_present() {
     let resp = jsonrpc_success(&json!(42), json!({"ok": true}));
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 42);
-    assert_eq!(resp["result"]["ok"], true);
+    assert!(resp["result"]["ok"].as_bool().unwrap());
     assert!(resp.get("error").is_none());
 }
 

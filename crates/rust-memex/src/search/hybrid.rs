@@ -382,6 +382,7 @@ impl HybridSearcher {
         options: SearchOptions,
     ) -> Result<Vec<HybridSearchResult>> {
         let expanded_limit = candidate_limit(limit, &options); // Get more candidates for fusion
+        let query_policy = QueryPolicy::from_query(query);
 
         // Run vector search
         let vector_results = self
@@ -457,6 +458,18 @@ impl HybridSearcher {
             }
         }
 
+        if query_policy.precision_query {
+            final_results.extend(
+                self.lexical_precision_candidates(
+                    &query_policy,
+                    namespace,
+                    expanded_limit,
+                    &options,
+                )
+                .await?,
+            );
+        }
+
         Self::apply_post_search_processing(query, &mut final_results, &options);
         Self::dedup_by_chunk_hash(&mut final_results);
         Self::dedup_by_source_path(&mut final_results);
@@ -473,6 +486,58 @@ impl HybridSearcher {
         Ok(final_results)
     }
 
+    async fn lexical_precision_candidates(
+        &self,
+        query_policy: &QueryPolicy,
+        namespace: Option<&str>,
+        limit: usize,
+        options: &SearchOptions,
+    ) -> Result<Vec<HybridSearchResult>> {
+        let docs = self.storage.all_documents(namespace, 100_000).await?;
+        let mut results = Vec::new();
+
+        for doc in docs {
+            let layer = doc.slice_layer();
+            let layer_matches = match options.layer_filter {
+                Some(SliceLayer::Outer) => layer.is_none() || layer == Some(SliceLayer::Outer),
+                Some(expected) => layer == Some(expected),
+                None => true,
+            };
+            if !layer_matches {
+                continue;
+            }
+
+            let evidence = SearchEvidence::from_parts(&doc.document, &doc.keywords, &doc.metadata);
+            let score = query_policy.lexical_score(&evidence);
+            if score <= 0.0 {
+                continue;
+            }
+
+            results.push(HybridSearchResult {
+                id: doc.id,
+                namespace: doc.namespace,
+                document: doc.document,
+                combined_score: score,
+                vector_score: None,
+                bm25_score: Some(score),
+                metadata: doc.metadata,
+                layer,
+                parent_id: doc.parent_id,
+                children_ids: doc.children_ids,
+                keywords: doc.keywords,
+            });
+        }
+
+        results.sort_by(|left, right| {
+            right
+                .combined_score
+                .partial_cmp(&left.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
     fn apply_post_search_processing(
         query: &str,
         results: &mut Vec<HybridSearchResult>,
@@ -482,9 +547,32 @@ impl HybridSearcher {
             results.retain(|result| matches_project_filter(&result.metadata, project));
         }
 
+        let query_policy = QueryPolicy::from_query(query);
         for result in results.iter_mut() {
-            result.combined_score =
+            let evidence =
+                SearchEvidence::from_parts(&result.document, &result.keywords, &result.metadata);
+            let lexical_score = query_policy.lexical_score(&evidence);
+            let mut score =
                 boosted_score(query, result.combined_score, &result.metadata, result.layer);
+
+            if query_policy.precision_query {
+                if lexical_score <= 0.0 {
+                    score *= 0.12;
+                } else {
+                    score += lexical_score;
+                }
+
+                if result.layer == Some(SliceLayer::Outer)
+                    && looks_like_keyword_stub(&result.document)
+                    && lexical_score < query_policy.strong_match_threshold()
+                {
+                    score *= 0.35;
+                }
+            } else if lexical_score > 0.0 {
+                score += lexical_score.min(0.25);
+            }
+
+            result.combined_score = score;
         }
 
         results.sort_by(|left, right| {
@@ -695,6 +783,184 @@ fn candidate_limit(limit: usize, options: &SearchOptions) -> usize {
     limit.max(1) * multiplier
 }
 
+struct SearchEvidence {
+    text: String,
+}
+
+impl SearchEvidence {
+    fn from_parts(document: &str, keywords: &[String], metadata: &Value) -> Self {
+        Self {
+            text: normalize_search_text(&format!(
+                "{} {} {}",
+                document,
+                keywords.join(" "),
+                metadata
+            )),
+        }
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.text.contains(needle)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueryPolicy {
+    precision_query: bool,
+    anchors: Vec<Vec<String>>,
+}
+
+impl QueryPolicy {
+    fn from_query(query: &str) -> Self {
+        let raw_terms = query
+            .split_whitespace()
+            .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-'))
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        let normalized_terms = raw_terms
+            .iter()
+            .map(|term| normalize_search_text(term))
+            .filter(|term| !term.is_empty() && !is_search_stopword(term))
+            .collect::<Vec<_>>();
+
+        let has_acronym = raw_terms.iter().any(|term| {
+            let alpha_count = term.chars().filter(|ch| ch.is_alphabetic()).count();
+            let upper_count = term.chars().filter(|ch| ch.is_uppercase()).count();
+            (2..=8).contains(&alpha_count) && upper_count >= 2
+        });
+        let has_definition_intent = normalized_terms.iter().any(|term| {
+            matches!(
+                term.as_str(),
+                "definition" | "defined" | "define" | "definicja" | "definicje" | "znaczenie"
+            )
+        });
+        let precision_query = normalized_terms.len() <= 4 && (has_acronym || has_definition_intent);
+
+        let anchors = normalized_terms
+            .iter()
+            .map(|term| expanded_anchor_terms(term))
+            .collect::<Vec<_>>();
+
+        Self {
+            precision_query,
+            anchors,
+        }
+    }
+
+    fn lexical_score(&self, evidence: &SearchEvidence) -> f32 {
+        if self.anchors.is_empty() {
+            return 0.0;
+        }
+
+        let mut matched = 0usize;
+        let mut score = 0.0f32;
+        for anchor_group in &self.anchors {
+            let mut group_score = 0.0f32;
+            for anchor in anchor_group {
+                if evidence.contains(anchor) {
+                    group_score = group_score.max(anchor_weight(anchor));
+                }
+            }
+            if group_score > 0.0 {
+                matched += 1;
+                score += group_score;
+            }
+        }
+
+        if self.precision_query && matched == self.anchors.len() {
+            score += 1.0;
+        }
+
+        score
+    }
+
+    fn strong_match_threshold(&self) -> f32 {
+        if self.anchors.len() >= 2 { 2.0 } else { 1.0 }
+    }
+}
+
+fn expanded_anchor_terms(term: &str) -> Vec<String> {
+    match term {
+        "dou" => vec![
+            "dou".to_string(),
+            "vc dou".to_string(),
+            "vc-dou".to_string(),
+            "definition of undone".to_string(),
+            "undone".to_string(),
+        ],
+        "definicja" | "definicje" | "znaczenie" => vec![
+            term.to_string(),
+            "definition".to_string(),
+            "defined".to_string(),
+            "define".to_string(),
+        ],
+        "definition" | "defined" | "define" => vec![
+            term.to_string(),
+            "definicja".to_string(),
+            "definicje".to_string(),
+        ],
+        other => vec![other.to_string()],
+    }
+}
+
+fn anchor_weight(anchor: &str) -> f32 {
+    match anchor {
+        "definition of undone" => 2.0,
+        "vc dou" | "vc-dou" | "dou" => 1.4,
+        "definition" | "definicja" | "definicje" => 1.2,
+        _ => 1.0,
+    }
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() || ch == '-' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_search_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "the"
+            | "a"
+            | "an"
+            | "and"
+            | "or"
+            | "of"
+            | "in"
+            | "o"
+            | "i"
+            | "w"
+            | "we"
+            | "na"
+            | "do"
+            | "to"
+            | "jest"
+            | "co"
+            | "czym"
+    )
+}
+
+fn looks_like_keyword_stub(document: &str) -> bool {
+    let trimmed = document.trim();
+    trimmed.starts_with('[')
+        && trimmed
+            .lines()
+            .next()
+            .is_some_and(|line| line.len() < 180 && line.contains(',') && line.contains(']'))
+}
+
 fn matches_project_filter(metadata: &Value, project: &str) -> bool {
     let needle = project.trim();
     if needle.is_empty() {
@@ -833,6 +1099,29 @@ mod tests {
         assert_eq!(config.vector_weight, 0.6);
         assert_eq!(config.bm25_weight, 0.4);
         assert!(!config.use_rrf);
+    }
+
+    #[test]
+    fn precision_query_boosts_dou_definition_evidence() {
+        let policy = QueryPolicy::from_query("DoU definicja");
+        assert!(policy.precision_query);
+
+        let good = SearchEvidence::from_parts(
+            "8. vc-dou — Definition of Undone audit calej powierzchni produktu",
+            &[],
+            &json!({}),
+        );
+        let weak = SearchEvidence::from_parts(
+            "[assistant, nie, search, wiec, juz] [project: VetCoders/ai-contexters]",
+            &[],
+            &json!({}),
+        );
+
+        assert!(policy.lexical_score(&good) >= policy.strong_match_threshold());
+        assert_eq!(policy.lexical_score(&weak), 0.0);
+        assert!(looks_like_keyword_stub(
+            "[assistant, nie, search, wiec, juz] [project: x]"
+        ));
     }
 
     #[tokio::test]

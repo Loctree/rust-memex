@@ -494,7 +494,7 @@ async fn purge_quality_endpoint_requires_dry_run_then_executes() {
 
     assert_eq!(dry_run_response.status(), StatusCode::OK);
     let dry_run_json: Value = response_json(dry_run_response).await;
-    assert_eq!(dry_run_json["dry_run"], true);
+    assert!(dry_run_json["dry_run"].as_bool().unwrap());
     assert_eq!(
         test_app
             .storage
@@ -553,7 +553,7 @@ async fn dedup_endpoint_lists_duplicates_then_executes() {
 
     assert_eq!(dry_run_response.status(), StatusCode::OK);
     let dry_run_json: Value = response_json(dry_run_response).await;
-    assert_eq!(dry_run_json["dry_run"], true);
+    assert!(dry_run_json["dry_run"].as_bool().unwrap());
     assert_eq!(
         dry_run_json["result"]["group_by"], "source-hash-layer",
         "post-v4 default must surface back to the operator on the wire"
@@ -588,7 +588,7 @@ async fn dedup_endpoint_lists_duplicates_then_executes() {
 
     assert_eq!(execute_response.status(), StatusCode::OK);
     let execute_json: Value = response_json(execute_response).await;
-    assert_eq!(execute_json["execute"], true);
+    assert!(execute_json["execute"].as_bool().unwrap());
     assert_eq!(execute_json["result"]["group_by"], "source-hash-layer");
     assert_eq!(execute_json["result"]["duplicates_removed"], 1);
     // 4 seeded - 1 removed = 3 (dup-keep + dup-unique + dup-pre-v4).
@@ -625,7 +625,7 @@ async fn dedup_endpoint_supports_legacy_content_hash_grouping() {
 
     assert_eq!(dry_run_response.status(), StatusCode::OK);
     let dry_run_json: Value = response_json(dry_run_response).await;
-    assert_eq!(dry_run_json["dry_run"], true);
+    assert!(dry_run_json["dry_run"].as_bool().unwrap());
     assert_eq!(
         dry_run_json["result"]["group_by"], "content-hash",
         "legacy opt-in must echo back so operators can audit which mode ran"

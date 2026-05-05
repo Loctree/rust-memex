@@ -461,7 +461,12 @@ fn emit_backfill_progress(
     let tick = (elapsed as usize / 10) % SPINNER.len();
     eprint!(
         "\r  {} [{:>6}/{:>6}] {:5.1}%  {:.0} docs/s  ETA {}   ",
-        SPINNER[tick], processed, total, pct, rate, fmt_duration(eta)
+        SPINNER[tick],
+        processed,
+        total,
+        pct,
+        rate,
+        fmt_duration(eta)
     );
 }
 
@@ -934,7 +939,7 @@ mod backfill_tests {
     async fn backfill_promotes_legacy_content_hash_to_source_hash() {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("lancedb");
-        let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
+        let storage = StorageManager::new_lance_only(db_path.to_str().expect("utf-8 temp db path"))
             .await
             .expect("storage");
         storage.ensure_collection().await.expect("collection");
@@ -1064,7 +1069,8 @@ mod dedup_grouping_tests {
     #[tokio::test]
     async fn source_hash_layer_grouping_preserves_onion_structure() {
         let tmp = TempDir::new().expect("temp dir");
-        let storage = StorageManager::new_lance_only(tmp.path().join("db").to_str().unwrap())
+        let db_path = tmp.path().join("db");
+        let storage = StorageManager::new_lance_only(db_path.to_str().expect("utf-8 temp db path"))
             .await
             .expect("storage");
         storage.ensure_collection().await.expect("collection");
@@ -1151,7 +1157,8 @@ mod dedup_grouping_tests {
     #[tokio::test]
     async fn content_hash_grouping_finds_zero_duplicates_on_fresh_onion() {
         let tmp = TempDir::new().expect("temp dir");
-        let storage = StorageManager::new_lance_only(tmp.path().join("db").to_str().unwrap())
+        let db_path = tmp.path().join("db");
+        let storage = StorageManager::new_lance_only(db_path.to_str().expect("utf-8 temp db path"))
             .await
             .expect("storage");
         storage.ensure_collection().await.expect("collection");

@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::embeddings::EmbeddingClient;
+use crate::preprocessing::{PreprocessingConfig, Preprocessor};
 use crate::rag::{ChunkOpts, ChunkerKind, OuterSynthesis, SliceMode, detect_default_chunker};
 use crate::storage::{ChromaDocument, StorageManager};
 
@@ -429,6 +430,10 @@ pub struct PipelineConfig {
     pub outer_synthesis: OuterSynthesis,
     /// Enable storage-backed deduplication.
     pub dedup_enabled: bool,
+    /// Optional semantic cleanup applied after raw source hashing/dedup and
+    /// before chunking. The source hash intentionally remains the raw file hash
+    /// so pipeline outputs stay replayable from the original corpus.
+    pub preprocess_config: Option<PreprocessingConfig>,
     /// Maximum number of embedding requests allowed in flight.
     pub embed_concurrency: usize,
     /// Optional adaptive governor for runtime batch/concurrency tuning.
@@ -454,6 +459,7 @@ impl Default for PipelineConfig {
             chunker: None,
             outer_synthesis: OuterSynthesis::default(),
             dedup_enabled: true,
+            preprocess_config: None,
             embed_concurrency: 1,
             governor: None,
             event_sender: None,
@@ -898,9 +904,15 @@ async fn stage_read_files(
     namespace: String,
     storage: Arc<StorageManager>,
     dedup_enabled: bool,
+    preprocess_config: Option<PreprocessingConfig>,
     tx: mpsc::Sender<FileContent>,
     observer: PipelineObserver,
 ) {
+    let preprocessor = preprocess_config.map(|config| {
+        let min_content_length = config.min_content_length;
+        (min_content_length, Preprocessor::new(config))
+    });
+
     for path in files {
         let text = match extract_file_text(&path).await {
             Ok(text) => text,
@@ -963,6 +975,23 @@ async fn stage_read_files(
             }
         }
 
+        let text = if let Some((min_content_length, preprocessor)) = &preprocessor {
+            let cleaned = preprocessor.extract_semantic_content(&text);
+            if cleaned.trim().len() < *min_content_length {
+                observer
+                    .emit(PipelineEvent::FileSkipped {
+                        path: path.clone(),
+                        content_hash,
+                        reason: "preprocessed content below min length".to_string(),
+                    })
+                    .await;
+                continue;
+            }
+            cleaned
+        } else {
+            text
+        };
+
         let bytes = text.len();
         let content = FileContent {
             path: path.clone(),
@@ -1023,8 +1052,12 @@ async fn stage_chunk_content(
     while let Some(file_content) = rx.recv().await {
         let path = file_content.path.clone();
         let content_hash = file_content.content_hash.clone();
-        let selected_chunker = chunker
-            .unwrap_or_else(|| detect_default_chunker(&file_content.path, &file_content.namespace));
+        let selected_chunker = select_pipeline_chunker(
+            chunker,
+            slice_mode,
+            &file_content.path,
+            &file_content.namespace,
+        );
         let opts = ChunkOpts::new(
             selected_chunker,
             selected_chunker.slice_mode(slice_mode),
@@ -1068,6 +1101,23 @@ async fn stage_chunk_content(
     }
 
     info!("Chunker stage complete");
+}
+
+fn select_pipeline_chunker(
+    explicit: Option<ChunkerKind>,
+    requested_slice_mode: SliceMode,
+    source_path: &Path,
+    namespace: &str,
+) -> ChunkerKind {
+    if let Some(chunker) = explicit {
+        return chunker;
+    }
+
+    if requested_slice_mode == SliceMode::Flat {
+        return ChunkerKind::Flat;
+    }
+
+    detect_default_chunker(source_path, namespace)
 }
 
 // =============================================================================
@@ -1526,12 +1576,14 @@ pub async fn run_pipeline(
     let chunker = config.chunker;
     let outer_synthesis = config.outer_synthesis.clone();
     let dedup_enabled = config.dedup_enabled;
+    let preprocess_config = config.preprocess_config.clone();
 
     let reader_handle = tokio::spawn(stage_read_files(
         files,
         ns_for_reader,
         storage_for_reader,
         dedup_enabled,
+        preprocess_config,
         tx1,
         observer.clone(),
     ));
@@ -1608,9 +1660,79 @@ mod tests {
             crate::rag::OuterSynthesis::Keyword
         ));
         assert!(config.dedup_enabled);
+        assert!(config.preprocess_config.is_none());
         assert_eq!(config.embed_concurrency, 1);
         assert!(config.governor.is_none());
         assert!(config.event_sender.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_reader_applies_preprocess_after_raw_source_hashing() {
+        let tmp = TempDir::new().expect("temp dir");
+        let source = tmp.path().join("conversation.md");
+        let raw = "Operator decision: ship flat memory.\n\nsession_id: 123e4567-e89b-12d3-a456-426614174000\n";
+        std::fs::write(&source, raw).expect("write source");
+
+        let storage = Arc::new(
+            StorageManager::new_lance_only(tmp.path().join("lancedb").to_str().unwrap())
+                .await
+                .expect("storage"),
+        );
+        storage.ensure_collection().await.expect("collection");
+        let observer = PipelineObserver::new(
+            1,
+            1,
+            0,
+            None,
+            EmbedRuntimeSettings::new(8_192, 16, 1),
+            "fixed".to_string(),
+            "operator-configured limits".to_string(),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        stage_read_files(
+            vec![source],
+            "kb:test".to_string(),
+            storage,
+            false,
+            Some(PreprocessingConfig {
+                remove_metadata: true,
+                min_content_length: 1,
+                ..Default::default()
+            }),
+            tx,
+            observer,
+        )
+        .await;
+
+        let content = rx.recv().await.expect("preprocessed file content");
+        assert_eq!(content.content_hash, crate::rag::compute_content_hash(raw));
+        assert!(content.text.contains("Operator decision"));
+        assert!(!content.text.contains("123e4567"));
+    }
+
+    #[test]
+    fn pipeline_auto_chunker_honors_explicit_flat_slice_mode() {
+        let selected = select_pipeline_chunker(
+            None,
+            SliceMode::Flat,
+            Path::new("/Users/silver/memex-index-staging/miksa-clean/conversation.md"),
+            "kb:mikserka",
+        );
+
+        assert_eq!(selected, ChunkerKind::Flat);
+    }
+
+    #[test]
+    fn pipeline_auto_chunker_keeps_transcript_routing_for_onion_modes() {
+        let selected = select_pipeline_chunker(
+            None,
+            SliceMode::Onion,
+            Path::new("/Users/polyversai/.aicx/store/Loctree/session.md"),
+            "aicx",
+        );
+
+        assert_eq!(selected, ChunkerKind::Aicx);
     }
 
     #[tokio::test]

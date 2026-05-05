@@ -228,7 +228,7 @@ async fn health_reports_pre_v4_table_as_needing_migration() {
     assert_eq!(body["status"], "needs_migration");
     assert_eq!(body["schema_version"], "v3-pre");
     assert_eq!(body["expected_schema"], "v4");
-    assert_eq!(body["needs_migration"], true);
+    assert!(body["needs_migration"].as_bool().unwrap());
     assert_eq!(body["missing_columns"], json!(["source_hash"]));
     assert!(body["manifest_version"].as_u64().is_some(), "{body}");
     assert_eq!(body["last_successful_append_at"], Value::Null);
@@ -269,7 +269,7 @@ async fn health_reports_ok_after_migration_and_successful_upsert() {
     let body = read_json(response).await;
     assert_eq!(body["status"], "ok");
     assert_eq!(body["schema_version"], "v4");
-    assert_eq!(body["needs_migration"], false);
+    assert!(!body["needs_migration"].as_bool().unwrap());
     assert_eq!(body["missing_columns"], json!([]));
     assert!(
         body["last_successful_append_at"].as_str().is_some(),
@@ -298,7 +298,7 @@ async fn health_reports_empty_current_schema_before_first_append() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["schema_version"], "v4");
     assert_eq!(body["expected_schema"], "v4");
-    assert_eq!(body["needs_migration"], false);
+    assert!(!body["needs_migration"].as_bool().unwrap());
     assert_eq!(body["missing_columns"], json!([]));
     assert_eq!(body["manifest_version"], Value::Null);
     assert_eq!(body["last_successful_append_at"], Value::Null);

@@ -590,10 +590,6 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
     // Pipeline mode: concurrent stages with channels
     if pipeline {
-        if preprocess {
-            eprintln!("Warning: --preprocess is not supported in pipeline mode (ignoring)");
-        }
-
         let (checkpoint, existing_checkpoint_loaded) = if resume {
             if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
                 let resumed_count = cp.indexed_files.len();
@@ -682,6 +678,10 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             chunker,
             outer_synthesis: outer_synthesis.clone(),
             dedup_enabled: dedup && !disable_storage_dedup,
+            preprocess_config: preprocess.then_some(PreprocessingConfig {
+                remove_metadata: sanitize_metadata,
+                ..Default::default()
+            }),
             embed_concurrency: pipeline_embed_concurrency as usize,
             governor: pipeline_governor.then(|| {
                 PipelineGovernorConfig::adaptive(
@@ -961,33 +961,59 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
             let file_result = match result {
                 Ok(rust_memex::IndexResult::Indexed { chunks_indexed, .. }) => {
-                    // Handle calibration on first completed file
-                    if !calibration_done.swap(true, Ordering::SeqCst)
-                        && let Some(ref t) = tracker
-                    {
-                        let mut guard = t.lock().await;
-                        guard.finish_calibration(chunks_indexed, &embedder_model);
-                        guard.adjust_estimate(file_bytes, chunks_indexed);
-                        guard.start_progress_bar();
-                    }
+                    if chunks_indexed == 0 {
+                        // A zero-chunk "success" means the file did not actually land in memory.
+                        // Treat it as a per-file failure so strict/threshold policies can catch it.
+                        if !calibration_done.swap(true, Ordering::SeqCst)
+                            && let Some(ref t) = tracker
+                        {
+                            let mut guard = t.lock().await;
+                            guard.finish_calibration(0, &embedder_model);
+                            guard.start_progress_bar();
+                        }
 
-                    indexed_count.fetch_add(1, Ordering::SeqCst);
-                    total_chunks_count.fetch_add(chunks_indexed, Ordering::SeqCst);
+                        let error = "no chunks indexed".to_string();
+                        failed_count.fetch_add(1, Ordering::SeqCst);
 
-                    if let Some(ref t) = tracker {
-                        t.lock().await.file_indexed(chunks_indexed);
+                        if let Some(ref t) = tracker {
+                            t.lock().await.file_failed();
+                        } else {
+                            eprintln!("  -> {} FAILED: {}", display_path, error);
+                        }
+
+                        FileIndexResult::Failed {
+                            path: display_path,
+                            error,
+                        }
                     } else {
-                        eprintln!("  -> {} done ({} chunks)", display_path, chunks_indexed);
-                    }
+                        // Handle calibration on first completed file
+                        if !calibration_done.swap(true, Ordering::SeqCst)
+                            && let Some(ref t) = tracker
+                        {
+                            let mut guard = t.lock().await;
+                            guard.finish_calibration(chunks_indexed, &embedder_model);
+                            guard.adjust_estimate(file_bytes, chunks_indexed);
+                            guard.start_progress_bar();
+                        }
 
-                    // Update checkpoint
-                    if resume {
-                        let mut cp = checkpoint.lock().await;
-                        cp.mark_indexed(&file_path);
-                        let _ = cp.save(&db_path);
-                    }
+                        indexed_count.fetch_add(1, Ordering::SeqCst);
+                        total_chunks_count.fetch_add(chunks_indexed, Ordering::SeqCst);
 
-                    FileIndexResult::Indexed
+                        if let Some(ref t) = tracker {
+                            t.lock().await.file_indexed(chunks_indexed);
+                        } else {
+                            eprintln!("  -> {} done ({} chunks)", display_path, chunks_indexed);
+                        }
+
+                        // Update checkpoint
+                        if resume {
+                            let mut cp = checkpoint.lock().await;
+                            cp.mark_indexed(&file_path);
+                            let _ = cp.save(&db_path);
+                        }
+
+                        FileIndexResult::Indexed
+                    }
                 }
                 Ok(rust_memex::IndexResult::Skipped { reason, .. }) => {
                     // Handle calibration if this was the first file

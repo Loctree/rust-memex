@@ -1047,7 +1047,7 @@ mod tests {
     fn jsonrpc_success_omits_null_id() {
         let response = jsonrpc_success(&Value::Null, json!({"ok": true}));
         assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["result"]["ok"], true);
+        assert!(response["result"]["ok"].as_bool().unwrap());
         assert_eq!(response.get("id"), None);
     }
 

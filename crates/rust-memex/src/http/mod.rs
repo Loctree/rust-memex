@@ -41,6 +41,7 @@
 //!
 //! Vibecrafted with AI Agents by Loctree (c)2026 Loctree
 
+mod context_pack;
 mod lifecycle;
 mod recovery;
 
@@ -267,11 +268,15 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             transition: border-color 0.2s;
         }
         .doc-card:hover { border-color: var(--accent); }
+        .doc-card.cluster-card {
+            border-left: 3px solid var(--accent);
+        }
         .doc-header {
             display: flex;
             justify-content: space-between;
             align-items: flex-start;
             margin-bottom: 8px;
+            gap: 12px;
         }
         .doc-id {
             font-family: monospace;
@@ -280,6 +285,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             background: var(--bg);
             padding: 4px 8px;
             border-radius: 4px;
+            overflow-wrap: anywhere;
         }
         .doc-score {
             font-size: 12px;
@@ -313,6 +319,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             margin-top: 12px;
             display: flex;
             gap: 8px;
+            flex-wrap: wrap;
         }
         .doc-actions button {
             padding: 6px 12px;
@@ -505,6 +512,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const API = window.location.origin;
         let currentNamespace = null;
         let latestDiscovery = null;
+        let latestSearchClusters = [];
 
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
@@ -664,6 +672,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
             const list = document.getElementById('doc-list');
             list.innerHTML = '<div class="loading">Searching...</div>';
+            latestSearchClusters = [];
 
             const namespace = document.getElementById('namespace-select').value || null;
             const project = document.getElementById('project-input').value.trim() || null;
@@ -684,8 +693,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                 const data = await res.json();
 
                 document.getElementById('results-title').textContent = `Search: "${query}"`;
+                const clusterCount = Array.isArray(data.clusters) ? data.clusters.length : 0;
+                const duplicateCount = typeof data.duplicate_count === 'number' ? data.duplicate_count : 0;
                 document.getElementById('results-count').textContent =
-                    `${data.count} results in ${data.elapsed_ms}ms`;
+                    `${clusterCount} clusters, ${duplicateCount} hidden duplicates in ${data.elapsed_ms}ms`;
 
                 if (data.results.length === 0) {
                     list.innerHTML = `
@@ -697,13 +708,49 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                     return;
                 }
 
-                list.innerHTML = data.results.map(doc => renderDocCard(doc, true)).join('');
+                latestSearchClusters = Array.isArray(data.clusters) ? data.clusters : [];
+                list.innerHTML = latestSearchClusters.length > 0
+                    ? latestSearchClusters.map((cluster, index) => renderClusterCard(cluster, index)).join('')
+                    : data.results.map(doc => renderDocCard(doc, true)).join('');
             } catch (e) {
                 list.innerHTML = `<div class="empty-state" style="color:var(--error)">
                     <h3>Search failed</h3>
                     <p>${e.message}</p>
                 </div>`;
             }
+        }
+
+        function renderClusterCard(cluster, index) {
+            const doc = cluster.representative;
+            const text = doc.text || '';
+            const truncated = text.length > 650 ? text.slice(0, 650) + '...' : text;
+            const layer = doc.layer || 'flat';
+            const label = cluster.source_path || cluster.session_id || doc.id;
+
+            return `
+                <div class="doc-card cluster-card">
+                    <div class="doc-header">
+                        <span class="doc-id">${escapeHtml(label)}</span>
+                        <span class="doc-score">Score: ${doc.score.toFixed(3)}</span>
+                    </div>
+                    <div class="doc-text">${escapeHtml(truncated)}</div>
+                    <div class="doc-meta">
+                        <span>Namespace: <strong>${escapeHtml(doc.namespace)}</strong></span>
+                        <span>Grouped by: <strong>${escapeHtml(cluster.group_by)}</strong></span>
+                        <span>Evidence: <strong>${cluster.evidence.length}</strong></span>
+                        <span>Hidden duplicates: <strong>${cluster.hidden_duplicate_count}</strong></span>
+                        <span class="layer">${escapeHtml(layer)}</span>
+                    </div>
+                    <div class="doc-actions">
+                        <button onclick="openContextPack(${index}, 'full', true)">Context Pack</button>
+                        <button onclick="openContextPack(${index}, 'decisions', false)">Decisions</button>
+                        <button onclick="showRawEvidence(${index})">Raw Evidence</button>
+                        <button onclick="showClusterDetails(${index})">Cluster JSON</button>
+                        ${doc.can_expand ? `<button onclick="expand('${doc.namespace}', '${doc.id}')">Expand ▼</button>` : ''}
+                        ${doc.can_drill_up ? `<button onclick="drillUp('${doc.namespace}', '${doc.id}')">Parent ▲</button>` : ''}
+                    </div>
+                </div>
+            `;
         }
 
         function renderDocCard(doc, showScore = false) {
@@ -731,6 +778,54 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
                     </div>
                 </div>
             `;
+        }
+
+        async function openContextPack(index, view = 'full', showRawEvidence = true) {
+            const cluster = latestSearchClusters[index];
+            if (!cluster) return;
+            const ids = cluster.evidence.map(item => item.id);
+            const namespace = cluster.representative.namespace;
+            document.getElementById('modal-title').textContent =
+                view === 'decisions' ? 'Decision Context Pack' : 'Context Pack';
+            document.getElementById('modal-content').textContent = 'Building context pack...';
+            document.getElementById('modal-overlay').classList.add('active');
+
+            try {
+                const res = await fetch(`${API}/api/context-pack`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        namespace,
+                        ids,
+                        view,
+                        show_decisions_only: view === 'decisions',
+                        show_raw_evidence: showRawEvidence,
+                        max_evidence_per_cluster: 8,
+                        max_source_chunks: 240
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(typeof data === 'string' ? data : JSON.stringify(data));
+                document.getElementById('modal-content').textContent = data.markdown || JSON.stringify(data, null, 2);
+            } catch (e) {
+                document.getElementById('modal-content').textContent = `Context pack failed: ${e.message}`;
+            }
+        }
+
+        function showRawEvidence(index) {
+            const cluster = latestSearchClusters[index];
+            if (!cluster) return;
+            document.getElementById('modal-title').textContent = 'Raw Evidence';
+            document.getElementById('modal-content').textContent = JSON.stringify(cluster.evidence, null, 2);
+            document.getElementById('modal-overlay').classList.add('active');
+        }
+
+        function showClusterDetails(index) {
+            const cluster = latestSearchClusters[index];
+            if (!cluster) return;
+            document.getElementById('modal-title').textContent = 'Cluster JSON';
+            document.getElementById('modal-content').textContent = JSON.stringify(cluster, null, 2);
+            document.getElementById('modal-overlay').classList.add('active');
         }
 
         function escapeHtml(text) {
@@ -1246,7 +1341,7 @@ fn default_limit() -> usize {
 }
 
 /// Search result for JSON response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResultJson {
     pub id: String,
     pub namespace: String,
@@ -1334,6 +1429,8 @@ impl From<ChromaDocument> for SearchResultJson {
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResultJson>,
+    pub clusters: Vec<context_pack::SearchClusterJson>,
+    pub duplicate_count: usize,
     pub query: String,
     pub namespace: Option<String>,
     pub elapsed_ms: u64,
@@ -1569,6 +1666,8 @@ pub struct CrossSearchParams {
 #[derive(Debug, Serialize)]
 pub struct CrossSearchResponse {
     pub results: Vec<SearchResultJson>,
+    pub clusters: Vec<context_pack::SearchClusterJson>,
+    pub duplicate_count: usize,
     pub query: String,
     pub mode: String,
     pub namespaces_searched: usize,
@@ -2147,6 +2246,10 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/cross-search", get(cross_search_handler))
         .route("/sse/cross-search", get(sse_cross_search_handler))
         .route("/sse/namespaces", get(sse_namespaces_handler))
+        .route(
+            "/api/context-pack",
+            post(context_pack::context_pack_handler),
+        )
         .route("/expand/{ns}/{id}", get(expand_handler))
         .route("/parent/{ns}/{id}", get(parent_handler))
         .route("/get/{ns}/{id}", get(get_handler))
@@ -2895,9 +2998,13 @@ async fn search_handler(
     })?;
 
     let count = results.len();
+    let clusters = context_pack::collapse_results(&results);
+    let duplicate_count = count.saturating_sub(clusters.len());
 
     Ok(Json(SearchResponse {
         results,
+        clusters,
+        duplicate_count,
         query: req.query,
         namespace: req.namespace,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -3000,6 +3107,8 @@ async fn cross_search_handler(
     if namespaces.is_empty() {
         return Ok(Json(CrossSearchResponse {
             results: vec![],
+            clusters: vec![],
+            duplicate_count: 0,
             query: params.query,
             mode: params.mode,
             namespaces_searched: 0,
@@ -3043,9 +3152,13 @@ async fn cross_search_handler(
 
     let results: Vec<SearchResultJson> = all_results.into_iter().map(|(r, _)| r).collect();
     let total_results = results.len();
+    let clusters = context_pack::collapse_results(&results);
+    let duplicate_count = total_results.saturating_sub(clusters.len());
 
     Ok(Json(CrossSearchResponse {
         results,
+        clusters,
+        duplicate_count,
         query: params.query,
         mode: params.mode,
         namespaces_searched: namespaces_count,
@@ -4010,7 +4123,7 @@ mod tests {
         assert_eq!(overview.total_documents, 42);
         assert_eq!(overview.db_path, "/tmp/memex");
 
-        assert_eq!(status["cache_ready"], true);
+        assert!(status["cache_ready"].as_bool().unwrap());
         assert_eq!(status["namespace_count"], 2);
         assert_eq!(status["hint"], "OK");
     }
@@ -4039,6 +4152,83 @@ mod tests {
         assert_eq!(second.namespace_count, 2);
         assert_eq!(namespace_ids, vec!["alpha", "beta"]);
     }
+
+    #[tokio::test]
+    async fn test_context_pack_route_rebuilds_clustered_source_context() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+        let storage = state.rag.storage_manager();
+        let path = "/tmp/codex__019d749e-5b30-7f33-8bb4-a3a6e21b66c4__clean.md";
+
+        let mut outer = ChromaDocument::new_flat_with_hashes(
+            "outer-hit".to_string(),
+            "kb:context".to_string(),
+            vec![0.5, 0.25],
+            json!({"path": path, "source_path": path}),
+            "Outer summary about a release decision.".to_string(),
+            "chunk-outer".to_string(),
+            Some("source-shared".to_string()),
+        );
+        outer.layer = SliceLayer::Outer.as_u8();
+
+        let mut core = ChromaDocument::new_flat_with_hashes(
+            "core-source".to_string(),
+            "kb:context".to_string(),
+            vec![0.5, 0.25],
+            json!({"path": path, "source_path": path}),
+            "# Full Transcript\n\nDecision: ship the context-pack route.".to_string(),
+            "chunk-core".to_string(),
+            Some("source-shared".to_string()),
+        );
+        core.layer = SliceLayer::Core.as_u8();
+
+        storage
+            .add_to_store(vec![outer, core])
+            .await
+            .expect("seed context docs");
+
+        let app = create_router(state, &HttpServerConfig::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/context-pack")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "namespace": "kb:context",
+                            "ids": ["outer-hit"],
+                            "view": "full"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["selected_ids"], json!(["outer-hit"]));
+        assert_eq!(body["duplicate_count"], 0);
+        assert_eq!(body["clusters"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["sources"][0]["status"], "rebuilt_from_core_chunk",
+            "{body}"
+        );
+        assert!(
+            body["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Decision: ship the context-pack route."),
+            "{body}"
+        );
+    }
+
     #[test]
     fn test_chroma_document_maps_to_browse_json() {
         let doc = ChromaDocument {

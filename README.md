@@ -564,8 +564,9 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (status, db_path, embedding_provider) |
-| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported) |
+| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported); response includes collapsed `clusters` and `duplicate_count` |
 | `/sse/search` | GET | SSE streaming search with optional `project`, `layer`, and `deep` filters |
+| `/api/context-pack` | POST | Build a markdown context pack from a query or explicit chunk IDs, with grouped evidence and rebuilt indexed source chunks |
 | `/upsert` | POST | Add/update document |
 | `/index` | POST | Full pipeline indexing with onion slices |
 | `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |

@@ -6,13 +6,21 @@ use tokio::sync::Mutex;
 pub use rust_memex::contracts::stats::{DatabaseStats, NamespaceStats, StorageMetrics};
 pub use rust_memex::contracts::timeline::{TimeRange, TimelineEntry, TimelineFilter};
 use rust_memex::{
-    BM25Config, BM25Index, EmbeddingClient, EmbeddingConfig, HealthChecker, RAGPipeline,
-    SliceLayer, StorageManager,
+    BM25Config, BM25Index, EmbeddingClient, EmbeddingConfig, HealthChecker, HybridConfig,
+    HybridSearcher, RAGPipeline, SearchMode, SearchOptions, SliceLayer, StorageManager,
     diagnostics::{
         self, TimelineBucket, TimelineQuery, namespace_stats as collect_namespace_stats,
     },
     inspect_cross_store_recovery,
 };
+
+fn bm25_path_from_db(db_path: &str) -> String {
+    let expanded = shellexpand::tilde(db_path).to_string();
+    std::path::Path::new(&expanded)
+        .parent()
+        .map(|parent| parent.join("bm25").to_string_lossy().to_string())
+        .unwrap_or_else(|| BM25Config::default().index_path)
+}
 
 /// Run overview command - quick stats and health check
 pub async fn run_overview(
@@ -470,7 +478,20 @@ pub async fn run_recall(
     storage.ensure_collection().await?;
 
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
-    let rag = RAGPipeline::new(embedding_client, storage.clone()).await?;
+    let hybrid = HybridSearcher::new(
+        storage.clone(),
+        HybridConfig {
+            mode: SearchMode::Hybrid,
+            bm25: BM25Config {
+                index_path: bm25_path_from_db(&db_path),
+                read_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await?;
+    let query_embedding = embedding_client.lock().await.embed(&query).await?;
 
     // Get namespaces to search
     let namespaces: Vec<String> = if let Some(ref ns) = namespace_filter {
@@ -499,17 +520,38 @@ pub async fn run_recall(
         return Ok(());
     }
 
-    // Search each namespace for outer layer results (summaries)
+    // Recall is a human-facing truth surface, not a token-minimization primitive.
+    // Search all onion layers and let hybrid lexical/vector ranking decide what is
+    // actually responsive to the query; outer-only recall often returns metadata
+    // stubs while the useful content lives in middle/core slices.
     let mut all_results: Vec<(String, rust_memex::SearchResult)> = Vec::new();
 
     for ns in &namespaces {
-        // Search specifically for outer layer (summaries)
-        let results = rag
-            .memory_search_with_layer(ns, &query, limit, Some(SliceLayer::Outer))
+        let results = hybrid
+            .search(
+                &query,
+                query_embedding.clone(),
+                Some(ns),
+                limit,
+                SearchOptions::deep(),
+            )
             .await?;
 
         for r in results {
-            all_results.push((ns.clone(), r));
+            all_results.push((
+                ns.clone(),
+                rust_memex::SearchResult {
+                    id: r.id,
+                    namespace: r.namespace,
+                    text: r.document,
+                    score: r.combined_score,
+                    metadata: r.metadata,
+                    layer: r.layer,
+                    parent_id: r.parent_id,
+                    children_ids: r.children_ids,
+                    keywords: r.keywords,
+                },
+            ));
         }
     }
 

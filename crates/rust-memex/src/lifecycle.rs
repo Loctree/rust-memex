@@ -947,7 +947,7 @@ mod tests {
         assert_eq!(prepared["reprocess_source_hash"], "fresh-hash");
         assert_eq!(prepared["reprocess_collapsed_records"], 4);
         assert_eq!(prepared["reprocess_source"], "legacy.jsonl");
-        assert_eq!(prepared["reprocess_preprocessed"], true);
+        assert!(prepared["reprocess_preprocessed"].as_bool().unwrap());
         assert!(prepared.get("layer").is_none());
         assert!(prepared.get("original_id").is_none());
         assert!(prepared.get("content_hash").is_none());
