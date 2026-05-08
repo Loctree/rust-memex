@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow};
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-    UInt8Array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray, UInt8Array,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -449,8 +449,11 @@ impl CrossStoreRecoveryBatch {
     }
 }
 
-type BatchIter =
-    RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>;
+// lancedb 0.27 `Table::add` requires `T: Scannable`. `RecordBatchIterator`
+// impls `RecordBatchReader`, and `Box<dyn RecordBatchReader + Send + 'static>`
+// has a blanket `Scannable` impl — boxing satisfies the bound without changing
+// the producer side.
+type BatchIter = Box<dyn RecordBatchReader + Send + 'static>;
 
 impl StorageManager {
     pub async fn new(db_path: &str) -> Result<Self> {
@@ -1379,10 +1382,10 @@ impl StorageManager {
             ],
         )?;
 
-        Ok(RecordBatchIterator::new(
+        Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)].into_iter(),
             schema,
-        ))
+        )))
     }
 
     fn batch_to_docs(&self, batch: &RecordBatch) -> Result<Vec<ChromaDocument>> {

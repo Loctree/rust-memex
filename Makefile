@@ -224,6 +224,9 @@ dev: ## Run in development mode (foreground, debug logs)
 test: ## Run tests
 	cargo test
 
+test-e2e: ## Run e2e tests against the operator's canonical config.toml provider cascade
+	cargo test --workspace --all-targets --no-fail-fast --features e2e-ollama
+
 check: ## Run cargo check
 	cargo check
 

@@ -205,8 +205,10 @@ pub fn get_extended_host_config_path(kind: ExtendedHostKind) -> Option<(PathBuf,
 fn parse_toml_mcp_servers(content: &str) -> Vec<McpServerEntry> {
     let mut servers = Vec::new();
 
-    if let Ok(value) = content.parse::<toml::Value>()
-        && let Some(mcp_servers) = value.get("mcp_servers").and_then(|v| v.as_table())
+    // toml 1.0: `Value` parser expects a single value, not a document.
+    // Parse the document as `Table` (alias for `Map<String, Value>`).
+    if let Ok(root) = content.parse::<toml::Table>()
+        && let Some(mcp_servers) = root.get("mcp_servers").and_then(|v| v.as_table())
     {
         for (name, config) in mcp_servers {
             let command = config
@@ -548,8 +550,10 @@ fn merge_json_config(existing_content: &str, entry: &McpServerEntry) -> Result<S
 
 /// Merge the rust_memex host entry into existing TOML config.
 fn merge_toml_config(existing_content: &str, entry: &McpServerEntry) -> Result<String> {
-    let mut config: toml::Value = if existing_content.trim().is_empty() {
-        toml::Value::Table(toml::map::Map::new())
+    // toml 1.0: parse the document as `Table`. `Value` parser only accepts a
+    // single value, not a full document.
+    let mut config: toml::Table = if existing_content.trim().is_empty() {
+        toml::Table::new()
     } else {
         existing_content
             .parse()
@@ -557,16 +561,15 @@ fn merge_toml_config(existing_content: &str, entry: &McpServerEntry) -> Result<S
     };
 
     // Ensure mcp_servers table exists
-    let table = config.as_table_mut().expect("root must be a table");
-    if !table.contains_key("mcp_servers") {
-        table.insert(
+    if !config.contains_key("mcp_servers") {
+        config.insert(
             "mcp_servers".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
+            toml::Value::Table(toml::Table::new()),
         );
     }
 
     // Add or update rust_memex entry
-    if let Some(mcp_servers) = table.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
+    if let Some(mcp_servers) = config.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
         mcp_servers.insert(entry.name.clone(), toml_server_config(entry));
     }
 

@@ -1,110 +1,70 @@
 //! End-to-End Pipeline Tests
 //!
-//! These tests verify the full pipeline: index → embed → search
-//! They require a running embedding server (Ollama or MLX).
+//! Full lifecycle verification: load operator's canonical config.toml →
+//! build embedder via real provider cascade → index → embed → store →
+//! search → delete → confirm-removed → re-add → confirm-restored.
 //!
-//! Run with: cargo test --test e2e_pipeline -- --ignored
+//! These tests are gated behind the `e2e-ollama` feature. They consume the
+//! same `~/.rmcp-servers/rust-memex/config.toml` (or `RUST_MEMEX_CONFIG`)
+//! that runtime uses — no synthetic defaults, no inline hardcoded endpoints.
+//! If no config exists or no provider in the cascade is reachable, tests
+//! fail-fast (no silent SKIP).
 //!
-//! Vibecrafted with AI Agents by Loctree (c)2026 Loctree
+//! Run with: `make test-e2e`
+//!         or `cargo test --features e2e-ollama --test e2e_pipeline`
+//!
+//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
 
-use rust_memex::{
-    ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager,
-};
-use serde::Deserialize;
+mod common;
+
+use rust_memex::{ChromaDocument, StorageManager};
 use serde_json::json;
 use tempfile::TempDir;
 
-const LOCAL_OLLAMA_MODEL: &str = "qwen3-embedding:4b";
-const LOCAL_OLLAMA_DIMENSION: usize = 2560;
+/// Synthetic dimension for storage-validation tests that don't touch a real
+/// provider. Storage rules don't care about the value, only consistency.
+const SYNTHETIC_TEST_DIM: usize = 2560;
 
 // =============================================================================
-// HELPER: Check if embedding server is available
+// E2E TEST: Full pipeline lifecycle (index → search → delete → restore)
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
-struct OllamaTagsResponse {
-    models: Vec<OllamaModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaModel {
-    name: String,
-}
-
-async fn ollama_qwen4b_available() -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await {
-        if !resp.status().is_success() {
-            return false;
-        }
-
-        if let Ok(tags) = resp.json::<OllamaTagsResponse>().await {
-            return tags
-                .models
-                .iter()
-                .any(|model| model.name == LOCAL_OLLAMA_MODEL);
-        }
-    }
-
-    false
-}
-
-fn create_test_embedding_config() -> EmbeddingConfig {
-    EmbeddingConfig {
-        required_dimension: LOCAL_OLLAMA_DIMENSION,
-        max_batch_chars: 32000,
-        max_batch_items: 16,
-        providers: vec![ProviderConfig {
-            name: "ollama-local".to_string(),
-            base_url: "http://localhost:11434".to_string(),
-            model: LOCAL_OLLAMA_MODEL.to_string(),
-            priority: 1,
-            endpoint: "/v1/embeddings".to_string(),
-        }],
-        reranker: Default::default(),
-    }
-}
-
-// =============================================================================
-// E2E TEST: Full pipeline index → embed → search
-// =============================================================================
-
-/// Full E2E test: create embeddings, store, search, verify results
+/// Full lifecycle: index 5 docs, semantic search, delete one, confirm absent,
+/// re-add, confirm restored. Exercises the config-driven provider cascade
+/// for embedding + LanceDB storage end-to-end.
+#[cfg(feature = "e2e-ollama")]
 #[tokio::test]
-#[ignore] // Run with: cargo test --test e2e_pipeline -- --ignored
-async fn test_e2e_index_embed_search() {
-    if !ollama_qwen4b_available().await {
-        eprintln!(
-            "SKIP: Local Ollama model '{}' unavailable at http://localhost:11434",
-            LOCAL_OLLAMA_MODEL
-        );
-        return;
-    }
+async fn test_e2e_full_lifecycle_index_search_delete_restore() {
+    use rust_memex::EmbeddingClient;
 
-    // Setup
-    let tmp = TempDir::new().expect("Failed to create temp dir");
-    let db_path = tmp.path().join("lancedb");
+    let cfg = common::load_e2e_config().expect("e2e config required");
+    eprintln!(
+        "e2e config: {} (providers: {})",
+        cfg.source_path.display(),
+        cfg.embeddings.providers.len()
+    );
 
-    let config = create_test_embedding_config();
-    let mut embedder = EmbeddingClient::new(&config)
+    let mut embedder = EmbeddingClient::new(&cfg.embeddings)
         .await
-        .expect("Failed to create embedding client");
+        .expect("EmbeddingClient must connect to a configured provider");
+    let dim = cfg.embeddings.required_dimension;
+    let connected = embedder.connected_to().to_string();
+    eprintln!("connected provider: {connected}");
 
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("lancedb");
     let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
         .await
-        .expect("Failed to create storage");
-
+        .expect("storage init");
     storage
         .ensure_collection()
         .await
-        .expect("Failed to ensure collection");
+        .expect("ensure_collection");
 
-    // Test documents
-    let test_docs = vec![
+    let ns = "e2e-lifecycle";
+
+    // Test corpus
+    let corpus = [
         (
             "doc-rust",
             "Rust is a systems programming language focused on safety and performance.",
@@ -127,308 +87,310 @@ async fn test_e2e_index_embed_search() {
         ),
     ];
 
-    // INDEX: Generate embeddings and store documents
-    let mut stored_docs = Vec::new();
-    for (id, content) in &test_docs {
-        let embedding = embedder
-            .embed(content)
-            .await
-            .expect("Failed to generate embedding");
-
-        assert_eq!(
-            embedding.len(),
-            LOCAL_OLLAMA_DIMENSION,
-            "Embedding dimension should be {}",
-            LOCAL_OLLAMA_DIMENSION
-        );
-
-        let doc = ChromaDocument::new_flat(
-            id.to_string(),
-            "e2e-test-ns".to_string(),
+    // ---- INDEX --------------------------------------------------------------
+    let mut docs = Vec::with_capacity(corpus.len());
+    for (id, text) in corpus.iter() {
+        let embedding = embedder.embed(text).await.expect("embed");
+        assert_eq!(embedding.len(), dim, "embedding dim must match config");
+        docs.push(ChromaDocument::new_flat(
+            (*id).to_string(),
+            ns.to_string(),
             embedding,
-            json!({"type": "programming", "source": "test"}),
-            content.to_string(),
-        );
-        stored_docs.push(doc);
+            json!({"source": "e2e"}),
+            (*text).to_string(),
+        ));
     }
+    storage.add_to_store(docs).await.expect("add_to_store");
 
-    storage
-        .add_to_store(stored_docs)
-        .await
-        .expect("Failed to store documents");
-
-    // SEARCH: Query for programming languages
+    // ---- SEARCH (initial) ---------------------------------------------------
     let query = "systems programming language with memory safety";
-    let query_embedding = embedder.embed(query).await.expect("Failed to embed query");
-
+    let q_embedding = embedder.embed(query).await.expect("embed query");
     let results = storage
-        .search_store(Some("e2e-test-ns"), query_embedding, 3)
+        .search_store(Some(ns), q_embedding.clone(), corpus.len())
         .await
-        .expect("Failed to search");
-
-    // VERIFY: Should find Rust as top result (most relevant to query)
-    assert!(!results.is_empty(), "Search should return results");
-    assert!(results.len() <= 3, "Should respect limit");
-
-    // Rust should be in top results for memory safety query
-    let result_ids: Vec<&str> = results.iter().map(|d| d.id.as_str()).collect();
-    eprintln!("Search results for '{}': {:?}", query, result_ids);
-
-    // At minimum, we should get some results
+        .expect("search_store initial");
+    assert!(!results.is_empty(), "search must return results");
+    let initial_ids: Vec<String> = results.iter().map(|d| d.id.clone()).collect();
+    eprintln!("initial search top-{}: {:?}", results.len(), initial_ids);
     assert!(
-        results.iter().any(|d| d.id.starts_with("doc-")),
-        "Results should contain our test documents"
+        initial_ids.iter().any(|id| id == "doc-rust"),
+        "doc-rust must be reachable before delete; got {:?}",
+        initial_ids
+    );
+
+    // ---- DELETE -------------------------------------------------------------
+    let removed = storage
+        .delete_documents(ns, &["doc-rust"])
+        .await
+        .expect("delete_documents");
+    assert_eq!(removed, 1, "delete must remove exactly 1 document");
+
+    // ---- SEARCH (after delete) ---------------------------------------------
+    let results_after_delete = storage
+        .search_store(Some(ns), q_embedding.clone(), corpus.len())
+        .await
+        .expect("search_store after delete");
+    let after_delete_ids: Vec<String> = results_after_delete.iter().map(|d| d.id.clone()).collect();
+    eprintln!(
+        "after-delete search top-{}: {:?}",
+        results_after_delete.len(),
+        after_delete_ids
+    );
+    assert!(
+        !after_delete_ids.iter().any(|id| id == "doc-rust"),
+        "doc-rust must be absent after delete; got {:?}",
+        after_delete_ids
+    );
+
+    // ---- RESTORE ------------------------------------------------------------
+    let rust_text = corpus
+        .iter()
+        .find(|(id, _)| *id == "doc-rust")
+        .map(|(_, t)| *t)
+        .expect("doc-rust in corpus");
+    let restore_embedding = embedder.embed(rust_text).await.expect("re-embed");
+    storage
+        .add_to_store(vec![ChromaDocument::new_flat(
+            "doc-rust".to_string(),
+            ns.to_string(),
+            restore_embedding,
+            json!({"source": "e2e", "restored": true}),
+            rust_text.to_string(),
+        )])
+        .await
+        .expect("re-add doc-rust");
+
+    let results_after_restore = storage
+        .search_store(Some(ns), q_embedding, corpus.len())
+        .await
+        .expect("search_store after restore");
+    let after_restore_ids: Vec<String> =
+        results_after_restore.iter().map(|d| d.id.clone()).collect();
+    eprintln!(
+        "after-restore search top-{}: {:?}",
+        results_after_restore.len(),
+        after_restore_ids
+    );
+    assert!(
+        after_restore_ids.iter().any(|id| id == "doc-rust"),
+        "doc-rust must reappear after restore; got {:?}",
+        after_restore_ids
     );
 }
 
-/// Test batch embedding with multiple texts
+/// Batch embedding sanity: embed multiple texts in one call, verify dim
+/// consistency and absence of NaN/Inf in every row.
+#[cfg(feature = "e2e-ollama")]
 #[tokio::test]
-#[ignore]
 async fn test_e2e_batch_embedding() {
-    if !ollama_qwen4b_available().await {
-        eprintln!(
-            "SKIP: Local Ollama model '{}' unavailable",
-            LOCAL_OLLAMA_MODEL
-        );
-        return;
-    }
+    use rust_memex::EmbeddingClient;
 
-    let config = create_test_embedding_config();
-    let mut embedder = EmbeddingClient::new(&config)
+    let cfg = common::load_e2e_config().expect("e2e config required");
+    let mut embedder = EmbeddingClient::new(&cfg.embeddings)
         .await
-        .expect("Failed to create embedding client");
+        .expect("EmbeddingClient must connect");
+    let dim = cfg.embeddings.required_dimension;
 
     let texts: Vec<String> = vec![
-        "First document about machine learning".to_string(),
-        "Second document about natural language processing".to_string(),
-        "Third document about computer vision".to_string(),
-        "Fourth document about reinforcement learning".to_string(),
+        "First document about machine learning".into(),
+        "Second document about natural language processing".into(),
+        "Third document about computer vision".into(),
+        "Fourth document about reinforcement learning".into(),
     ];
 
-    let embeddings = embedder
-        .embed_batch(&texts)
-        .await
-        .expect("Failed to batch embed");
-
+    let embeddings = embedder.embed_batch(&texts).await.expect("embed_batch");
     assert_eq!(
         embeddings.len(),
         texts.len(),
-        "Should get embedding for each text"
+        "must return one embedding per input"
     );
-
     for (i, emb) in embeddings.iter().enumerate() {
-        assert_eq!(
-            emb.len(),
-            LOCAL_OLLAMA_DIMENSION,
-            "Embedding {} should have {} dimensions",
-            i,
-            LOCAL_OLLAMA_DIMENSION
-        );
-
-        // Check no NaN/Inf values
+        assert_eq!(emb.len(), dim, "embedding {i} dim mismatch");
         for (j, &val) in emb.iter().enumerate() {
             assert!(
                 !val.is_nan() && !val.is_infinite(),
-                "Embedding {} has invalid value at index {}: {}",
-                i,
-                j,
-                val
+                "embedding {i}[{j}] is NaN/Inf: {val}"
             );
         }
     }
 }
 
-/// Test dimension validation at startup (fail-fast)
+/// Dimension-mismatch fail-fast: bumping required_dimension above what the
+/// provider returns must error at client construction (before any DB write).
+/// Exercises the EmbeddingClient invariant: dim mismatch corrupts the DB if
+/// it slips through, so it must abort early.
+#[cfg(feature = "e2e-ollama")]
 #[tokio::test]
-#[ignore]
-async fn test_e2e_local_ollama_qwen4b_validation() {
-    if !ollama_qwen4b_available().await {
-        eprintln!(
-            "SKIP: Local Ollama model '{}' unavailable",
-            LOCAL_OLLAMA_MODEL
-        );
-        return;
-    }
+async fn test_e2e_dim_mismatch_fails_fast() {
+    use rust_memex::EmbeddingClient;
 
-    // Config with correct dimension
-    let config = create_test_embedding_config();
-    let result = EmbeddingClient::new(&config).await;
-    assert!(
-        result.is_ok(),
-        "Should connect with correct dimension config"
-    );
-
-    let mut embedder = result.unwrap();
-    let connected = embedder.connected_to();
-    eprintln!("Connected to: {}", connected);
-
-    assert!(
-        connected == "ollama-local",
-        "Should connect to local Ollama, got: {}",
-        connected
-    );
-
-    let embedding = embedder
-        .embed("qwen4b validation probe")
+    let cfg = common::load_e2e_config().expect("e2e config required");
+    // Sanity: real config must work first
+    let _ok = EmbeddingClient::new(&cfg.embeddings)
         .await
-        .expect("Expected local Ollama /v1/embeddings to work");
-    assert_eq!(embedding.len(), LOCAL_OLLAMA_DIMENSION);
+        .expect("baseline config must succeed");
 
-    let mut bad_config = create_test_embedding_config();
-    bad_config.required_dimension = 4096;
-    let err = EmbeddingClient::new(&bad_config)
+    // Bump dim by 1 — no real model returns this; client must reject.
+    let mut bad = cfg.embeddings.clone();
+    bad.required_dimension += 1;
+    let err = EmbeddingClient::new(&bad)
         .await
         .err()
-        .expect("Mismatched config dimension should fail fast");
-    let message = err.to_string();
+        .expect("dim mismatch must error at construction");
+    let msg = err.to_string();
     assert!(
-        message.contains("returned 2560 dims") || message.contains("returned 2560"),
-        "Unexpected error message: {}",
-        message
-    );
-    assert!(
-        message.contains("required_dimension=4096"),
-        "Unexpected error message: {}",
-        message
+        msg.contains("required_dimension") || msg.contains("dim"),
+        "error must mention dimension; got: {msg}"
     );
 }
 
-/// Test deduplication via content hash
+/// Content-hash deduplication: store doc with hash, observe presence; ensure
+/// hash-check API stays consistent across roundtrip.
+#[cfg(feature = "e2e-ollama")]
 #[tokio::test]
-#[ignore]
 async fn test_e2e_deduplication() {
-    if !ollama_qwen4b_available().await {
-        eprintln!(
-            "SKIP: Local Ollama model '{}' unavailable",
-            LOCAL_OLLAMA_MODEL
-        );
-        return;
-    }
+    use rust_memex::{EmbeddingClient, compute_content_hash};
 
-    use rust_memex::compute_content_hash;
-
-    let tmp = TempDir::new().expect("Failed to create temp dir");
-    let db_path = tmp.path().join("lancedb");
-
-    let config = create_test_embedding_config();
-    let mut embedder = EmbeddingClient::new(&config)
+    let cfg = common::load_e2e_config().expect("e2e config required");
+    let mut embedder = EmbeddingClient::new(&cfg.embeddings)
         .await
-        .expect("Failed to create embedding client");
+        .expect("EmbeddingClient must connect");
 
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("lancedb");
     let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
         .await
-        .expect("Failed to create storage");
+        .expect("storage init");
+    storage
+        .ensure_collection()
+        .await
+        .expect("ensure_collection");
 
-    storage.ensure_collection().await.unwrap();
-
-    let content = "This is unique content for deduplication test";
+    let ns = "e2e-dedup";
+    let content = "Unique content for deduplication test";
     let hash = compute_content_hash(content);
 
-    // First check - hash should not exist
-    let exists_before = storage
-        .has_content_hash("dedup-test-ns", &hash)
-        .await
-        .expect("Failed to check hash");
-    assert!(!exists_before, "Hash should not exist before indexing");
+    assert!(
+        !storage
+            .has_content_hash(ns, &hash)
+            .await
+            .expect("has_content_hash"),
+        "hash must not exist before indexing"
+    );
 
-    // Index the content
-    let embedding = embedder.embed(content).await.unwrap();
+    let embedding = embedder.embed(content).await.expect("embed");
     let mut doc = ChromaDocument::new_flat(
         "dedup-doc-1".to_string(),
-        "dedup-test-ns".to_string(),
+        ns.to_string(),
         embedding,
         json!({}),
         content.to_string(),
     );
     doc.content_hash = Some(hash.clone());
-    storage.add_to_store(vec![doc]).await.unwrap();
+    storage.add_to_store(vec![doc]).await.expect("add_to_store");
 
-    // Second check - hash should exist now
-    let exists_after = storage
-        .has_content_hash("dedup-test-ns", &hash)
-        .await
-        .expect("Failed to check hash");
-    assert!(exists_after, "Hash should exist after indexing");
+    assert!(
+        storage
+            .has_content_hash(ns, &hash)
+            .await
+            .expect("has_content_hash post"),
+        "hash must exist after indexing"
+    );
 }
 
-/// Test that invalid embeddings are rejected
+// =============================================================================
+// STORAGE INVARIANT (no embedding provider needed)
+// =============================================================================
+
+/// Storage-level validation: empty IDs, empty namespaces, NaN/Inf in
+/// embeddings, and inconsistent batch dimensions must all be rejected before
+/// any LanceDB write. This invariant doesn't need a real provider — it
+/// exercises pure storage rules with synthetic dim.
 #[tokio::test]
 async fn test_storage_rejects_invalid_embeddings() {
-    let tmp = TempDir::new().expect("Failed to create temp dir");
+    let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("lancedb");
-
     let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
         .await
-        .expect("Failed to create storage");
-
+        .expect("storage init");
     storage.ensure_collection().await.unwrap();
 
-    // Test: Empty ID should be rejected
+    // Empty ID rejected
     let doc_empty_id = ChromaDocument::new_flat(
-        "".to_string(),
+        String::new(),
         "test-ns".to_string(),
-        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
+        vec![0.1f32; SYNTHETIC_TEST_DIM],
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_empty_id]).await;
-    assert!(result.is_err(), "Empty ID should be rejected");
+    assert!(
+        storage.add_to_store(vec![doc_empty_id]).await.is_err(),
+        "Empty ID must be rejected"
+    );
 
-    // Test: Empty namespace should be rejected
+    // Empty namespace rejected
     let doc_empty_ns = ChromaDocument::new_flat(
         "valid-id".to_string(),
-        "".to_string(),
-        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
+        String::new(),
+        vec![0.1f32; SYNTHETIC_TEST_DIM],
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_empty_ns]).await;
-    assert!(result.is_err(), "Empty namespace should be rejected");
+    assert!(
+        storage.add_to_store(vec![doc_empty_ns]).await.is_err(),
+        "Empty namespace must be rejected"
+    );
 
-    // Test: NaN in embedding should be rejected
-    let mut embedding_with_nan = vec![0.1f32; LOCAL_OLLAMA_DIMENSION];
-    embedding_with_nan[100] = f32::NAN;
+    // NaN in embedding rejected
+    let mut nan_emb = vec![0.1f32; SYNTHETIC_TEST_DIM];
+    nan_emb[100] = f32::NAN;
     let doc_nan = ChromaDocument::new_flat(
         "nan-doc".to_string(),
         "test-ns".to_string(),
-        embedding_with_nan,
+        nan_emb,
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_nan]).await;
-    assert!(result.is_err(), "NaN in embedding should be rejected");
+    assert!(
+        storage.add_to_store(vec![doc_nan]).await.is_err(),
+        "NaN in embedding must be rejected"
+    );
 
-    // Test: Inf in embedding should be rejected
-    let mut embedding_with_inf = vec![0.1f32; LOCAL_OLLAMA_DIMENSION];
-    embedding_with_inf[200] = f32::INFINITY;
+    // Inf in embedding rejected
+    let mut inf_emb = vec![0.1f32; SYNTHETIC_TEST_DIM];
+    inf_emb[200] = f32::INFINITY;
     let doc_inf = ChromaDocument::new_flat(
         "inf-doc".to_string(),
         "test-ns".to_string(),
-        embedding_with_inf,
+        inf_emb,
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_inf]).await;
-    assert!(result.is_err(), "Inf in embedding should be rejected");
+    assert!(
+        storage.add_to_store(vec![doc_inf]).await.is_err(),
+        "Inf in embedding must be rejected"
+    );
 
-    // Test: Inconsistent dimensions in batch should be rejected
+    // Inconsistent dims in same batch rejected
     let doc_good = ChromaDocument::new_flat(
         "doc-good".to_string(),
         "test-ns".to_string(),
-        vec![0.1f32; LOCAL_OLLAMA_DIMENSION],
+        vec![0.1f32; SYNTHETIC_TEST_DIM],
         json!({}),
         "Content".to_string(),
     );
-    let doc_1024 = ChromaDocument::new_flat(
-        "doc-1024".to_string(),
+    let doc_short = ChromaDocument::new_flat(
+        "doc-short".to_string(),
         "test-ns".to_string(),
-        vec![0.1f32; 1024], // Wrong dimension!
+        vec![0.1f32; 1024], // wrong dim within batch
         json!({}),
         "Content".to_string(),
     );
-    let result = storage.add_to_store(vec![doc_good, doc_1024]).await;
     assert!(
-        result.is_err(),
-        "Inconsistent dimensions should be rejected"
+        storage
+            .add_to_store(vec![doc_good, doc_short])
+            .await
+            .is_err(),
+        "Inconsistent batch dims must be rejected"
     );
 }

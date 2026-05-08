@@ -3445,7 +3445,7 @@ impl RAGPipeline {
             let documents: Vec<ChromaDocument> = batch
                 .iter()
                 .cloned()
-                .zip(embeddings.into_iter())
+                .zip(embeddings)
                 .map(|(chunk, embedding)| {
                     let source_hash = Some(chunk.source_hash);
                     if chunk.layer > 0 {
