@@ -22,6 +22,13 @@ cli = ["clap", "indicatif", "ratatui", "crossterm", "sysinfo"]
 # Provider cascade: current Ollama/OpenAI-compatible embedding approach
 provider-cascade = []
 
+# E2E integration tests against a real embedding provider cascade.
+# Tests load the operator's canonical `~/.rmcp-servers/rust-memex/config.toml`
+# (or RUST_MEMEX_CONFIG override) and exercise full lifecycle: index → embed →
+# store → search → delete → restore. Run with: `make test-e2e` or
+# `cargo test --features e2e-ollama --workspace --no-fail-fast`.
+e2e-ollama = []
+
 # Embedded Candle embeddings (placeholder for future)
 # embedded-candle = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 #
@@ -54,7 +61,7 @@ futures.workspace = true
 glob.workspace = true
 indicatif = { workspace = true, optional = true }
 lancedb.workspace = true
-memex-contracts = { path = "../memex-contracts", version = "0.6.4" }
+memex-contracts = { path = "../memex-contracts", version = "0.6.5" }
 openidconnect.workspace = true
 pdf-extract.workspace = true
 ratatui = { workspace = true, optional = true }

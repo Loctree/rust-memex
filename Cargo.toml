@@ -4,7 +4,7 @@ members = ["crates/rust-memex", "crates/memex-contracts"]
 default-members = ["crates/rust-memex"]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 rust-version = "1.88"
 description = "Operator CLI + MCP server: canonical corpus second: semantic index second to aicx"
@@ -16,11 +16,11 @@ keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 
 [workspace.dependencies]
-aicx-parser = "0.1.0"
+aicx-parser = "0.2"
 anyhow = "1.0"
 argon2 = "0.5"
-arrow-array = "56.2"
-arrow-schema = "56.2"
+arrow-array = "57"
+arrow-schema = "57"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json", "multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -29,7 +29,7 @@ crossterm = "0.29"
 futures = "0.3"
 glob = "0.3"
 indicatif = "0.17"
-lancedb = { version = "0.22.3", default-features = false }
+lancedb = { version = "0.27", default-features = false }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest"] }
 pdf-extract = "0.10"
 protoc-bin-vendored = "3"
@@ -40,13 +40,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 shellexpand = "3.1"
-subtle = "2.5"
-sysinfo = "0.33"
-tantivy = "0.22"
-tempfile = "3.14"
-tokio = { version = "1", features = ["full"] }
+subtle = "2.6"
+sysinfo = "0.39"
+tantivy = "0.24"
+tempfile = "3.27"
+tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1"
-toml = "0.8"
+toml = "1"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
