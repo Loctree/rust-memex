@@ -2283,9 +2283,13 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
     // MCP-over-SSE endpoints (auth required when token is configured)
     let mcp_routes = Router::new()
         .route("/mcp/", get(mcp_sse_handler))
+        .route("/mcp", get(mcp_sse_handler))
         .route("/mcp/messages/", post(mcp_messages_handler))
+        .route("/mcp/messages", post(mcp_messages_handler))
         .route("/sse/", get(mcp_sse_handler))
+        .route("/sse", get(mcp_sse_handler))
         .route("/messages/", post(mcp_messages_handler))
+        .route("/messages", post(mcp_messages_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -3645,12 +3649,13 @@ pub struct McpMessagesParams {
 /// Creates a new session and sends the endpoint URL for messages
 async fn mcp_sse_handler(
     State(state): State<HttpState>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     // Create a new session
     let (session_id, mut rx) = state.mcp_sessions.create_session().await;
 
-    // Use Host header from request to build endpoint URL (enables remote access)
+    // Use Host header from request to build base URL (enables remote access in logs)
     let base_url = if let Some(host) = headers.get(axum::http::header::HOST) {
         if let Ok(host_str) = host.to_str() {
             format!("http://{}", host_str)
@@ -3662,16 +3667,19 @@ async fn mcp_sse_handler(
     };
 
     info!(
-        "MCP SSE: New session {} (base_url: {})",
-        session_id, base_url
+        "MCP SSE: New session {} (base_url: {}, path: {})",
+        session_id, base_url, uri.path()
     );
 
     let sessions_for_cleanup = state.mcp_sessions.clone();
     let session_id_for_cleanup = session_id.clone();
+    let path_str = uri.path().to_string();
 
     let stream = async_stream::stream! {
-        // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)
-        let endpoint_url = format!("{}/messages/?session_id={}", base_url, session_id);
+        // Build a relative path for the client POST messages (FastMCP/MCP SSE standard)
+        let is_mcp = path_str.starts_with("/mcp");
+        let relative_path = if is_mcp { "/mcp/messages/" } else { "/messages/" };
+        let endpoint_url = format!("{}?session_id={}", relative_path, session_id);
         yield Ok(Event::default()
             .event("endpoint")
             .data(endpoint_url));

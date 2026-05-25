@@ -816,6 +816,13 @@ fn extract_doc_timestamp(doc: &crate::ChromaDocument) -> Option<DateTime<Utc>> {
                 .and_then(|value| value.as_str())
         })
         .and_then(parse_iso_or_date)
+        .or_else(|| {
+            doc.metadata
+                .get("path")
+                .and_then(|value| value.as_str())
+                .and_then(extract_date_from_path)
+                .and_then(|d| parse_iso_or_date(&d))
+        })
 }
 
 fn extract_doc_timestamp_string(
@@ -827,8 +834,48 @@ fn extract_doc_timestamp_string(
                 return None;
             }
             value.as_str().map(ToOwned::to_owned)
+        }).or_else(|| {
+            object.get("path")
+                .and_then(|value| value.as_str())
+                .and_then(extract_date_from_path)
         })
     })
+}
+
+fn extract_date_from_path(path: &str) -> Option<String> {
+    use std::sync::OnceLock;
+
+    // Look for YYYY-MM-DD or YYYY_MM_DD
+    static RE_STANDARD: OnceLock<regex::Regex> = OnceLock::new();
+    let re_standard = RE_STANDARD.get_or_init(|| {
+        regex::Regex::new(r"(19\d{2}|20\d{2})[_-](\d{2})[_-](\d{2})").unwrap()
+    });
+
+    if let Some(caps) = re_standard.captures(path) {
+        let year = caps.get(1)?.as_str();
+        let month = caps.get(2)?.as_str();
+        let day = caps.get(3)?.as_str();
+        return Some(format!("{}-{}-{}", year, month, day));
+    }
+
+    // Also look for YYYY_MMDD or YYYYMMDD
+    static RE_SHORT: OnceLock<regex::Regex> = OnceLock::new();
+    let re_short = RE_SHORT.get_or_init(|| {
+        regex::Regex::new(r"(19\d{2}|20\d{2})_?(\d{2})(\d{2})").unwrap()
+    });
+
+    if let Some(caps) = re_short.captures(path) {
+        let year = caps.get(1)?.as_str();
+        let month = caps.get(2)?.as_str();
+        let day = caps.get(3)?.as_str();
+        let month_num: u32 = month.parse().ok()?;
+        let day_num: u32 = day.parse().ok()?;
+        if (1..=12).contains(&month_num) && (1..=31).contains(&day_num) {
+            return Some(format!("{}-{}-{}", year, month, day));
+        }
+    }
+
+    None
 }
 
 fn parse_time_bound(input: &str) -> Option<DateTime<Utc>> {
