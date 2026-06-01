@@ -4,6 +4,27 @@ set -e
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
+setup_rust_toolchain_path() {
+  if [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+    return
+  fi
+
+  if [ -x "/opt/homebrew/opt/rustup/bin/rustup" ]; then
+    export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+    return
+  fi
+
+  for toolchain_bin in "$HOME"/.rustup/toolchains/stable-*/bin; do
+    if [ -x "$toolchain_bin/rustc" ]; then
+      export PATH="$toolchain_bin:$PATH"
+      return
+    fi
+  done
+}
+
+setup_rust_toolchain_path
+
 echo "=== Pre-commit (fast checks) ==="
 
 # Check if any Rust files are staged
