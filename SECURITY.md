@@ -1,4 +1,4 @@
-<!-- Copyright (c) 2025-2026 Loctree (https://loct.io) -->
+<!-- Copyright (c) 2025-2026 Loctree (https://vetcoders.io) -->
 # Security Policy
 
 ## Supported Versions
@@ -13,7 +13,7 @@
 Please use GitHub Security Advisories for responsible disclosure:
 https://github.com/Loctree/rust-memex/security/advisories/new
 
-If GitHub Advisories are unavailable, email security@loct.io with a
+If GitHub Advisories are unavailable, email security@vetcoders.io with a
 summary, affected version, reproduction steps, and expected impact.
 
 Please do not report suspected vulnerabilities in public GitHub issues.

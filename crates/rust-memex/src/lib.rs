@@ -1,0 +1,243 @@
+pub mod auth;
+pub mod common;
+pub mod diagnostics;
+pub mod embeddings;
+pub mod engine;
+pub mod handlers;
+pub mod http;
+pub mod lifecycle;
+pub mod mcp_core;
+pub mod mcp_protocol;
+mod mcp_runtime;
+pub mod path_utils;
+pub mod preprocessing;
+pub mod query;
+pub mod rag;
+pub mod recovery;
+pub mod search;
+pub mod security;
+pub mod startup;
+pub mod storage;
+#[cfg(test)]
+mod tests;
+pub mod tools;
+
+// CLI-only modules (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub mod progress;
+#[cfg(feature = "cli")]
+pub mod tui;
+
+use anyhow::Result;
+pub use memex_contracts as contracts;
+use tracing::Level;
+
+// Re-export core types for library consumers
+pub use auth::{
+    AuthDenial, AuthManager, AuthResult, Scope, TokenEntry, TokenStoreFile, TokenStoreV2,
+};
+pub use embeddings::{
+    DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
+    MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
+    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size, truncate_to_token_limit,
+    validate_batch_tokens, validate_chunk_tokens,
+};
+pub use handlers::{MCPServer, create_server};
+pub use mcp_core::{
+    McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
+};
+pub use mcp_core::{dispatch_mcp_jsonrpc_request, dispatch_mcp_payload, dispatch_mcp_request};
+pub use mcp_runtime::build_mcp_core;
+pub use preprocessing::{
+    IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
+    TextIntegrityMetrics,
+};
+pub use query::{
+    LoctreeSuggestion, QueryIntent, QueryRouter, RecommendedSearchMode, RoutingDecision,
+    SearchModeRecommendation, TemporalHints, detect_intent,
+};
+pub use rag::{
+    Chunk as PipelineChunk,
+    ChunkOpts,
+    ChunkProvider,
+    ChunkerKind,
+    ContextPrefixConfig,
+    CrossStoreRecoveryBatchReport,
+    CrossStoreRecoveryReport,
+    CrossStoreRecoveryState,
+    EmbeddedChunk,
+    EnrichedChunk,
+    FileContent,
+    IndexResult,
+    OnionSlice,
+    OnionSliceConfig,
+    OuterSynthesis,
+    PipelineConfig,
+    PipelineEvent,
+    PipelineGovernorConfig,
+    PipelineResult,
+    PipelineSnapshot,
+    PipelineStats,
+    RAGPipeline,
+    SearchOptions,
+    SearchResult,
+    SliceLayer,
+    SliceMode,
+    compute_content_hash,
+    create_enriched_chunks,
+    create_onion_slices,
+    detect_default_chunker,
+    inspect_cross_store_recovery,
+    repair_cross_store_recovery,
+    // Async pipeline exports
+    run_pipeline,
+};
+pub use recovery::{
+    MaintenanceExecution, MergeExecution, RepairExecution, cleanup_versions, collect_garbage,
+    compact_database, merge_databases, repair_writes,
+};
+pub use search::{
+    BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
+    StemLanguage,
+};
+pub use security::NamespaceSecurityConfig;
+pub use startup::{StartupSchemaGuard, guard_daemon_startup_schema};
+pub use storage::{
+    ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
+    CrossStoreRecoveryStatus, DEFAULT_TABLE_NAME, GcConfig, GcStats, SchemaMigrationReport,
+    SchemaMismatchWriteError, SchemaVersion, StorageManager, TableStats, parse_duration_string,
+    required_columns_for,
+};
+
+// High-level engine API
+pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
+pub use lifecycle::{
+    ExportRecord, ImportOutcome, NamespaceMigrationOutcome, ReindexJob, ReindexOutcome,
+    ReprocessJob, ReprocessOutcome, default_reindexed_namespace, export_namespace_jsonl_stream,
+    import_jsonl_bytes_stream, import_jsonl_file, import_jsonl_reader, migrate_namespace_atomic,
+    reindex_namespace, reprocess_jsonl_file,
+};
+
+// Canonical MCP metadata plus local Rust helper API.
+pub use tools::{
+    ToolDefinition, ToolResult, delete_document, delete_documents_by_filter, get_document,
+    search_documents, store_document, store_documents_batch, tool_definitions,
+};
+
+// CLI-only re-exports (require indicatif, ratatui, crossterm)
+#[cfg(feature = "cli")]
+pub use progress::IndexProgressTracker;
+#[cfg(feature = "cli")]
+pub use tui::{
+    CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker, HostDetection, HostKind,
+    WizardConfig, detect_hosts, run_wizard,
+};
+
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Cache size in MB for moka in-memory cache
+    pub cache_mb: usize,
+
+    /// Path for embedded vector store (LanceDB)
+    pub db_path: String,
+
+    /// Max allowed request size (bytes) for JSON-RPC framing
+    pub max_request_bytes: usize,
+
+    /// Default log level to use when wiring tracing
+    pub log_level: Level,
+
+    /// Allowed paths for file access (whitelist).
+    /// If empty, defaults to $HOME and current working directory.
+    /// Supports ~ expansion and absolute paths.
+    pub allowed_paths: Vec<String>,
+
+    /// Namespace security configuration (token-based access control)
+    pub security: NamespaceSecurityConfig,
+
+    /// Embedding provider configuration (universal, config-driven)
+    pub embeddings: EmbeddingConfig,
+
+    /// Hybrid search configuration (vector + BM25)
+    pub hybrid: HybridConfig,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            cache_mb: 4096,
+            db_path: "~/.rmcp-servers/rust-memex/lancedb".to_string(),
+            max_request_bytes: 5 * 1024 * 1024,
+            log_level: Level::INFO,
+            allowed_paths: vec![],
+            security: NamespaceSecurityConfig::default(),
+            embeddings: EmbeddingConfig::default(),
+            hybrid: HybridConfig::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    #[doc(alias = "with_db_path")]
+    pub fn with_storage_path(mut self, db_path: impl Into<String>) -> Self {
+        self.db_path = db_path.into();
+        self
+    }
+
+    #[deprecated(note = "use with_storage_path")]
+    pub fn with_db_path(self, db_path: impl Into<String>) -> Self {
+        self.with_storage_path(db_path)
+    }
+}
+
+/// Helper to build and run the stdin/stdout server for library consumers.
+pub async fn run_stdio_server(config: ServerConfig) -> Result<()> {
+    let server = create_server(config).await?;
+    server.run_stdio().await
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_config_has_expected_values() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.cache_mb, 4096);
+        assert_eq!(cfg.db_path, "~/.rmcp-servers/rust-memex/lancedb");
+        assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn contracts_are_reachable_through_main_crate() {
+        let audit = contracts::audit::AuditResult {
+            namespace: "animals".to_string(),
+            document_count: 4,
+            avg_chunk_length: 256,
+            sentence_integrity: 0.92,
+            word_integrity: 0.94,
+            chunk_quality: 0.9,
+            overall_score: 0.91,
+            recommendation: contracts::audit::AuditRecommendation::Good,
+            passes_threshold: true,
+        };
+        let storage = contracts::stats::StorageMetrics::default();
+        let timeline = contracts::timeline::TimelineFilter {
+            namespace: Some("animals".to_string()),
+            since: Some("2026-04-19".to_string()),
+            gaps_only: false,
+        };
+        let progress = contracts::progress::SseEvent {
+            event: "done".to_string(),
+            id: Some("evt-1".to_string()),
+            data: json!({ "status": "ok" }),
+        };
+
+        let _: rag::AuditResult = audit.clone();
+        let _: http::AuditResult = audit;
+        let _: http::StorageMetrics = storage;
+        let _: http::TimelineFilter = timeline;
+        let _: http::SseEvent = progress;
+    }
+}

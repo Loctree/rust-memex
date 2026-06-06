@@ -564,8 +564,9 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (status, db_path, embedding_provider) |
-| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported) |
+| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported); response includes collapsed `clusters` and `duplicate_count` |
 | `/sse/search` | GET | SSE streaming search with optional `project`, `layer`, and `deep` filters |
+| `/api/context-pack` | POST | Build a markdown context pack from a query or explicit chunk IDs, with grouped evidence and rebuilt indexed source chunks |
 | `/upsert` | POST | Add/update document |
 | `/index` | POST | Full pipeline indexing with onion slices |
 | `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |
@@ -573,6 +574,17 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | `/get/{ns}/{id}` | GET | Get document by ID |
 | `/delete/{ns}/{id}` | POST | Delete document |
 | `/ns/{namespace}` | DELETE | Purge entire namespace |
+
+**Diagnostic & lifecycle endpoints** (require `Bearer` auth_token):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/audit` | GET | Per-namespace quality audit (chunk completeness, hash coverage, score) |
+| `/api/stats` / `/api/stats/{ns}` | GET | Database / namespace statistics |
+| `/api/timeline` | GET | Indexing timeline aggregates |
+| `/api/purge-quality` | POST | Purge low-quality chunks under a threshold (gated by approval key) |
+| `/api/dedup` | POST | Run post-index deduplication (`group-by`, `keep`, `dry_run` body fields) |
+| `/api/backfill-hashes` | POST | Spec P0 backfill: populate per-chunk `content_hash` + `source_hash` for pre-v4 namespaces |
 
 ### MCP-over-SSE Endpoints (Claude Code compatibility)
 
@@ -653,6 +665,17 @@ allowed_paths = [
 # Security
 security_enabled = true
 token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
+
+# Optional: dashboard-only OIDC for browser users.
+# API / SSE / MCP still stay Bearer-authenticated via auth_token.
+auth_token = "replace-me"
+
+[dashboard_oidc]
+issuer_url = "https://issuer.example"
+client_id = "rust-memex-dashboard"
+client_secret = "optional-confidential-client-secret"
+public_base_url = "https://memex.example.com"
+scopes = ["openid", "profile", "email"]
 ```
 
 ## Documentation
@@ -754,16 +777,66 @@ Automatic removal of ~36-40% noise from conversation exports:
 rust-memex index -n memories /path/to/export.json --preprocess
 ```
 
-### Exact-Match Deduplication
+### Deduplication & Hash Hygiene
 
-SHA256-based dedup for overlapping exports (e.g., quarterly exports containing 6 months of data):
+Two layers of dedup work together:
+
+**1. Pre-index source dedup** (during `index`)
+
+The pipeline computes `sha256(file_text)` and skips files whose `source_hash`
+already exists in the namespace (with a fallback to `content_hash` for pre-v4
+namespaces). The skip line is logged at `info!` so it shows up in the default
+operator run log:
+
+```
+Skip duplicate source: /path/to/file.md (source_hash 8ee43c1e7393b432)
+```
 
 ```bash
 # Dedup enabled (default)
 rust-memex index -n memories /path/to/data/
 
-# Disable dedup
+# Disable dedup for this run
 rust-memex index -n memories /path/to/data/ --no-dedup
+
+# Spec P4 escape hatch: force re-index a known-duplicate source
+rust-memex index -n memories /path/to/data/ --allow-duplicates
+```
+
+**2. Post-index dedup CLI** (standalone command)
+
+```bash
+# Default grouping: source-hash + layer (preserves onion structure,
+# removes only true source repeats while keeping outer/middle/inner/core)
+rust-memex dedup -n kb:transcripts --dry-run
+
+# Collapse all layers per source (legacy aggressive grouping)
+rust-memex dedup -n kb:transcripts --group-by source-hash
+
+# Per-chunk content_hash grouping (legacy pre-v4 behavior)
+rust-memex dedup -n kb:transcripts --group-by content-hash
+
+# Cross-namespace dedup pool
+rust-memex dedup --cross-namespace --dry-run false
+
+# Keep newest duplicates instead of oldest
+rust-memex dedup -n memories --keep newest
+```
+
+**3. Hash backfill (spec P0)** — fills `content_hash` (per-chunk) and
+`source_hash` (per-source) for namespaces indexed before v4. Without backfill,
+`dedup` reports "Without hash: N (cannot deduplicate)" and is blind to legacy
+chunks:
+
+```bash
+# Dry-run backfill across all namespaces
+rust-memex backfill-hashes
+
+# Backfill one namespace, then commit
+rust-memex backfill-hashes -n kb:transcripts --dry-run false
+
+# Machine-readable JSON for scripts / CI
+rust-memex backfill-hashes --json
 ```
 
 **Output with statistics:**
@@ -774,6 +847,28 @@ Indexing complete:
   Skipped (duplicate): 33
   Deduplication:       enabled
 ```
+
+### LLM-Synthesized Outer Layer (Spec P3)
+
+The default outer layer is a TF-based keyword extract (`--outer-synthesis
+keyword`). For transcript-heavy namespaces where keyword splat is noise (CLI
+animation gerunds, structural markdown, file-path tokens), the outer layer can
+be replaced with a 1-3 sentence summary from a local Ollama model:
+
+```bash
+# Wire the outer layer through Ollama (requires --pipeline mode)
+rust-memex index -n kb:transcripts /path/to/transcripts/ \
+  --slice-mode onion \
+  --pipeline \
+  --outer-synthesis llm \
+  --ollama-model qwen2.5:3b \
+  --ollama-endpoint http://localhost:11434
+```
+
+Failure modes (network, non-2xx, malformed JSON, empty completion) silently
+fall back to the keyword outer so the pipeline never stalls. Reachable only
+through `--pipeline` — passing `--outer-synthesis llm` without `--pipeline` is
+rejected up-front by clap.
 
 ## Code Structure
 
@@ -792,7 +887,7 @@ rust-memex/
 │   ├── preprocessing/
 │   │   └── mod.rs          # Noise filtering for conversation exports
 │   ├── storage/
-│   │   └── mod.rs          # LanceDB + Tantivy (schema v3 with content_hash)
+│   │   └── mod.rs          # LanceDB + Tantivy (schema v4: source_hash + per-chunk content_hash)
 │   ├── embeddings/
 │   │   └── mod.rs          # MLX/FastEmbed bridge
 │   └── tui/

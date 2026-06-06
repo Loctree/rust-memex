@@ -50,8 +50,8 @@ help: ## Show this help
 build: ## Build release binary
 	cargo build --release
 
-install: build ## Build and install to ~/.cargo/bin
-	@cp ./target/release/$(BINARY) $(INSTALL_PATH)
+install: ## Build and install to ~/.cargo/bin
+	cargo install --path crates/rust-memex --locked --force --bin $(BINARY)
 	@echo "Installed to $(INSTALL_PATH)"
 
 # ============================================================================
@@ -223,6 +223,9 @@ dev: ## Run in development mode (foreground, debug logs)
 
 test: ## Run tests
 	cargo test
+
+test-e2e: ## Run e2e tests against the operator's canonical config.toml provider cascade
+	cargo test --workspace --all-targets --no-fail-fast --features e2e-ollama
 
 check: ## Run cargo check
 	cargo check

@@ -210,7 +210,7 @@ main() {
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
     install_compat_aliases "$INSTALL_DIR/$BINARY_NAME"
     success "Installed ${BINARY_NAME} to $INSTALL_DIR/$BINARY_NAME"
-    info "Legacy compatibility alias: $INSTALL_DIR/rmcp_memex"
+    info "Legacy compatibility alias: $INSTALL_DIR/rust_memex"
 
     installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null || echo "unknown")
     info "Installed version: $installed_version"
