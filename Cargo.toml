@@ -55,7 +55,6 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 walkdir = "2.5"
 
 [patch.crates-io]
-aicx-parser = { path = "../aicx/crates/aicx-parser" }
 # Keep local directory namespaces without pulling unused cloud backends into the graph.
 lance-namespace-impls = { path = "vendor/lance-namespace-impls" }
 

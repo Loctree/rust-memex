@@ -7243,9 +7243,5 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "aicx-parser"
-version = "0.8.0"
-
-[[patch.unused]]
 name = "lance-namespace-impls"
 version = "0.39.0"

@@ -829,16 +829,20 @@ fn extract_doc_timestamp_string(
     metadata: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
     metadata.and_then(|object| {
-        object.iter().find_map(|(key, value)| {
-            if !(key.contains("date") || key.contains("timestamp") || key.contains("time")) {
-                return None;
-            }
-            value.as_str().map(ToOwned::to_owned)
-        }).or_else(|| {
-            object.get("path")
-                .and_then(|value| value.as_str())
-                .and_then(extract_date_from_path)
-        })
+        object
+            .iter()
+            .find_map(|(key, value)| {
+                if !(key.contains("date") || key.contains("timestamp") || key.contains("time")) {
+                    return None;
+                }
+                value.as_str().map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                object
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .and_then(extract_date_from_path)
+            })
     })
 }
 
@@ -847,9 +851,8 @@ fn extract_date_from_path(path: &str) -> Option<String> {
 
     // Look for YYYY-MM-DD or YYYY_MM_DD
     static RE_STANDARD: OnceLock<regex::Regex> = OnceLock::new();
-    let re_standard = RE_STANDARD.get_or_init(|| {
-        regex::Regex::new(r"(19\d{2}|20\d{2})[_-](\d{2})[_-](\d{2})").unwrap()
-    });
+    let re_standard = RE_STANDARD
+        .get_or_init(|| regex::Regex::new(r"(19\d{2}|20\d{2})[_-](\d{2})[_-](\d{2})").unwrap());
 
     if let Some(caps) = re_standard.captures(path) {
         let year = caps.get(1)?.as_str();
@@ -860,9 +863,8 @@ fn extract_date_from_path(path: &str) -> Option<String> {
 
     // Also look for YYYY_MMDD or YYYYMMDD
     static RE_SHORT: OnceLock<regex::Regex> = OnceLock::new();
-    let re_short = RE_SHORT.get_or_init(|| {
-        regex::Regex::new(r"(19\d{2}|20\d{2})_?(\d{2})(\d{2})").unwrap()
-    });
+    let re_short =
+        RE_SHORT.get_or_init(|| regex::Regex::new(r"(19\d{2}|20\d{2})_?(\d{2})(\d{2})").unwrap());
 
     if let Some(caps) = re_short.captures(path) {
         let year = caps.get(1)?.as_str();

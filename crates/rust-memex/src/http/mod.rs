@@ -3668,7 +3668,9 @@ async fn mcp_sse_handler(
 
     info!(
         "MCP SSE: New session {} (base_url: {}, path: {})",
-        session_id, base_url, uri.path()
+        session_id,
+        base_url,
+        uri.path()
     );
 
     let sessions_for_cleanup = state.mcp_sessions.clone();

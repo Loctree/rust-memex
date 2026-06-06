@@ -7,6 +7,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const GPU_CLASSES: &[&str] = &["AGXAcceleratorG15X", "IOAccelerator"];
 const EMBEDDER_PROCESS_NAMES: &[&str] = &["ollama", "llama-server", "mlx_server", "mlx-server"];
 
@@ -149,43 +150,49 @@ struct GpuMetrics {
 
 fn probe_gpu() -> Result<GpuMetrics, GpuStatus> {
     #[cfg(not(target_os = "macos"))]
-    return Err(GpuStatus::Unavailable {
-        reason: "GPU telemetry only supported on macOS via ioreg".to_string(),
-    });
-
-    let mut reasons = Vec::new();
-
-    for class_name in GPU_CLASSES {
-        match std::process::Command::new("ioreg")
-            .args(["-l", "-w", "0", "-r", "-c", class_name, "-d", "1"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(metrics) = parse_ioreg_output(&stdout, class_name) {
-                    return Ok(metrics);
-                }
-                reasons.push(format!("{class_name}: telemetry keys not found"));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                if stderr.is_empty() {
-                    reasons.push(format!("{class_name}: ioreg exited with {}", output.status));
-                } else {
-                    reasons.push(format!("{class_name}: {stderr}"));
-                }
-            }
-            Err(error) => {
-                reasons.push(format!("{class_name}: {error}"));
-            }
-        }
+    {
+        Err(GpuStatus::Unavailable {
+            reason: "GPU telemetry only supported on macOS via ioreg".to_string(),
+        })
     }
 
-    Err(GpuStatus::Unavailable {
-        reason: reasons.join(" | "),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let mut reasons = Vec::new();
+
+        for class_name in GPU_CLASSES {
+            match std::process::Command::new("ioreg")
+                .args(["-l", "-w", "0", "-r", "-c", class_name, "-d", "1"])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Some(metrics) = parse_ioreg_output(&stdout, class_name) {
+                        return Ok(metrics);
+                    }
+                    reasons.push(format!("{class_name}: telemetry keys not found"));
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if stderr.is_empty() {
+                        reasons.push(format!("{class_name}: ioreg exited with {}", output.status));
+                    } else {
+                        reasons.push(format!("{class_name}: {stderr}"));
+                    }
+                }
+                Err(error) => {
+                    reasons.push(format!("{class_name}: {error}"));
+                }
+            }
+        }
+
+        Err(GpuStatus::Unavailable {
+            reason: reasons.join(" | "),
+        })
+    }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_ioreg_output(output: &str, class_name: &str) -> Option<GpuMetrics> {
     let device_util = extract_ioreg_value(output, "Device Utilization %")
         .or_else(|| extract_ioreg_value(output, "Renderer Utilization %"))?;
@@ -198,6 +205,7 @@ fn parse_ioreg_output(output: &str, class_name: &str) -> Option<GpuMetrics> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn extract_ioreg_value(output: &str, key: &str) -> Option<u64> {
     let quoted_key = format!("\"{key}\"");
     let key_index = output.find(&quoted_key)?;
