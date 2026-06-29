@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn keyword_extraction_splits_paths_and_filters_session_tokens() {
         let keywords = extract_keywords(
-            "/Users/silver/Git/tools/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            "/Users/user/projects/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
             10,
         );
 

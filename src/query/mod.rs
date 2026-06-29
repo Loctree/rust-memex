@@ -22,7 +22,7 @@
 //! use rust_memex::query::{detect_intent, QueryIntent, QueryRouter};
 //!
 //! // Quick intent detection
-//! let intent = detect_intent("when did we buy dragon");
+//! let intent = detect_intent("when did we buy laptop");
 //! assert!(matches!(intent, QueryIntent::Temporal));
 //!
 //! // Full routing with recommendations
