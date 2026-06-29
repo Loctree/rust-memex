@@ -495,7 +495,7 @@ async fn memory_upsert_replaces_onion_family_by_original_id() -> Result<()> {
     let namespace = "memory-upsert-onion";
     let initial_text = "This is a long document about indexing and embeddings. It exists to force onion slicing during the first upsert. \
 The content is intentionally verbose and repetitive so the outer and core layers both exist and can later be replaced cleanly. \
-Project Vista keeps appearing here to provide a stable metadata anchor for search filters.";
+Project Demo keeps appearing here to provide a stable metadata anchor for search filters.";
     let updated_text = "This is an updated long document about project search filters, namespace cache invalidation, and release hardening. \
 It should fully replace the previous onion family instead of appending stale slices. \
 The text stays comfortably above the slicing threshold so onion-fast still writes both outer and core documents.";
@@ -504,7 +504,7 @@ The text stays comfortably above the slicing threshold so onion-fast still write
         namespace,
         "doc-1".to_string(),
         initial_text.to_string(),
-        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+        json!({"slice_mode": "onion-fast", "project": "Demo"}),
     )
     .await?;
 
@@ -534,7 +534,7 @@ The text stays comfortably above the slicing threshold so onion-fast still write
         namespace,
         "doc-1".to_string(),
         updated_text.to_string(),
-        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+        json!({"slice_mode": "onion-fast", "project": "Demo"}),
     )
     .await?;
 

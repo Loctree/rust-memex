@@ -497,7 +497,7 @@ pub enum Commands {
     /// using the onion slice architecture (outer layers = summaries).
     ///
     /// Examples:
-    ///   rust-memex recall "Vista architecture"          # Search all namespaces
+    ///   rust-memex recall "Demo architecture"          # Search all namespaces
     ///   rust-memex recall "laptop setup" -n memories    # Specific namespace
     ///   rust-memex recall "auth flow" --limit 20        # More sources
     Recall {

@@ -3802,16 +3802,16 @@ mod tests {
 
     #[test]
     fn search_options_can_carry_project_filter() {
-        let options = SearchOptions::deep().with_project(Some("Vista".to_string()));
+        let options = SearchOptions::deep().with_project(Some("Demo".to_string()));
         assert_eq!(options.layer_filter, None);
-        assert_eq!(options.project_filter.as_deref(), Some("Vista"));
+        assert_eq!(options.project_filter.as_deref(), Some("Demo"));
     }
 
     #[test]
     fn project_match_uses_metadata_fields() {
         assert!(metadata_matches_project(
-            &json!({"project": "Vista"}),
-            "vista"
+            &json!({"project": "Demo"}),
+            "demo"
         ));
         assert!(metadata_matches_project(
             &json!({"project_id": "Loctree"}),
@@ -3819,7 +3819,7 @@ mod tests {
         ));
         assert!(!metadata_matches_project(
             &json!({"project": "rust-memex"}),
-            "vista"
+            "demo"
         ));
         assert_eq!(
             SearchOptions::default().layer_filter,

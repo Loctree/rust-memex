@@ -1180,7 +1180,7 @@ mod tests {
                 metadata: json!({
                     "original_id": "doc-1",
                     "layer": "outer",
-                    "project": "vista"
+                    "project": "demo"
                 }),
                 content_hash: Some("outer-hash".to_string()),
                 embeddings: None,
@@ -1192,7 +1192,7 @@ mod tests {
                 metadata: json!({
                     "original_id": "doc-1",
                     "layer": "core",
-                    "project": "vista"
+                    "project": "demo"
                 }),
                 content_hash: Some("core-hash".to_string()),
                 embeddings: None,
@@ -1239,7 +1239,7 @@ mod tests {
             "layer": "outer",
             "slice_mode": "onion",
             "content_hash": "stale",
-            "project": "vista"
+            "project": "demo"
         });
 
         let prepared = prepare_reprocess_metadata(
@@ -1252,7 +1252,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(prepared["project"], "vista");
+        assert_eq!(prepared["project"], "demo");
         assert_eq!(prepared["slice_mode"], "onion-fast");
         assert_eq!(prepared["reprocess_source_record_id"], "core-1");
         assert_eq!(prepared["reprocess_source_hash"], "fresh-hash");

@@ -148,17 +148,17 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### Vista Integration
+### Optimized Profile
 
-For Vista PIMS, use the optimized constructor:
+For a smaller-footprint setup, use the optimized constructor:
 
 ```rust
 use rust_memex::MemexEngine;
 
-// Vista-optimized: 1024 dims, qwen3-embedding:0.6b model
-let engine = MemexEngine::for_vista().await?;
+// Optimized: 1024 dims, qwen3-embedding:0.6b model
+let engine = MemexEngine::for_app_optimized().await?;
 
-// Store visit notes
+// Store notes
 engine.store(
     "visit-456",
     "SOAP note: Feline diabetes mellitus diagnosis...",
@@ -613,10 +613,10 @@ curl -X POST http://localhost:8997/upsert \
 # Search
 curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
+  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Demo", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
+curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Demo&layer=1"
 ```
 
 ### Multi-Host Database Paths

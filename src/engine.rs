@@ -506,34 +506,34 @@ impl MemexEngine {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let engine = MemexEngine::for_app("vista", "patient-notes").await?;
+    /// let engine = MemexEngine::for_app("myapp", "notes").await?;
     /// ```
     pub async fn for_app(app_name: &str, namespace: &str) -> Result<Self> {
         let config = MemexConfig::new(app_name, namespace);
         Self::new(config).await
     }
 
-    /// Vista-optimized setup with 1024-dimension embeddings.
+    /// Optimized setup with 1024-dimension embeddings.
     ///
     /// Uses smaller embedding model (qwen3-embedding:0.6b) for faster inference.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let engine = MemexEngine::for_vista().await?;
+    /// let engine = MemexEngine::for_app_optimized().await?;
     /// ```
-    pub async fn for_vista() -> Result<Self> {
+    pub async fn for_app_optimized() -> Result<Self> {
         use crate::embeddings::ProviderConfig;
 
         let config = MemexConfig {
-            app_name: "vista".to_string(),
+            app_name: "app".to_string(),
             namespace: "default".to_string(),
-            db_path: Some("~/.rmcp-servers/vista/lancedb".to_string()),
+            db_path: Some("~/.rmcp-servers/app/lancedb".to_string()),
             dimension: 1024,
             embedding_config: EmbeddingConfig {
                 required_dimension: 1024,
                 providers: vec![ProviderConfig {
-                    name: "ollama-vista".to_string(),
+                    name: "ollama-optimized".to_string(),
                     base_url: "http://localhost:11434".to_string(),
                     model: "qwen3-embedding:0.6b".to_string(),
                     priority: 1,
@@ -543,7 +543,7 @@ impl MemexEngine {
             },
             enable_bm25: false,
             bm25_config: None,
-            enable_hybrid: true, // Hybrid enabled for Vista
+            enable_hybrid: true, // Hybrid enabled for the optimized profile
             hybrid_config: None,
         };
         Self::new(config).await
@@ -1139,12 +1139,12 @@ mod tests {
 
     #[test]
     fn test_memex_config_builder() {
-        let config = MemexConfig::new("vista", "patients")
+        let config = MemexConfig::new("demo", "records")
             .with_dimension(1024)
             .with_db_path("/custom/path/db");
 
-        assert_eq!(config.app_name, "vista");
-        assert_eq!(config.namespace, "patients");
+        assert_eq!(config.app_name, "demo");
+        assert_eq!(config.namespace, "records");
         assert_eq!(config.dimension, 1024);
         assert_eq!(config.embedding_config.required_dimension, 1024);
         assert_eq!(config.effective_db_path(), "/custom/path/db");

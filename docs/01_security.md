@@ -21,7 +21,7 @@ Zamiast hardcoded ograniczenia do `$HOME` i `cwd`, wprowadzono konfigurowalną l
 # ~/.rmcp-servers/rust-memex/config.toml
 allowed_paths = [
     "~",                              # Home directory
-    "/Volumes/LibraxisShare/data",    # External volume
+    "/Volumes/ExternalDrive/data",    # External volume
     "/opt/shared/documents"           # Shared directory
 ]
 ```

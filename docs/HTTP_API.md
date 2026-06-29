@@ -129,7 +129,7 @@ These remain useful for legacy clients, but new code should prefer `GET /api/dis
 ```bash
 curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Vista","deep":true}'
+  -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Demo","deep":true}'
 ```
 
 Representative response:

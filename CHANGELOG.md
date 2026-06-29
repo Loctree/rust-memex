@@ -216,7 +216,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **MemexEngine** - High-level API for library consumers
   - `MemexEngine::for_app()` - quick setup for any application with auto-config
-  - `MemexEngine::for_vista()` - Vista-optimized defaults (1024 dims, qwen3-embedding:0.6b)
+  - `MemexEngine::for_app_optimized()` - optimized defaults (1024 dims, qwen3-embedding:0.6b)
   - CRUD operations: `store()`, `search()`, `get()`, `delete()`
   - Batch operations: `store_batch()` for efficient bulk inserts
   - Filtered operations: `search_filtered()`, `delete_by_filter()` for GDPR-compliant deletion

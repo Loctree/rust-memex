@@ -14,7 +14,7 @@
 SHELL := /bin/bash
 BINARY := rust-memex
 INSTALL_PATH := $(HOME)/.cargo/bin/$(BINARY)
-LAUNCHD_PLIST := $(HOME)/Library/LaunchAgents/ai.libraxis.rust-memex.plist
+LAUNCHD_PLIST := $(HOME)/Library/LaunchAgents/ai.vetcoders.rust-memex.plist
 
 # Disk paths
 DB_PATH_DISK := $(HOME)/.ai-memories/lancedb
@@ -63,14 +63,14 @@ start: ## Start memex service via launchd
 		echo "Service already running on port $(HTTP_PORT)"; \
 	else \
 		launchctl bootstrap gui/$$(id -u) $(LAUNCHD_PLIST) 2>/dev/null || \
-		launchctl kickstart gui/$$(id -u)/ai.libraxis.rust-memex 2>/dev/null || \
+		launchctl kickstart gui/$$(id -u)/ai.vetcoders.rust-memex 2>/dev/null || \
 		$(INSTALL_PATH) serve --db-path $(DB_PATH) --http-port $(HTTP_PORT) --http-only & \
 		sleep 3; \
 		echo "Started memex on port $(HTTP_PORT)"; \
 	fi
 
 stop: ## Stop memex service
-	@-launchctl bootout gui/$$(id -u)/ai.libraxis.rust-memex 2>/dev/null
+	@-launchctl bootout gui/$$(id -u)/ai.vetcoders.rust-memex 2>/dev/null
 	@-pkill -f "$(BINARY) serve" 2>/dev/null
 	@echo "Stopped memex service"
 
