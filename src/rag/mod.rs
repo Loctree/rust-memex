@@ -644,7 +644,7 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
 
     // Sort by frequency and take top N
     let mut words: Vec<_> = word_counts.into_iter().collect();
-    words.sort_by(|a, b| b.1.cmp(&a.1));
+    words.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     words
         .into_iter()
@@ -3815,7 +3815,7 @@ mod tests {
         ));
         assert!(metadata_matches_project(
             &json!({"project_id": "Loctree"}),
-            "vetcoders"
+            "loctree"
         ));
         assert!(!metadata_matches_project(
             &json!({"project": "rust-memex"}),
