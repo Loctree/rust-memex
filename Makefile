@@ -1,10 +1,10 @@
 # rust-memex Makefile
 # ============================================================================
 # Service management, build, and maintenance targets
-# Created by M&K (c)2026 Loctree
+# Created by vetcoders (c)2026 Loctree
 # ============================================================================
 #
-# RAM DISK MODE (Dragon 512GB):
+# RAM DISK MODE (512GB host):
 #   make ramdisk-up    - Create 50GB RAM disk, copy DB, start service
 #   make ramdisk-down  - Sync to disk, unmount RAM disk, stop service
 #   make snapshot      - Sync RAM disk to disk (backup)
@@ -105,7 +105,7 @@ dashboard: ## Open dashboard in browser
 	@open http://localhost:$(HTTP_PORT)/
 
 # ============================================================================
-# RAM DISK (Dragon 512GB - full DB in RAM)
+# RAM DISK (512GB host - full DB in RAM)
 # ============================================================================
 
 ramdisk-create: ## Create 50GB RAM disk (requires sudo for mount)

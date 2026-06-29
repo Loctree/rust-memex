@@ -205,7 +205,7 @@ use rust_memex::{MemexEngine, SearchMode};
 let engine = MemexEngine::for_app("my-app", "documents").await?;
 
 // Hybrid search with BM25 + vector fusion (recommended)
-let results = engine.search_hybrid("dragon mac studio", 10).await?;
+let results = engine.search_hybrid("fast mac studio", 10).await?;
 for r in &results {
     println!("{}: {} (combined: {:.2}, vector: {:.2}, bm25: {:.2})",
         r.id, r.document, r.combined_score, r.vector_score, r.bm25_score);
@@ -621,7 +621,7 @@ curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5
 
 ### Multi-Host Database Paths
 
-For setups with multiple machines (e.g., dragon, mgbook16), use per-host database paths:
+For setups with multiple machines (e.g., laptop, workstation), use per-host database paths:
 
 ```bash
 # Per-host paths (each machine gets own database)
@@ -685,7 +685,7 @@ Intelligent query intent detection for automatic search mode selection:
 
 ```bash
 # Auto-detect query intent and select optimal mode
-rust-memex search -n memories -q "when did we buy dragon" --auto-route
+rust-memex search -n memories -q "when did we buy the laptop" --auto-route
 # Output: Query intent: temporal (confidence: 0.70)
 #         Selects: hybrid mode with date boosting
 
@@ -695,7 +695,7 @@ rust-memex search -n code -q "who imports main.rs" --auto-route
 #         Consider: loctree query --kind who-imports --target main.rs
 
 # Deep exploration with all onion layers
-rust-memex dive -n memories -q "dragon" --verbose
+rust-memex dive -n memories -q "laptop" --verbose
 ```
 
 **Intent Types:**
@@ -817,5 +817,4 @@ Add to `~/.claude.json`:
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders

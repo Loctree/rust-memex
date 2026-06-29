@@ -6,8 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - **Rebranded: `rmcp-memex` → `rust-memex`.** Crate name on crates.io, binary name `rmcp-memex` → `rust-memex`, library path `rmcp_memex` → `rust_memex`, and all internal imports `use rmcp_memex::` → `use rust_memex::`. User-facing `RMCP_MEMEX_*` environment variables preserved as-is for backward compatibility.
-- **Moved to Loctree org:** `https://github.com/VetCoders/rmcp-memex` → `https://github.com/Loctree/rust-memex`. Docs, install CTAs, and issue tracker URLs updated across README, docs/, install.sh, and Makefile.
-- **Authors + license unchanged.** Maciej Gad & Monika Szymanska remain the Cargo authors; dual MIT OR Apache-2.0 license retained for library-friendly downstream use.
+- **Moved to Loctree org:** `https://github.com/vetcoders/rmcp-memex` → `https://github.com/Loctree/rust-memex`. Docs, install CTAs, and issue tracker URLs updated across README, docs/, install.sh, and Makefile.
+- **Authors + license unchanged.** Vetcoders remains the Cargo author; dual MIT OR Apache-2.0 license retained for library-friendly downstream use.
 
 ### Added
 - `rust-memex reindex` subcommand for rebuilding namespace contents with paginated source reads, preflight embedding checks, and target-namespace safety guards
@@ -171,7 +171,7 @@ All notable changes to this project will be documented in this file.
 - **CLI `--auto-route` flag** - Automatic search mode selection for `search` command
   - Analyzes query intent and selects optimal mode (vector/bm25/hybrid)
   - Displays intent, confidence, and loctree suggestions when applicable
-  - Example: `rust-memex search -n memories -q "when did we buy dragon" --auto-route`
+  - Example: `rust-memex search -n memories -q "when did we buy the laptop" --auto-route`
 - **MCP `auto_route` parameter** - Added to `rag_search` and `memory_search` tools
   - When `true`, QueryRouter overrides explicit `mode` parameter
   - Enables intelligent mode selection for AI agents
@@ -370,4 +370,4 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders

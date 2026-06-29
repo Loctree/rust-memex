@@ -334,5 +334,4 @@ key_derivation = "argon2id"
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders
