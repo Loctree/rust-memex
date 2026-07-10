@@ -158,11 +158,6 @@ pub async fn detect_providers() -> Vec<DetectedProvider> {
         providers.push(provider);
     }
 
-    // Check dragon:12345 (common remote MLX server)
-    if let Some(provider) = detect_mlx(&client, "http://dragon", 12345).await {
-        providers.push(provider);
-    }
-
     providers
 }
 

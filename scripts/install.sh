@@ -37,5 +37,5 @@ JSON
 
 echo ""
 echo "Notes:"
-echo "- The MLX HTTP bridge is optional. By default, DRAGON_BASE_URL=http://localhost."
+echo "- The MLX HTTP bridge is optional. By default, EMBEDDER_BASE_URL=http://localhost."
 echo "- To force local-only embeddings, set DISABLE_MLX=1."

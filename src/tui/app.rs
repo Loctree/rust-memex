@@ -436,7 +436,7 @@ fn get_hostname() -> String {
 pub enum DbPathMode {
     /// Single shared path (e.g., ~/.ai-memories/lancedb)
     Shared,
-    /// Per-host path with hostname suffix (e.g., ~/.ai-memories/lancedb.dragon)
+    /// Per-host path with hostname suffix (e.g., ~/.ai-memories/lancedb.host-a)
     PerHost,
 }
 

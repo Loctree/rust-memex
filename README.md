@@ -309,9 +309,8 @@ MEMEX_BM25_PATH=~/.rmcp-servers/myapp/bm25
 # ADVANCED: Multiple providers (fallback cascade)
 # =============================================================================
 
-# Remote embedding server fallback
-# DRAGON_BASE_URL=http://your-server.local
-# DRAGON_EMBEDDER_PORT=12345
+# Remote embedding server fallback (uses EMBEDDER_PORT below)
+# EMBEDDER_BASE_URL=http://your-server.local
 
 # MLX embedder for Apple Silicon
 # EMBEDDER_PORT=12300
@@ -633,7 +632,7 @@ rust-memex wizard
 
 The TUI wizard auto-detects hostname and offers:
 - **Shared mode**: `~/.ai-memories/lancedb` (same path everywhere)
-- **Per-host mode**: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
+- **Per-host mode**: `~/.ai-memories/lancedb.host-a`, `~/.ai-memories/lancedb.host-b`, etc.
 
 ### Configuration (TOML)
 

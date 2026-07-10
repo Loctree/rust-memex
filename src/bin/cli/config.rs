@@ -157,8 +157,8 @@ pub struct MlxFileConfig {
     #[serde(default)]
     pub disabled: bool,
     pub local_port: Option<u16>,
-    pub dragon_url: Option<String>,
-    pub dragon_port: Option<u16>,
+    pub embedder_url: Option<String>,
+    pub embedder_port: Option<u16>,
     pub embedder_model: Option<String>,
     pub reranker_model: Option<String>,
     pub reranker_port_offset: Option<u16>,
@@ -171,8 +171,8 @@ impl MlxFileConfig {
         config.merge_file_config(rust_memex::MlxMergeOptions {
             disabled: Some(self.disabled),
             local_port: self.local_port,
-            dragon_url: self.dragon_url.clone(),
-            dragon_port: self.dragon_port,
+            embedder_url: self.embedder_url.clone(),
+            embedder_port: self.embedder_port,
             embedder_model: self.embedder_model.clone(),
             reranker_model: self.reranker_model.clone(),
             reranker_port_offset: self.reranker_port_offset,
