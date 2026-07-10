@@ -58,17 +58,17 @@ Example response:
   "version": "0.5.1",
   "db_path": "/Users/tester/.rmcp-servers/rust-memex/lancedb",
   "embedding_provider": "ollama-local",
-  "total_documents": 27455,
+  "total_documents": 20000,
   "namespace_count": 2,
   "namespaces": [
     {
-      "id": "kodowanie",
-      "count": 15000,
+      "id": "notes",
+      "count": 12000,
       "last_indexed_at": "2026-03-15T10:11:12Z"
     },
     {
       "id": "memories",
-      "count": 12455,
+      "count": 8000,
       "last_indexed_at": null
     }
   ]
@@ -129,7 +129,7 @@ These remain useful for legacy clients, but new code should prefer `GET /api/dis
 ```bash
 curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Demo","deep":true}'
+  -d '{"query":"rust async","namespace":"notes","k":10,"mode":"hybrid","project":"Demo","deep":true}'
 ```
 
 Representative response:
@@ -139,7 +139,7 @@ Representative response:
   "results": [
     {
       "id": "doc-456",
-      "namespace": "kodowanie",
+      "namespace": "notes",
       "text": "Matching content...",
       "score": 0.85,
       "layer": "L0_Atom"

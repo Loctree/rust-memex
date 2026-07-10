@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn keyword_extraction_splits_paths_and_filters_session_tokens() {
         let keywords = extract_keywords(
-            "/Users/user/projects/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            "/Users/tester/projects/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
             10,
         );
 
@@ -3833,14 +3833,14 @@ mod tests {
 
 [signals]
 Results:
-- AICX lookup działa
+- Config lookup succeeded
 [/signals]
 
-[09:14:00] assistant: Tak, i to właśnie jest sedno: `aicx-dragon` to żywy endpoint MCP.
-[09:15:33] user: ziom ale ty sobie sam skonfigurowałeś ~/.codex/config.toml
-[09:15:47] assistant: Sprawdzam teraz lokalny kontrakt konfiguracji MCP dla Codexa.
+[09:14:00] assistant: Right, that is the crux: the MCP endpoint is live and reachable.
+[09:15:33] user: but you configured ~/.codex/config.toml yourself
+[09:15:47] assistant: Checking the local MCP configuration contract for Codex now.
 [09:15:55] reasoning: **Checking config contract**
-[09:16:06] assistant: Składnia configu wygląda już poprawnie według samego Codexa.
+[09:16:06] assistant: The config syntax already looks correct per Codex itself.
 "#;
 
         let docs = extract_markdown_transcript_documents(raw, Path::new("sample.md"))
