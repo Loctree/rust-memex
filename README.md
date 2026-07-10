@@ -126,12 +126,12 @@ async fn main() -> anyhow::Result<()> {
     // Store a document
     engine.store(
         "doc-1",
-        "Patient presented with lethargy and decreased appetite",
-        json!({"patient_id": "P-123", "visit_type": "checkup"})
+        "Onboarding notes: new users need a guided setup walkthrough",
+        json!({"source": "support", "topic": "onboarding"})
     ).await?;
 
     // Search semantically
-    let results = engine.search("lethargy symptoms", 10).await?;
+    let results = engine.search("user onboarding setup", 10).await?;
     for r in &results {
         println!("{}: {} (score: {:.2})", r.id, r.text, r.score);
     }
@@ -160,9 +160,9 @@ let engine = MemexEngine::for_app_optimized().await?;
 
 // Store notes
 engine.store(
-    "visit-456",
-    "SOAP note: Feline diabetes mellitus diagnosis...",
-    json!({"patient_id": "P-789", "doc_type": "soap_note"})
+    "note-456",
+    "Release notes: summary of shipped features and known issues...",
+    json!({"doc_type": "release_note", "version": "1.2.0"})
 ).await?;
 ```
 
