@@ -56,7 +56,7 @@ Example response:
   "status": "ok",
   "hint": "OK",
   "version": "0.5.1",
-  "db_path": "/Users/you/.rmcp-servers/rust-memex/lancedb",
+  "db_path": "/Users/tester/.rmcp-servers/rust-memex/lancedb",
   "embedding_provider": "ollama-local",
   "total_documents": 27455,
   "namespace_count": 2,
