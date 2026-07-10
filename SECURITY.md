@@ -13,7 +13,7 @@
 Please use GitHub Security Advisories for responsible disclosure:
 https://github.com/Loctree/rust-memex/security/advisories/new
 
-If GitHub Advisories are unavailable, email security@loct.io with a
+If GitHub Advisories are unavailable, email security@loctree.com with a
 summary, affected version, reproduction steps, and expected impact.
 
 Please do not report suspected vulnerabilities in public GitHub issues.
