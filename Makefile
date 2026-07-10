@@ -1,7 +1,7 @@
 # rust-memex Makefile
 # ============================================================================
 # Service management, build, and maintenance targets
-# Created by vetcoders (c)2026 Loctree
+# Created by Vetcoders (c)2026 Loctree
 # ============================================================================
 #
 # RAM DISK MODE (512GB host):

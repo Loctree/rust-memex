@@ -2,7 +2,7 @@
 # reindex-memories.sh
 # Reindex all memories after fixing timestamp preservation (P0)
 #
-# Created by vetcoders (c)2025
+# Created by Vetcoders (c)2025
 # Part of rust-memex P4 fix
 
 set -e
