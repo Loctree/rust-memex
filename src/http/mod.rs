@@ -2609,20 +2609,20 @@ mod tests {
 
     #[test]
     fn test_search_request_accepts_k_alias() {
-        let json = r#"{"query": "test", "k": 7, "deep": true, "project": "Vista"}"#;
+        let json = r#"{"query": "test", "k": 7, "deep": true, "project": "Demo"}"#;
         let req: SearchRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.limit, 7);
         assert!(req.deep);
-        assert_eq!(req.project.as_deref(), Some("Vista"));
+        assert_eq!(req.project.as_deref(), Some("Demo"));
     }
 
     #[test]
     fn test_sse_search_params_accept_k_alias() {
-        let json = r#"{"query":"test","k":9,"deep":true,"project":"Vista","mode":"bm25"}"#;
+        let json = r#"{"query":"test","k":9,"deep":true,"project":"Demo","mode":"bm25"}"#;
         let params: SseSearchParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.limit, 9);
         assert!(params.deep);
-        assert_eq!(params.project.as_deref(), Some("Vista"));
+        assert_eq!(params.project.as_deref(), Some("Demo"));
         assert_eq!(params.mode, "bm25");
     }
 

@@ -644,7 +644,7 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
 
     // Sort by frequency and take top N
     let mut words: Vec<_> = word_counts.into_iter().collect();
-    words.sort_by(|a, b| b.1.cmp(&a.1));
+    words.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     words
         .into_iter()
@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn keyword_extraction_splits_paths_and_filters_session_tokens() {
         let keywords = extract_keywords(
-            "/Users/silver/Git/tools/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            "/Users/tester/projects/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
             10,
         );
 
@@ -3802,24 +3802,24 @@ mod tests {
 
     #[test]
     fn search_options_can_carry_project_filter() {
-        let options = SearchOptions::deep().with_project(Some("Vista".to_string()));
+        let options = SearchOptions::deep().with_project(Some("Demo".to_string()));
         assert_eq!(options.layer_filter, None);
-        assert_eq!(options.project_filter.as_deref(), Some("Vista"));
+        assert_eq!(options.project_filter.as_deref(), Some("Demo"));
     }
 
     #[test]
     fn project_match_uses_metadata_fields() {
         assert!(metadata_matches_project(
-            &json!({"project": "Vista"}),
-            "vista"
+            &json!({"project": "Demo"}),
+            "demo"
         ));
         assert!(metadata_matches_project(
             &json!({"project_id": "Loctree"}),
-            "vetcoders"
+            "loctree"
         ));
         assert!(!metadata_matches_project(
             &json!({"project": "rust-memex"}),
-            "vista"
+            "demo"
         ));
         assert_eq!(
             SearchOptions::default().layer_filter,
@@ -3833,14 +3833,14 @@ mod tests {
 
 [signals]
 Results:
-- AICX lookup działa
+- Config lookup succeeded
 [/signals]
 
-[09:14:00] assistant: Tak, i to właśnie jest sedno: `aicx-dragon` to żywy endpoint MCP.
-[09:15:33] user: ziom ale ty sobie sam skonfigurowałeś ~/.codex/config.toml
-[09:15:47] assistant: Sprawdzam teraz lokalny kontrakt konfiguracji MCP dla Codexa.
+[09:14:00] assistant: Right, that is the crux: the MCP endpoint is live and reachable.
+[09:15:33] user: but you configured ~/.codex/config.toml yourself
+[09:15:47] assistant: Checking the local MCP configuration contract for Codex now.
 [09:15:55] reasoning: **Checking config contract**
-[09:16:06] assistant: Składnia configu wygląda już poprawnie według samego Codexa.
+[09:16:06] assistant: The config syntax already looks correct per Codex itself.
 "#;
 
         let docs = extract_markdown_transcript_documents(raw, Path::new("sample.md"))

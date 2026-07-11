@@ -17,8 +17,8 @@
 //! priority = 1
 //!
 //! [[embeddings.providers]]
-//! name = "dragon"
-//! base_url = "http://dragon:12345"
+//! name = "embedder"
+//! base_url = "http://localhost:12345"
 //! model = "Qwen/Qwen3-Embedding-4B"
 //! priority = 2
 //! ```
@@ -174,8 +174,8 @@ impl Default for EmbeddingConfig {
                     endpoint: default_embeddings_endpoint(),
                 },
                 ProviderConfig {
-                    name: "dragon".to_string(),
-                    base_url: "http://dragon:12345".to_string(),
+                    name: "embedder".to_string(),
+                    base_url: "http://localhost:12345".to_string(),
                     model: "Qwen/Qwen3-Embedding-4B".to_string(),
                     priority: 2,
                     endpoint: default_embeddings_endpoint(),
@@ -218,8 +218,8 @@ impl EmbeddingConfig {
 pub struct MlxConfig {
     pub disabled: bool,
     pub local_port: u16,
-    pub dragon_url: String,
-    pub dragon_port: u16,
+    pub embedder_url: String,
+    pub embedder_port: u16,
     pub embedder_model: String,
     pub reranker_model: String,
     pub reranker_port_offset: u16,
@@ -232,8 +232,8 @@ pub struct MlxConfig {
 pub struct MlxMergeOptions {
     pub disabled: Option<bool>,
     pub local_port: Option<u16>,
-    pub dragon_url: Option<String>,
-    pub dragon_port: Option<u16>,
+    pub embedder_url: Option<String>,
+    pub embedder_port: Option<u16>,
     pub embedder_model: Option<String>,
     pub reranker_model: Option<String>,
     pub reranker_port_offset: Option<u16>,
@@ -244,8 +244,8 @@ impl Default for MlxConfig {
         Self {
             disabled: false,
             local_port: 12345,
-            dragon_url: "http://dragon".to_string(),
-            dragon_port: 12345,
+            embedder_url: "http://localhost".to_string(),
+            embedder_port: 12345,
             embedder_model: "Qwen/Qwen3-Embedding-4B".to_string(),
             reranker_model: "Qwen/Qwen3-Reranker-4B".to_string(),
             reranker_port_offset: 1,
@@ -255,23 +255,41 @@ impl Default for MlxConfig {
     }
 }
 
+/// Prefer the value read from the current env key, falling back to the value
+/// read from the pre-rename legacy key. Kept as a pure function so the
+/// precedence contract is unit-testable without mutating process environment.
+fn resolve_legacy_env(current: Option<String>, legacy: Option<String>) -> Option<String> {
+    current.or(legacy)
+}
+
 impl MlxConfig {
     /// Create config from environment variables (legacy support)
     pub fn from_env() -> Self {
+        // Read the neutral env var, falling back to its pre-rename `DRAGON_*`
+        // name (see commit 2c50593) so env-driven deployments keep pointing at
+        // the same remote embedder host after upgrade instead of silently
+        // dropping to the localhost default.
+        let env_or_legacy = |new_key: &str, legacy_key: &str| -> Option<String> {
+            resolve_legacy_env(std::env::var(new_key).ok(), std::env::var(legacy_key).ok())
+        };
+
         let disabled = std::env::var("DISABLE_MLX")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        // local_port drives only the localhost provider (http://localhost:{port}),
+        // so it must NOT inherit the legacy DRAGON_EMBEDDER_PORT, which was the
+        // remote host's port. The DRAGON_* fallbacks apply only to the remote
+        // `embedder` provider below.
         let local_port = std::env::var("EMBEDDER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(12345);
 
-        let dragon_url =
-            std::env::var("DRAGON_BASE_URL").unwrap_or_else(|_| "http://dragon".to_string());
+        let embedder_url = env_or_legacy("EMBEDDER_BASE_URL", "DRAGON_BASE_URL")
+            .unwrap_or_else(|| "http://localhost".to_string());
 
-        let dragon_port = std::env::var("DRAGON_EMBEDDER_PORT")
-            .ok()
+        let embedder_port = env_or_legacy("EMBEDDER_PORT", "DRAGON_EMBEDDER_PORT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(local_port);
 
@@ -300,8 +318,8 @@ impl MlxConfig {
         Self {
             disabled,
             local_port,
-            dragon_url,
-            dragon_port,
+            embedder_url,
+            embedder_port,
             embedder_model,
             reranker_model,
             reranker_port_offset,
@@ -318,11 +336,11 @@ impl MlxConfig {
         if let Some(v) = opts.local_port {
             self.local_port = v;
         }
-        if let Some(v) = opts.dragon_url {
-            self.dragon_url = v;
+        if let Some(v) = opts.embedder_url {
+            self.embedder_url = v;
         }
-        if let Some(v) = opts.dragon_port {
-            self.dragon_port = v;
+        if let Some(v) = opts.embedder_port {
+            self.embedder_port = v;
         }
         if let Some(v) = opts.embedder_model {
             self.embedder_model = v;
@@ -353,15 +371,15 @@ impl MlxConfig {
                     endpoint: default_embeddings_endpoint(),
                 },
                 ProviderConfig {
-                    name: "dragon".to_string(),
-                    base_url: format!("{}:{}", self.dragon_url, self.dragon_port),
+                    name: "embedder".to_string(),
+                    base_url: format!("{}:{}", self.embedder_url, self.embedder_port),
                     model: self.embedder_model.clone(),
                     priority: 2,
                     endpoint: default_embeddings_endpoint(),
                 },
             ],
             reranker: RerankerConfig {
-                base_url: Some(format!("{}:{}", self.dragon_url, reranker_port)),
+                base_url: Some(format!("{}:{}", self.embedder_url, reranker_port)),
                 model: Some(self.reranker_model.clone()),
                 endpoint: default_rerank_endpoint(),
             },
@@ -1317,6 +1335,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_env_fallback_precedence() {
+        // Current key wins when both are set.
+        assert_eq!(
+            resolve_legacy_env(Some("new".into()), Some("old".into())).as_deref(),
+            Some("new")
+        );
+        // Falls back to the pre-rename DRAGON_* value when the new key is unset,
+        // so env-driven upgrades keep the configured remote host.
+        assert_eq!(
+            resolve_legacy_env(None, Some("old".into())).as_deref(),
+            Some("old")
+        );
+        // Neither set -> None (caller applies its default).
+        assert_eq!(resolve_legacy_env(None, None), None);
+    }
+
+    #[test]
     fn test_provider_sorting() {
         let mut providers = [
             ProviderConfig {
@@ -1344,8 +1379,8 @@ mod tests {
         let legacy = MlxConfig {
             disabled: false,
             local_port: 12345,
-            dragon_url: "http://dragon".into(),
-            dragon_port: 12345,
+            embedder_url: "http://localhost".into(),
+            embedder_port: 12345,
             embedder_model: "test-model".into(),
             reranker_model: "rerank-model".into(),
             reranker_port_offset: 1,

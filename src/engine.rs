@@ -398,7 +398,7 @@ impl LayerStats {
 
         // Sort by frequency and take top 10
         let mut keywords: Vec<_> = keyword_counts.into_iter().collect();
-        keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_keywords = keywords.into_iter().take(10).map(|(k, _)| k).collect();
 
         Self {
@@ -506,34 +506,35 @@ impl MemexEngine {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let engine = MemexEngine::for_app("vista", "patient-notes").await?;
+    /// let engine = MemexEngine::for_app("myapp", "notes").await?;
     /// ```
     pub async fn for_app(app_name: &str, namespace: &str) -> Result<Self> {
         let config = MemexConfig::new(app_name, namespace);
         Self::new(config).await
     }
 
-    /// Vista-optimized setup with 1024-dimension embeddings.
+    /// Optimized setup with 1024-dimension embeddings.
     ///
     /// Uses smaller embedding model (qwen3-embedding:0.6b) for faster inference.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let engine = MemexEngine::for_vista().await?;
+    /// let engine = MemexEngine::for_app_optimized().await?;
     /// ```
-    pub async fn for_vista() -> Result<Self> {
+    pub async fn for_app_optimized() -> Result<Self> {
         use crate::embeddings::ProviderConfig;
 
         let config = MemexConfig {
-            app_name: "vista".to_string(),
+            app_name: "app".to_string(),
             namespace: "default".to_string(),
-            db_path: Some("~/.rmcp-servers/vista/lancedb".to_string()),
+            // Defaults to ~/.rmcp-servers/app/lancedb via effective_db_path().
+            db_path: None,
             dimension: 1024,
             embedding_config: EmbeddingConfig {
                 required_dimension: 1024,
                 providers: vec![ProviderConfig {
-                    name: "ollama-vista".to_string(),
+                    name: "ollama-optimized".to_string(),
                     base_url: "http://localhost:11434".to_string(),
                     model: "qwen3-embedding:0.6b".to_string(),
                     priority: 1,
@@ -543,7 +544,7 @@ impl MemexEngine {
             },
             enable_bm25: false,
             bm25_config: None,
-            enable_hybrid: true, // Hybrid enabled for Vista
+            enable_hybrid: true, // Hybrid enabled for the optimized profile
             hybrid_config: None,
         };
         Self::new(config).await
@@ -676,7 +677,7 @@ impl MemexEngine {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let results = engine.search_hybrid("when did we buy dragon", 10).await?;
+    /// let results = engine.search_hybrid("when did we buy laptop", 10).await?;
     /// for r in results {
     ///     println!("{}: combined={:.3}, vector={:?}, bm25={:?}",
     ///         r.id, r.combined_score, r.vector_score, r.bm25_score);
@@ -721,7 +722,7 @@ impl MemexEngine {
     /// use rust_memex::SearchMode;
     ///
     /// // Keyword-only for exact matches
-    /// let results = engine.search_with_mode("dragon", 10, SearchMode::Keyword).await?;
+    /// let results = engine.search_with_mode("laptop", 10, SearchMode::Keyword).await?;
     /// ```
     pub async fn search_with_mode(
         &self,
@@ -853,7 +854,7 @@ impl MemexEngine {
         let mut docs = Vec::with_capacity(items.len());
         let mut bm25_docs = Vec::new();
 
-        for (item, embedding) in items.iter().zip(embeddings.into_iter()) {
+        for (item, embedding) in items.iter().zip(embeddings) {
             let doc = ChromaDocument::new_flat(
                 item.id.clone(),
                 self.namespace.clone(),
@@ -1139,12 +1140,12 @@ mod tests {
 
     #[test]
     fn test_memex_config_builder() {
-        let config = MemexConfig::new("vista", "patients")
+        let config = MemexConfig::new("demo", "records")
             .with_dimension(1024)
             .with_db_path("/custom/path/db");
 
-        assert_eq!(config.app_name, "vista");
-        assert_eq!(config.namespace, "patients");
+        assert_eq!(config.app_name, "demo");
+        assert_eq!(config.namespace, "records");
         assert_eq!(config.dimension, 1024);
         assert_eq!(config.embedding_config.required_dimension, 1024);
         assert_eq!(config.effective_db_path(), "/custom/path/db");

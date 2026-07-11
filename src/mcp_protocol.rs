@@ -1164,10 +1164,10 @@ mod tests {
     #[test]
     fn requested_search_options_captures_project_filter() {
         assert_eq!(
-            requested_search_options(&json!({"project": "Vista"})),
+            requested_search_options(&json!({"project": "Demo"})),
             SearchOptions {
                 layer_filter: Some(SliceLayer::Outer),
-                project_filter: Some("Vista".to_string()),
+                project_filter: Some("Demo".to_string()),
             }
         );
     }

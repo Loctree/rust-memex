@@ -106,10 +106,10 @@ As an MCP (Model Context Protocol) server, `rust-memex` provides:
 
 ```toml
 # Full library with CLI
-rust-memex = "0.5"
+rust-memex = "0.6"
 
 # Library only (no CLI dependencies)
-rust-memex = { version = "0.5", default-features = false }
+rust-memex = { version = "0.6", default-features = false }
 ```
 
 ### Basic Usage
@@ -126,12 +126,12 @@ async fn main() -> anyhow::Result<()> {
     // Store a document
     engine.store(
         "doc-1",
-        "Patient presented with lethargy and decreased appetite",
-        json!({"patient_id": "P-123", "visit_type": "checkup"})
+        "Onboarding notes: new users need a guided setup walkthrough",
+        json!({"source": "support", "topic": "onboarding"})
     ).await?;
 
     // Search semantically
-    let results = engine.search("lethargy symptoms", 10).await?;
+    let results = engine.search("user onboarding setup", 10).await?;
     for r in &results {
         println!("{}: {} (score: {:.2})", r.id, r.text, r.score);
     }
@@ -148,21 +148,21 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### Vista Integration
+### Optimized Profile
 
-For Vista PIMS, use the optimized constructor:
+For a smaller-footprint setup, use the optimized constructor:
 
 ```rust
 use rust_memex::MemexEngine;
 
-// Vista-optimized: 1024 dims, qwen3-embedding:0.6b model
-let engine = MemexEngine::for_vista().await?;
+// Optimized: 1024 dims, qwen3-embedding:0.6b model
+let engine = MemexEngine::for_app_optimized().await?;
 
-// Store visit notes
+// Store notes
 engine.store(
-    "visit-456",
-    "SOAP note: Feline diabetes mellitus diagnosis...",
-    json!({"patient_id": "P-789", "doc_type": "soap_note"})
+    "note-456",
+    "Release notes: summary of shipped features and known issues...",
+    json!({"doc_type": "release_note", "version": "1.2.0"})
 ).await?;
 ```
 
@@ -205,7 +205,7 @@ use rust_memex::{MemexEngine, SearchMode};
 let engine = MemexEngine::for_app("my-app", "documents").await?;
 
 // Hybrid search with BM25 + vector fusion (recommended)
-let results = engine.search_hybrid("dragon mac studio", 10).await?;
+let results = engine.search_hybrid("fast mac studio", 10).await?;
 for r in &results {
     println!("{}: {} (combined: {:.2}, vector: {:.2}, bm25: {:.2})",
         r.id, r.document, r.combined_score, r.vector_score, r.bm25_score);
@@ -309,9 +309,8 @@ MEMEX_BM25_PATH=~/.rmcp-servers/myapp/bm25
 # ADVANCED: Multiple providers (fallback cascade)
 # =============================================================================
 
-# Remote embedding server fallback
-# DRAGON_BASE_URL=http://your-server.local
-# DRAGON_EMBEDDER_PORT=12345
+# Remote embedding server fallback (uses EMBEDDER_PORT below)
+# EMBEDDER_BASE_URL=http://your-server.local
 
 # MLX embedder for Apple Silicon
 # EMBEDDER_PORT=12300
@@ -613,15 +612,15 @@ curl -X POST http://localhost:8997/upsert \
 # Search
 curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
+  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Demo", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
+curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Demo&layer=1"
 ```
 
 ### Multi-Host Database Paths
 
-For setups with multiple machines (e.g., dragon, mgbook16), use per-host database paths:
+For setups with multiple machines (e.g., laptop, workstation), use per-host database paths:
 
 ```bash
 # Per-host paths (each machine gets own database)
@@ -633,7 +632,7 @@ rust-memex wizard
 
 The TUI wizard auto-detects hostname and offers:
 - **Shared mode**: `~/.ai-memories/lancedb` (same path everywhere)
-- **Per-host mode**: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
+- **Per-host mode**: `~/.ai-memories/lancedb.host-a`, `~/.ai-memories/lancedb.host-b`, etc.
 
 ### Configuration (TOML)
 
@@ -685,7 +684,7 @@ Intelligent query intent detection for automatic search mode selection:
 
 ```bash
 # Auto-detect query intent and select optimal mode
-rust-memex search -n memories -q "when did we buy dragon" --auto-route
+rust-memex search -n memories -q "when did we buy the laptop" --auto-route
 # Output: Query intent: temporal (confidence: 0.70)
 #         Selects: hybrid mode with date boosting
 
@@ -695,7 +694,7 @@ rust-memex search -n code -q "who imports main.rs" --auto-route
 #         Consider: loctree query --kind who-imports --target main.rs
 
 # Deep exploration with all onion layers
-rust-memex dive -n memories -q "dragon" --verbose
+rust-memex dive -n memories -q "laptop" --verbose
 ```
 
 **Intent Types:**
@@ -817,5 +816,4 @@ Add to `~/.claude.json`:
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders

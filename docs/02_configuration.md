@@ -1,49 +1,49 @@
 # Configuration Guide
 
-## Przegląd
+## Overview
 
-rust-memex można skonfigurować na trzy sposoby (w kolejności priorytetu):
-1. **Flagi CLI** - najwyższy priorytet
-2. **Plik konfiguracyjny TOML** - średni priorytet
-3. **Wartości domyślne** - najniższy priorytet
+rust-memex can be configured in three ways (in priority order):
+1. **CLI flags** - highest priority
+2. **TOML configuration file** - medium priority
+3. **Default values** - lowest priority
 
-## Opcje CLI
+## CLI Options
 
 ```bash
 rust-memex [OPTIONS] [COMMAND]
 ```
 
-### Komendy
+### Commands
 
-| Komenda | Opis |
+| Command | Description |
 |---------|------|
-| `serve` | Uruchom serwer MCP (domyślna) |
-| `wizard` | Interaktywny kreator konfiguracji |
-| `index` | Batch indexing dokumentów |
+| `serve` | Start the MCP server (default) |
+| `wizard` | Interactive configuration wizard |
+| `index` | Batch indexing of documents |
 
-### Globalne Opcje
+### Global Options
 
-| Flaga | Opis | Domyślnie |
+| Flag | Description | Default |
 |-------|------|-----------|
-| `--config <PATH>` | Ścieżka do pliku konfiguracyjnego TOML | brak |
-| `--cache-mb <SIZE>` | Rozmiar cache w MB | `4096` |
-| `--db-path <PATH>` | Ścieżka do LanceDB | `~/.rmcp-servers/rust-memex/lancedb` |
-| `--max-request-bytes <SIZE>` | Max rozmiar requestu | `5242880` (5MB) |
-| `--log-level <LEVEL>` | Poziom logowania | `info` |
-| `--allowed-paths <PATH>` | Dozwolone ścieżki (można powtórzyć) | `$HOME`, `cwd` |
-| `--security-enabled` | Włącz namespace security | `false` |
-| `--token-store-path <PATH>` | Ścieżka do token store | `~/.rmcp-servers/rust-memex/tokens.json` |
+| `--config <PATH>` | Path to the TOML configuration file | none |
+| `--cache-mb <SIZE>` | Cache size in MB | `4096` |
+| `--db-path <PATH>` | Path to LanceDB | `~/.rmcp-servers/rust-memex/lancedb` |
+| `--max-request-bytes <SIZE>` | Max request size | `5242880` (5MB) |
+| `--log-level <LEVEL>` | Log level | `info` |
+| `--allowed-paths <PATH>` | Allowed paths (can be repeated) | `$HOME`, `cwd` |
+| `--security-enabled` | Enable namespace security | `false` |
+| `--token-store-path <PATH>` | Path to the token store | `~/.rmcp-servers/rust-memex/tokens.json` |
 
-### Przykłady CLI
+### CLI Examples
 
 ```bash
-# Podstawowe uruchomienie
+# Basic run
 rust-memex serve
 
-# Z własną konfiguracją
+# With a custom configuration
 rust-memex serve --config ~/.rmcp-servers/rust-memex/config.toml
 
-# Z security i custom paths
+# With security and custom paths
 rust-memex serve \
   --security-enabled \
   --allowed-paths ~ \
@@ -54,71 +54,72 @@ rust-memex serve \
 rust-memex index ./documents --namespace docs --recursive --glob "*.md"
 ```
 
-## Plik Konfiguracyjny (TOML)
+## Configuration File (TOML)
 
-### Lokalizacja
+### Location
 
-Domyślna lokalizacja: `~/.rmcp-servers/rust-memex/config.toml`
+Default location: `~/.rmcp-servers/rust-memex/config.toml`
 
-### Pełny Przykład
+### Full Example
 
 ```toml
-# Rozmiar cache w MB
+# Cache size in MB
 cache_mb = 4096
 
-# Ścieżka do LanceDB vector store
+# Path to the LanceDB vector store
 db_path = "~/.rmcp-servers/rust-memex/lancedb"
 
-# Maksymalny rozmiar requestu JSON-RPC (bytes)
+# Maximum JSON-RPC request size (bytes)
 max_request_bytes = 5242880
 
-# Poziom logowania: trace, debug, info, warn, error
+# Log level: trace, debug, info, warn, error
 log_level = "info"
 
-# Whitelist dozwolonych ścieżek dla operacji na plikach
-# Jeśli puste, domyślnie $HOME i current working directory
+# Whitelist of allowed paths for file operations
+# If empty, defaults to $HOME and the current working directory
 allowed_paths = [
     "~",
-    "/Volumes/LibraxisShare/Klaudiusz",
+    "/Volumes/Shared/notes",
     "/opt/shared/documents"
 ]
 
-# Włącz namespace token-based access control
+# Enable namespace token-based access control
 security_enabled = true
 
-# Ścieżka do pliku z tokenami namespace'ów
+# Path to the namespace tokens file
 token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 ```
 
-### Minimalna Konfiguracja
+### Minimal Configuration
 
 ```toml
-# Tylko niezbędne ustawienia
+# Only the essential settings
 db_path = "~/.rmcp-servers/rust-memex/lancedb"
 security_enabled = true
 ```
 
-## Tryby Serwera
+## Server Modes
 
-`rust-memex` udostępnia jeden kanoniczny MCP surface. Nie ma już osobnego
-przełącznika `memory/full`, bo nie zmieniał on realnie kontraktu serwera.
+`rust-memex` exposes a single canonical MCP surface. There is no longer a
+separate `memory/full` switch, because it did not actually change the
+server contract.
 
-Jeśli chcesz zawęzić runtime:
-- użyj `allowed_paths`, aby ograniczyć dostęp do filesystem
-- ustaw `--security-enabled`, aby chronić namespace'y tokenami
-- ustaw `--auth-token`, jeśli wystawiasz mutujące endpointy HTTP
+If you want to narrow the runtime:
+- use `allowed_paths` to restrict filesystem access
+- set `--security-enabled` to protect namespaces with tokens
+- set `--auth-token` if you expose mutating HTTP endpoints
 
-## Zmienne Środowiskowe
+## Environment Variables
 
-| Zmienna | Opis |
+| Variable | Description |
 |---------|------|
-| `HOME` / `USERPROFILE` | Home directory (dla ~ expansion) |
-| `LANCEDB_PATH` | Override ścieżki LanceDB |
-| `SLED_PATH` | Override ścieżki sled K/V store |
-| `FASTEMBED_CACHE_PATH` | Cache dla modeli FastEmbed |
-| `HF_HUB_CACHE` | Cache dla modeli HuggingFace |
+| `HOME` / `USERPROFILE` | Home directory (for ~ expansion) |
+| `LANCEDB_PATH` | Override the LanceDB path |
+| `SLED_PATH` | Override the sled K/V store path |
+| `FASTEMBED_CACHE_PATH` | Cache for FastEmbed models |
+| `HF_HUB_CACHE` | Cache for HuggingFace models |
 
-## Konfiguracja dla Claude/MCP
+## Configuration for Claude/MCP
 
 ### ~/.claude.json
 
@@ -133,7 +134,7 @@ Jeśli chcesz zawęzić runtime:
 }
 ```
 
-### Z security enabled
+### With security enabled
 
 ```json
 {
@@ -153,88 +154,88 @@ Jeśli chcesz zawęzić runtime:
 
 ## Batch Indexing
 
-Komenda `index` pozwala na masowe indeksowanie dokumentów.
+The `index` command allows bulk indexing of documents.
 
-### Składnia
+### Syntax
 
 ```bash
 rust-memex index <PATH> [OPTIONS]
 ```
 
-### Opcje
+### Options
 
-| Flaga | Opis |
+| Flag | Description |
 |-------|------|
-| `-n, --namespace <NAME>` | Namespace dla dokumentów (domyślnie: `rag`) |
-| `-r, --recursive` | Rekursywnie przeglądaj podkatalogi |
-| `-g, --glob <PATTERN>` | Filtruj pliki wzorcem glob |
-| `--max-depth <N>` | Maksymalna głębokość (0 = bez limitu) |
+| `-n, --namespace <NAME>` | Namespace for the documents (default: `rag`) |
+| `-r, --recursive` | Traverse subdirectories recursively |
+| `-g, --glob <PATTERN>` | Filter files by a glob pattern |
+| `--max-depth <N>` | Maximum depth (0 = no limit) |
 
-### Przykłady
+### Examples
 
 ```bash
-# Indeksuj pojedynczy plik
+# Index a single file
 rust-memex index ./README.md
 
-# Indeksuj folder rekursywnie
+# Index a folder recursively
 rust-memex index ./docs --recursive --namespace documentation
 
-# Tylko pliki markdown
+# Only markdown files
 rust-memex index ./notes --recursive --glob "*.md" --namespace notes
 
-# Z limitem głębokości
+# With a depth limit
 rust-memex index ./project --recursive --max-depth 3
 ```
 
-## Wizard (Kreator Konfiguracji)
+## Wizard (Configuration Wizard)
 
-Interaktywny kreator do generowania konfiguracji.
+An interactive wizard for generating a configuration.
 
 ```bash
 rust-memex wizard
 
-# Dry run - pokaż zmiany bez zapisywania
+# Dry run - show changes without saving
 rust-memex wizard --dry-run
 ```
 
-Wizard pomoże skonfigurować:
-- Ścieżkę do LanceDB
-- Dozwolone ścieżki
+The wizard helps you configure:
+- The LanceDB path
+- Allowed paths
 - Security settings
-- Integrację z Claude
+- Claude integration
 
-## Priorytet Konfiguracji
+## Configuration Priority
 
-Gdy ta sama opcja jest ustawiona w wielu miejscach:
+When the same option is set in multiple places:
 
 ```
 CLI flag > Config file > Default value
 ```
 
-Przykład:
+Example:
 ```bash
 # Config file: log_level = "info"
 # CLI: --log-level debug
-# Wynik: debug (CLI wygrywa)
+# Result: debug (CLI wins)
 rust-memex serve --config ~/.rmcp-servers/rust-memex/config.toml --log-level debug
 ```
 
-## Walidacja Konfiguracji
+## Configuration Validation
 
-Serwer waliduje konfigurację przy starcie:
+The server validates the configuration at startup:
 
-1. **Ścieżki** - sprawdza czy istnieją i są dostępne
-2. **Allowed paths** - rozwiązuje ~ i sprawdza uprawnienia
-3. **Token store** - tworzy plik jeśli nie istnieje (gdy security enabled)
-4. **LanceDB** - inicjalizuje bazę jeśli nie istnieje
+1. **Paths** - checks that they exist and are accessible
+2. **Allowed paths** - resolves ~ and checks permissions
+3. **Token store** - creates the file if it does not exist (when security enabled)
+4. **LanceDB** - initializes the database if it does not exist
 
-Błędy konfiguracji są raportowane przy starcie z jasnym komunikatem.
+Configuration errors are reported at startup with a clear message.
 
 ## Troubleshooting
 
 ### "Access denied: path outside allowed directories"
 
-Dodaj ścieżkę do `allowed_paths`:
+Add the path to `allowed_paths`:
 ```toml
 allowed_paths = [
     "~",
@@ -244,19 +245,20 @@ allowed_paths = [
 
 ### "Cannot resolve config path"
 
-Sprawdź czy plik konfiguracyjny istnieje:
+Check that the configuration file exists:
 ```bash
 ls -la ~/.rmcp-servers/rust-memex/config.toml
 ```
 
 ### "Token store not found"
 
-Przy pierwszym uruchomieniu z `--security-enabled`, token store jest tworzony automatycznie. Upewnij się że katalog nadrzędny istnieje:
+On the first run with `--security-enabled`, the token store is created
+automatically. Make sure the parent directory exists:
 ```bash
 mkdir -p ~/.rmcp-servers/rust-memex
 ```
 
-### Logi debugowania
+### Debug logs
 
 ```bash
 rust-memex serve --log-level trace
@@ -264,5 +266,4 @@ rust-memex serve --log-level trace
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders

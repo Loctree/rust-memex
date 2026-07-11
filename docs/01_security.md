@@ -2,39 +2,45 @@
 
 ## Problem
 
-W środowisku multi-agent, gdzie wiele AI agentów może korzystać z tego samego serwera rust-memex, potrzebna jest izolacja danych między agentami. Bez mechanizmu kontroli dostępu:
-- Agent A może odczytać dane Agenta B
-- Brak możliwości ochrony wrażliwych namespace'ów
-- Trudność w audycie dostępu do danych
+In a multi-agent environment, where many AI agents may use the same
+rust-memex server, data isolation between agents is required. Without an
+access-control mechanism:
+- Agent A can read Agent B's data
+- There is no way to protect sensitive namespaces
+- Auditing data access is difficult
 
-Dodatkowo, ograniczenie dostępu do plików tylko do `$HOME` i `cwd` było zbyt restrykcyjne - blokowało legitymowe użycie zewnętrznych wolumenów (np. `/Volumes/ExternalDrive`).
+In addition, restricting file access to only `$HOME` and `cwd` was too
+restrictive - it blocked legitimate use of external volumes (e.g.
+`/Volumes/ExternalDrive`).
 
-## Rozwiązanie
+## Solution
 
-Zaimplementowano dwupoziomowy system bezpieczeństwa:
+A two-level security system was implemented:
 
-### 1. Konfigurowalna Whitelist Ścieżek
+### 1. Configurable Path Whitelist
 
-Zamiast hardcoded ograniczenia do `$HOME` i `cwd`, wprowadzono konfigurowalną listę dozwolonych ścieżek.
+Instead of a hardcoded restriction to `$HOME` and `cwd`, a configurable
+list of allowed paths was introduced.
 
 ```toml
 # ~/.rmcp-servers/rust-memex/config.toml
 allowed_paths = [
     "~",                              # Home directory
-    "/Volumes/LibraxisShare/data",    # External volume
+    "/Volumes/ExternalDrive/data",    # External volume
     "/opt/shared/documents"           # Shared directory
 ]
 ```
 
-**Zachowanie:**
-- Jeśli `allowed_paths` jest puste → domyślnie `$HOME` + `cwd` (backward compatible)
-- Jeśli `allowed_paths` jest ustawione → tylko te ścieżki są dozwolone
-- Wspiera `~` expansion do home directory
-- Walidacja przez canonicalization (rozwiązuje symlinki)
+**Behavior:**
+- If `allowed_paths` is empty → defaults to `$HOME` + `cwd` (backward compatible)
+- If `allowed_paths` is set → only those paths are allowed
+- Supports `~` expansion to the home directory
+- Validation via canonicalization (resolves symlinks)
 
 ### 2. Namespace Access Tokens
 
-Token-based access control dla namespace'ów. Chronione namespace'y wymagają tokena do odczytu/zapisu.
+Token-based access control for namespaces. Protected namespaces require a
+token for read/write.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -43,7 +49,7 @@ Token-based access control dla namespace'ów. Chronione namespace'y wymagają to
 │                                                              │
 │  Public Namespace          Protected Namespace               │
 │  ┌─────────────┐          ┌─────────────────────┐           │
-│  │  "default"  │          │    "pamietnik"      │           │
+│  │  "default"  │          │    "diary"          │           │
 │  │             │          │                     │           │
 │  │  No token   │          │  Token: rmx_7f3a9b  │           │
 │  │  required   │          │  required           │           │
@@ -55,20 +61,20 @@ Token-based access control dla namespace'ów. Chronione namespace'y wymagają to
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Użycie
+## Usage
 
-### Włączenie Security
+### Enabling Security
 
 ```bash
 # CLI
 rust-memex serve --security-enabled
 
-# Lub w config.toml
+# Or in config.toml
 security_enabled = true
 token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 ```
 
-### Tworzenie Tokena dla Namespace
+### Creating a Token for a Namespace
 
 ```json
 // MCP Request
@@ -77,7 +83,7 @@ token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
   "params": {
     "name": "namespace_create_token",
     "arguments": {
-      "namespace": "pamietnik",
+      "namespace": "diary",
       "description": "Personal diary namespace"
     }
   }
@@ -87,37 +93,38 @@ token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 {
   "content": [{
     "type": "text",
-    "text": "Token created for namespace 'pamietnik': rmx_a1b2c3d4e5f6..."
+    "text": "Token created for namespace 'diary': rmx_a1b2c3d4e5f6..."
   }]
 }
 ```
 
-**WAŻNE:** Token jest zwracany tylko raz przy tworzeniu. Zapisz go w bezpiecznym miejscu!
+**IMPORTANT:** The token is returned only once, at creation time. Store it
+in a safe place!
 
-### Dostęp do Chronionego Namespace
+### Accessing a Protected Namespace
 
 ```json
-// Bez tokena - BŁĄD
+// Without a token - ERROR
 {
   "method": "tools/call",
   "params": {
     "name": "memory_search",
     "arguments": {
-      "namespace": "pamietnik",
-      "query": "moje wspomnienia"
+      "namespace": "diary",
+      "query": "my memories"
     }
   }
 }
-// Error: "Access denied: namespace 'pamietnik' requires a valid token"
+// Error: "Access denied: namespace 'diary' requires a valid token"
 
-// Z tokenem - OK
+// With a token - OK
 {
   "method": "tools/call",
   "params": {
     "name": "memory_search",
     "arguments": {
-      "namespace": "pamietnik",
-      "query": "moje wspomnienia",
+      "namespace": "diary",
+      "query": "my memories",
       "token": "rmx_a1b2c3d4e5f6..."
     }
   }
@@ -125,7 +132,7 @@ token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
 // Success: returns search results
 ```
 
-### Odwołanie Tokena
+### Revoking a Token
 
 ```json
 {
@@ -133,15 +140,15 @@ token_store_path = "~/.rmcp-servers/rust-memex/tokens.json"
   "params": {
     "name": "namespace_revoke_token",
     "arguments": {
-      "namespace": "pamietnik"
+      "namespace": "diary"
     }
   }
 }
 ```
 
-Po odwołaniu tokena, namespace staje się ponownie publiczny.
+After a token is revoked, the namespace becomes public again.
 
-### Lista Chronionych Namespace'ów
+### Listing Protected Namespaces
 
 ```json
 {
@@ -156,12 +163,12 @@ Po odwołaniu tokena, namespace staje się ponownie publiczny.
 {
   "content": [{
     "type": "text",
-    "text": "[\"pamietnik\", \"projekty\", \"finanse\"]"
+    "text": "[\"diary\", \"projects\", \"finance\"]"
   }]
 }
 ```
 
-### Status Security
+### Security Status
 
 ```json
 {
@@ -189,32 +196,32 @@ Po odwołaniu tokena, namespace staje się ponownie publiczny.
 }
 ```
 
-## Format Tokena
+## Token Format
 
-Tokeny mają format: `rmx_<32 znaki hex>`
+Tokens have the format: `rmx_<32 hex chars>`
 
 ```
 rmx_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
 │   └─────────────────────────────────┘
-│              32 znaki hex (128 bit)
+│              32 hex chars (128 bit)
 └── prefix "rmx_" (rust-memex)
 ```
 
-Tokeny są generowane kryptograficznie bezpiecznie (`rand::thread_rng()`).
+Tokens are generated cryptographically securely (`rand::thread_rng()`).
 
 ## Token Store
 
-Tokeny są przechowywane w pliku JSON:
+Tokens are stored in a JSON file:
 
 ```json
 // ~/.rmcp-servers/rust-memex/tokens.json
 {
-  "pamietnik": {
+  "diary": {
     "token_hash": "5e884898da28047d...",
     "created_at": "2024-12-22T10:30:00Z",
     "description": "Personal diary namespace"
   },
-  "projekty": {
+  "projects": {
     "token_hash": "d033e22ae348aeb5...",
     "created_at": "2024-12-22T11:00:00Z",
     "description": null
@@ -222,66 +229,66 @@ Tokeny są przechowywane w pliku JSON:
 }
 ```
 
-**Bezpieczeństwo:**
-- Przechowywany jest tylko **hash** tokena (SHA-256), nie sam token
-- Token plaintext jest zwracany tylko raz przy tworzeniu
-- Weryfikacja przez porównanie hashy
+**Security:**
+- Only the **hash** of the token (SHA-256) is stored, not the token itself
+- The plaintext token is returned only once, at creation time
+- Verification is done by comparing hashes
 
 ## Path Validation
 
-Funkcja `validate_path()` chroni przed path traversal attacks:
+The `validate_path()` function protects against path traversal attacks:
 
 ```rust
-// Blokowane wzorce
+// Blocked patterns
 "../../../etc/asdpasswd"     // Path traversal
 sd"/etc/passwd"             // Outside allowed paths
 "~/../../root/.ssh"       // Traversal after expansion
 
-// Dozwolone (jeśli w allowed_paths)
+// Allowed (if in allowed_paths)
 "~/Documents/notes.md"    // Under home
 "/Volumes/Data/file.txt"  // Configured external volume
 ```
 
-**Walidacja:**
-1. Sprawdzenie czy ścieżka nie jest pusta
-2. Expansion `~` do home directory
-3. Sprawdzenie wzorca `..` (path traversal)
-4. Canonicalization (rozwiązanie symlinków)
-5. Sprawdzenie czy canonical path jest pod dozwoloną ścieżką
+**Validation:**
+1. Check that the path is not empty
+2. Expand `~` to the home directory
+3. Check for the `..` pattern (path traversal)
+4. Canonicalization (resolve symlinks)
+5. Check that the canonical path is under an allowed path
 
-## Implementacja
+## Implementation
 
-### Pliki źródłowe
+### Source Files
 
-| Plik | Opis |
+| File | Description |
 |------|------|
 | `rust-memex/src/security/mod.rs` | `NamespaceAccessManager`, `TokenStore`, token generation/verification |
-| `rust-memex/src/handlers/mod.rs` | `validate_path()`, integration z access manager |
+| `rust-memex/src/handlers/mod.rs` | `validate_path()`, integration with the access manager |
 | `rust-memex/src/lib.rs` | `NamespaceSecurityConfig`, re-exports |
 | `rust-memex/src/bin/rust-memex.rs` | CLI flags `--security-enabled`, `--token-store-path` |
 
-### Kluczowe struktury
+### Key Structures
 
 ```rust
-/// Konfiguracja security
+/// Security configuration
 pub struct NamespaceSecurityConfig {
     pub enabled: bool,
     pub token_store_path: Option<String>,
 }
 
-/// Manager dostępu do namespace'ów
+/// Namespace access manager
 pub struct NamespaceAccessManager {
     enabled: bool,
     store: Option<Arc<Mutex<TokenStore>>>,
 }
 
-/// Przechowywanie tokenów
+/// Token storage
 pub struct TokenStore {
     path: PathBuf,
     tokens: HashMap<String, TokenEntry>,
 }
 
-/// Wpis tokena
+/// Token entry
 pub struct TokenEntry {
     pub token_hash: String,
     pub created_at: DateTime<Utc>,
@@ -289,50 +296,49 @@ pub struct TokenEntry {
 }
 ```
 
-### Testy
+### Tests
 
 ```bash
 cd rust-memex && cargo test security
 ```
 
-Testy pokrywają:
-- `test_token_generation` - generowanie tokenów w poprawnym formacie
-- `test_access_manager_disabled` - zachowanie gdy security wyłączone
-- `test_token_store_create_and_verify` - tworzenie i weryfikacja tokenów
-- `test_access_manager_enabled` - pełny flow z włączonym security
+The tests cover:
+- `test_token_generation` - generating tokens in the correct format
+- `test_access_manager_disabled` - behavior when security is disabled
+- `test_token_store_create_and_verify` - creating and verifying tokens
+- `test_access_manager_enabled` - full flow with security enabled
 
 ## Best Practices
 
-### Dla administratorów
+### For administrators
 
-1. **Włącz security w produkcji** - `--security-enabled`
-2. **Ogranicz allowed_paths** - tylko niezbędne ścieżki
-3. **Backup token store** - tokeny są nieodwracalne
-4. **Rotacja tokenów** - okresowo revoke + create nowe
+1. **Enable security in production** - `--security-enabled`
+2. **Restrict allowed_paths** - only the necessary paths
+3. **Back up the token store** - tokens are irreversible
+4. **Rotate tokens** - periodically revoke + create new ones
 
-### Dla agentów AI
+### For AI agents
 
-1. **Przechowuj tokeny bezpiecznie** - env vars lub secure storage
-2. **Nie loguj tokenów** - unikaj wyświetlania w logach
-3. **Używaj dedykowanych namespace'ów** - izolacja danych
-4. **Sprawdzaj security_status** - upewnij się że security jest włączone
+1. **Store tokens securely** - env vars or secure storage
+2. **Do not log tokens** - avoid displaying them in logs
+3. **Use dedicated namespaces** - data isolation
+4. **Check security_status** - make sure security is enabled
 
-## Przyszłe rozszerzenia
+## Future Extensions
 
-### Faza 3: Szyfrowanie Namespace'ów (planowane)
+### Phase 3: Namespace Encryption (planned)
 
 ```toml
-# Przyszła konfiguracja
-[namespaces.pamietnik]
+# Future configuration
+[namespaces.diary]
 encrypted = true
 key_derivation = "argon2id"
 ```
 
-- Dane w LanceDB szyfrowane kluczem namespace'u
-- Bez klucza = dane bezużyteczne
-- Dla naprawdę wrażliwych danych
+- Data in LanceDB encrypted with the namespace key
+- Without the key = data is useless
+- For truly sensitive data
 
 ---
 
-Vibecrafted with AI Agents by Loctree (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Loctree (c)2025 Vetcoders

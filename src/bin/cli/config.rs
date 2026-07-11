@@ -157,8 +157,14 @@ pub struct MlxFileConfig {
     #[serde(default)]
     pub disabled: bool,
     pub local_port: Option<u16>,
-    pub dragon_url: Option<String>,
-    pub dragon_port: Option<u16>,
+    // `dragon_url`/`dragon_port` are the pre-rename key names (see commit
+    // 2c50593); kept as serde aliases so existing config.toml files keep
+    // pointing the embedder at the same remote host after upgrade instead of
+    // silently falling back to the env/default localhost.
+    #[serde(alias = "dragon_url")]
+    pub embedder_url: Option<String>,
+    #[serde(alias = "dragon_port")]
+    pub embedder_port: Option<u16>,
     pub embedder_model: Option<String>,
     pub reranker_model: Option<String>,
     pub reranker_port_offset: Option<u16>,
@@ -171,8 +177,8 @@ impl MlxFileConfig {
         config.merge_file_config(rust_memex::MlxMergeOptions {
             disabled: Some(self.disabled),
             local_port: self.local_port,
-            dragon_url: self.dragon_url.clone(),
-            dragon_port: self.dragon_port,
+            embedder_url: self.embedder_url.clone(),
+            embedder_port: self.embedder_port,
             embedder_model: self.embedder_model.clone(),
             reranker_model: self.reranker_model.clone(),
             reranker_port_offset: self.reranker_port_offset,
@@ -288,5 +294,49 @@ impl ResolvedConfig {
             embedding_config,
             maintenance_config,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_dragon_keys_deserialize_into_embedder_fields() {
+        // A config.toml written before the dragon->embedder rename must still
+        // populate the renamed fields via serde aliases, otherwise the remote
+        // embedder host is silently dropped and to_mlx_config() falls back to
+        // the env/default localhost on upgrade.
+        let toml = r#"
+            [mlx]
+            dragon_url = "http://remote-embedder.internal"
+            dragon_port = 9999
+        "#;
+
+        let cfg: FileConfig = toml::from_str(toml).expect("legacy [mlx] config parses");
+        let mlx = cfg.mlx.expect("[mlx] section present");
+        assert_eq!(
+            mlx.embedder_url.as_deref(),
+            Some("http://remote-embedder.internal")
+        );
+        assert_eq!(mlx.embedder_port, Some(9999));
+    }
+
+    #[test]
+    fn new_embedder_keys_still_deserialize() {
+        // The neutral key names remain the primary spelling.
+        let toml = r#"
+            [mlx]
+            embedder_url = "http://new-embedder.internal"
+            embedder_port = 8888
+        "#;
+
+        let cfg: FileConfig = toml::from_str(toml).expect("new [mlx] config parses");
+        let mlx = cfg.mlx.expect("[mlx] section present");
+        assert_eq!(
+            mlx.embedder_url.as_deref(),
+            Some("http://new-embedder.internal")
+        );
+        assert_eq!(mlx.embedder_port, Some(8888));
     }
 }

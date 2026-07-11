@@ -33,7 +33,7 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 #   - jq for JSON parsing (optional)
 #
 # ============================================================================
-# Created by M&K (c)2026 The LibraxisAI Team
+# Created by Vetcoders (c)2026
 # ============================================================================
 
 set -uo pipefail

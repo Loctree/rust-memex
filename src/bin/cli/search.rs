@@ -533,7 +533,7 @@ pub async fn run_cross_search(
                 "{}. [{}] {} (score: {:.4})",
                 idx + 1,
                 r.namespace,
-                &r.id,
+                r.id,
                 r.score
             );
             if let Some(ref layer) = r.layer {

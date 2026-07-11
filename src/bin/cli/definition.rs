@@ -202,8 +202,8 @@ pub enum Commands {
     /// full metadata, and related chunks.
     ///
     /// Examples:
-    ///   rust-memex dive -n memories -q "dragon"
-    ///   rust-memex dive -n memories -q "dragon" --verbose
+    ///   rust-memex dive -n memories -q "laptop"
+    ///   rust-memex dive -n memories -q "laptop" --verbose
     Dive {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -316,10 +316,10 @@ pub enum Commands {
     /// defaults. Results include relevance scores, timestamps, and metadata.
     ///
     /// Examples:
-    ///   rust-memex search -n memories -q "when did we buy dragon"
-    ///   rust-memex search -n memories -q "dragon" --deep
-    ///   rust-memex search -n memories -q "dragon" -l 20
-    ///   rust-memex search -n memories -q "dragon" --mode hybrid
+    ///   rust-memex search -n memories -q "when did we buy laptop"
+    ///   rust-memex search -n memories -q "laptop" --deep
+    ///   rust-memex search -n memories -q "laptop" -l 20
+    ///   rust-memex search -n memories -q "laptop" --mode hybrid
     Search {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -497,8 +497,8 @@ pub enum Commands {
     /// using the onion slice architecture (outer layers = summaries).
     ///
     /// Examples:
-    ///   rust-memex recall "Vista architecture"          # Search all namespaces
-    ///   rust-memex recall "dragon setup" -n memories    # Specific namespace
+    ///   rust-memex recall "Demo architecture"          # Search all namespaces
+    ///   rust-memex recall "laptop setup" -n memories    # Specific namespace
     ///   rust-memex recall "auth flow" --limit 20        # More sources
     Recall {
         /// What to recall (search query)
@@ -665,7 +665,7 @@ pub enum Commands {
     /// Examples:
     ///   rust-memex merge --source ~/db1 --source ~/db2 --target ~/merged
     ///   rust-memex merge --source ~/db1 --source ~/db2 --target ~/merged --dedup
-    ///   rust-memex merge --source ~/dragon-db --target ~/merged --namespace-prefix "dragon:"
+    ///   rust-memex merge --source ~/laptop-db --target ~/merged --namespace-prefix "laptop:"
     ///   rust-memex merge --source ~/db1 --target ~/merged --dry-run
     Merge {
         /// Source database paths (can specify multiple times)
@@ -680,7 +680,7 @@ pub enum Commands {
         #[arg(long, short = 'd')]
         dedup: bool,
 
-        /// Prefix to add to source namespaces (e.g., "dragon:" -> "dragon:memories")
+        /// Prefix to add to source namespaces (e.g., "laptop:" -> "laptop:memories")
         #[arg(long, short = 'p')]
         namespace_prefix: Option<String>,
 

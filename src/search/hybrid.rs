@@ -906,17 +906,14 @@ mod tests {
 
     #[test]
     fn project_filter_matches_project_and_project_id() {
-        assert!(matches_project_filter(
-            &json!({"project": "Vista"}),
-            "vista"
-        ));
+        assert!(matches_project_filter(&json!({"project": "Demo"}), "demo"));
         assert!(matches_project_filter(
             &json!({"project_id": "Loctree"}),
-            "vetcoders"
+            "loctree"
         ));
         assert!(!matches_project_filter(
             &json!({"project": "rust-memex"}),
-            "vista"
+            "demo"
         ));
     }
 
