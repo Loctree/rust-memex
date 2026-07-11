@@ -277,7 +277,12 @@ impl MlxConfig {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
-        let local_port = env_or_legacy("EMBEDDER_PORT", "DRAGON_EMBEDDER_PORT")
+        // local_port drives only the localhost provider (http://localhost:{port}),
+        // so it must NOT inherit the legacy DRAGON_EMBEDDER_PORT, which was the
+        // remote host's port. The DRAGON_* fallbacks apply only to the remote
+        // `embedder` provider below.
+        let local_port = std::env::var("EMBEDDER_PORT")
+            .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(12345);
 
