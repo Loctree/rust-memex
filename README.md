@@ -106,10 +106,10 @@ As an MCP (Model Context Protocol) server, `rust-memex` provides:
 
 ```toml
 # Full library with CLI
-rust-memex = "0.5"
+rust-memex = "0.6"
 
 # Library only (no CLI dependencies)
-rust-memex = { version = "0.5", default-features = false }
+rust-memex = { version = "0.6", default-features = false }
 ```
 
 ### Basic Usage
