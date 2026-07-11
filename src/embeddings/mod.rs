@@ -255,23 +255,36 @@ impl Default for MlxConfig {
     }
 }
 
+/// Prefer the value read from the current env key, falling back to the value
+/// read from the pre-rename legacy key. Kept as a pure function so the
+/// precedence contract is unit-testable without mutating process environment.
+fn resolve_legacy_env(current: Option<String>, legacy: Option<String>) -> Option<String> {
+    current.or(legacy)
+}
+
 impl MlxConfig {
     /// Create config from environment variables (legacy support)
     pub fn from_env() -> Self {
+        // Read the neutral env var, falling back to its pre-rename `DRAGON_*`
+        // name (see commit 2c50593) so env-driven deployments keep pointing at
+        // the same remote embedder host after upgrade instead of silently
+        // dropping to the localhost default.
+        let env_or_legacy = |new_key: &str, legacy_key: &str| -> Option<String> {
+            resolve_legacy_env(std::env::var(new_key).ok(), std::env::var(legacy_key).ok())
+        };
+
         let disabled = std::env::var("DISABLE_MLX")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
-        let local_port = std::env::var("EMBEDDER_PORT")
-            .ok()
+        let local_port = env_or_legacy("EMBEDDER_PORT", "DRAGON_EMBEDDER_PORT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(12345);
 
-        let embedder_url =
-            std::env::var("EMBEDDER_BASE_URL").unwrap_or_else(|_| "http://localhost".to_string());
+        let embedder_url = env_or_legacy("EMBEDDER_BASE_URL", "DRAGON_BASE_URL")
+            .unwrap_or_else(|| "http://localhost".to_string());
 
-        let embedder_port = std::env::var("EMBEDDER_PORT")
-            .ok()
+        let embedder_port = env_or_legacy("EMBEDDER_PORT", "DRAGON_EMBEDDER_PORT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(local_port);
 
@@ -1314,6 +1327,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         format!("http://{}", addr)
+    }
+
+    #[test]
+    fn legacy_env_fallback_precedence() {
+        // Current key wins when both are set.
+        assert_eq!(
+            resolve_legacy_env(Some("new".into()), Some("old".into())).as_deref(),
+            Some("new")
+        );
+        // Falls back to the pre-rename DRAGON_* value when the new key is unset,
+        // so env-driven upgrades keep the configured remote host.
+        assert_eq!(
+            resolve_legacy_env(None, Some("old".into())).as_deref(),
+            Some("old")
+        );
+        // Neither set -> None (caller applies its default).
+        assert_eq!(resolve_legacy_env(None, None), None);
     }
 
     #[test]
