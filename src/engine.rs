@@ -528,7 +528,8 @@ impl MemexEngine {
         let config = MemexConfig {
             app_name: "app".to_string(),
             namespace: "default".to_string(),
-            db_path: Some("~/.rmcp-servers/app/lancedb".to_string()),
+            // Defaults to ~/.rmcp-servers/app/lancedb via effective_db_path().
+            db_path: None,
             dimension: 1024,
             embedding_config: EmbeddingConfig {
                 required_dimension: 1024,
