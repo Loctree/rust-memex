@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - **Rebranded: `rmcp-memex` → `rust-memex`.** Crate name on crates.io, binary name `rmcp-memex` → `rust-memex`, library path `rmcp_memex` → `rust_memex`, and all internal imports `use rmcp_memex::` → `use rust_memex::`. User-facing `RMCP_MEMEX_*` environment variables preserved as-is for backward compatibility.
 - **Moved to Loctree org:** `https://github.com/VetCoders/rmcp-memex` → `https://github.com/Loctree/rust-memex`. Docs, install CTAs, and issue tracker URLs updated across README, docs/, install.sh, and Makefile.
-- **License:** the crate ships under the Business Source License 1.1 (BUSL-1.1); see `LICENSE` for terms and the Apache-2.0 change license.
+- **License + authorship:** the crate ships under the Business Source License 1.1 (BUSL-1.1) with Libraxis AI as Licensor; see `LICENSE` for terms and the Apache-2.0 change license. Cargo `authors` metadata records the Libraxis AI legal entity.
 
 ### Added
 - `rust-memex reindex` subcommand for rebuilding namespace contents with paginated source reads, preflight embedding checks, and target-namespace safety guards
